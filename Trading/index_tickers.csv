@@ -1,0 +1,594 @@
+Ticker;Name
+^DJI;Dow Jones Industrial Average®
+^FCHI;CAC 40®
+^FTSE;FTSE 100®
+^GDAXI;DAX®
+^GSPC;S&P 500®
+^IBEX;IBEX 35®
+^N225;Nikkei 225®
+^NDX;NASDAQ 100
+^OMX;OMX S30®
+^RUT;Russell 2000®
+^SKEW;SKEW index
+^STOXX50E;EURO STOXX 50®
+^TYX;US 30Y T-Bond Sep25
+^VIX;VIX Index
+^VVIX;Volatility of Volatility
+0A5Q.IL;LINK Mobility Group
+3TW.F;Coinshares International
+7974.T;Nintendo
+81N.F;Rugvista Group
+8TRA.ST;Traton
+9984.T;SoftBank Group ADR
+AA;Alcoa
+AAC.ST;AAC Clyde Space
+AAK.ST;AAK
+AAL;American Airlines
+AAPL;Apple Inc
+ABB.ST;ABB
+ABBV;AbbVie Inc
+ABCL;AbCellera Biologics
+ABNB;Airbnb
+ABSO.ST;Absolent Air Care Group
+ACAD.ST;AcadeMedia
+ACAST.ST;Acast
+ADBE;Adobe
+ADDT-B.ST;Addtech
+ADDV-B.ST;ADDvise Group
+ADM;Archer-Daniels-Midland
+ADMCM.HE;Admicom
+ADS.DE;adidas
+AEM;Agnico Eagle Mines
+AFRM;Affirm
+AFRY.ST;AFRY
+AI;C3.ai
+AIR.PA;Airbus
+AKER.OL;Aker ASA
+ALFA.ST;Alfa Laval
+ALIF-B.ST;AddLife
+ALIG.ST;Alimak Group
+ALIV-SDB.ST;Autoliv SDB
+ALLEI.ST;Alleima
+ALLIGO-B.ST;Alligo
+ALNY;Alnylam Pharmaceuticals
+ALRM;Alarm.com
+AMAT;Applied Materials
+AMBEA.ST;Ambea
+AMD;Advanced Micro Devices
+AMGN;Amgen
+AMSC;American Superconductor
+AMZN;Amazon
+ANOD-B.ST;Addnode Group
+AP4N.MU;Riot Blockchain
+APD;Air Products and Chemicals
+APH;Amphenol
+APO;Apollo Global Management
+APOTEA.ST;Apotea
+APPS;Digital Turbine
+AQ.ST;AQ Group
+ARJO-B.ST;Arjo
+ARM;ARM Holdings
+ASMDEE-B.ST;Asmodee Group AB
+ASML;ASML Holding
+ASSA-B.ST;Assa Abloy
+ASTS;AST SpaceMobile
+ATCO-A.ST;Atlas Copco A
+ATRLJ-B.ST;Atrium Ljungberg
+ATT.ST;ATTENDO
+AUDUSD=X;AUD/USD
+AVGO;Broadcom
+AXFO.ST;Axfood
+AXON;Axon Enterprise
+AXP;American Express
+AXSM;Axsome Therapeutics
+AZN.ST;AstraZeneca
+BA;Boeing
+BA.L;BAE Systems
+BABA;Alibaba
+BAC;Bank of America
+BAHN-B.ST;Bahnhof B
+BALD-B.ST;Balder
+BAVA.CO;Bavarian Nordic
+BAYN.DE;Bayer
+BB;BlackBerry
+BB2.F;Burberry Group
+BCE;BCE
+BEIA-B.ST;Beijer Alma
+BEIJ-B.ST;Beijer Ref
+BERG-B.ST;Bergman & Beving
+BETCO.ST;Better Collective
+BETS-B.ST;Betsson
+BHG.ST;BHG Group
+BICO.ST;BICO Group
+BIDU;Baidu
+BIIB;Biogen
+BILI-A.ST;Bilia
+BILL.ST;Billerud
+BIM.ST;BIMobject
+BINV.ST;BioInvent International
+BIOA-B.ST;BioArctic
+BIOG-B.ST;BioGaia
+BKNG;Booking Holdings
+BLDP;Ballard Power Systems
+BLK;BlackRock
+BMAX.ST;Byggmax Group
+BNTX;BioNTech
+BOL.ST;Boliden
+BONAV-B.ST;Bonava B
+BONEX.ST;BoneSupport Holding
+BOOZT.ST;Boozt
+BRAV.ST;Bravida Holding
+BRK-B;Berkshire Hathaway B
+BTC-USD;Bitcoin Jul25
+BTG;B2Gold
+BTI;British American Tobacco
+BTS-B.ST;BTS Group
+BTU;Peabody Energy
+BUFAB.ST;Bufab
+BURE.ST;Bure Equity
+BWIN;Baldwin Insurance Group
+BX;Blackstone
+BZ=F;Brent Crude Oil Sep25
+CALX;Calix
+CAMX.ST;Camurus
+CAST.ST;Castellum
+CAT;Caterpillar
+CATE.ST;Catena
+CC=F;Cocoa Sep25
+CCS;Century Communities
+CELH;Celsius
+CEVI.ST;CellaVision
+CGON;CG oncology
+CHEMM.CO;ChemoMetec
+CHWY;Chewy
+CIBUS.ST;Cibus Nordic Real Estate
+CINT.ST;Cint Group
+CL;Colgate-Palmolive
+CLA-B.ST;Cloetta
+CLAS-B.ST;Clas Ohlson
+CLFD;Clearfield
+CME;CME Group
+CMG;Chipotle Mexican Grill
+CMI;Cummins
+CNI;Canadian National Railway
+CNTA;Centessa Pharmaceuticals Plc
+COIN;Coinbase Global
+COOR.ST;Coor Service Management Holding
+CORE-B.ST;Corem Property Group B
+CRED-A.ST;Creades
+CRM;Salesforce
+CRNX;Crinetics Pharmaceuticals
+CRSR;Corsair Gaming
+CRWD;Crowdstrike Holdings
+CSCO;Cisco
+CTEK.ST;Ctek
+CTT.ST;CTT Systems
+CVNA;Carvana
+CVX;Chevron
+CYBR;CyberArk Software
+DAL;Delta Air Lines
+DANSKE.CO;Danske Bank
+DDOG;Datadog
+DIOS.ST;Dios Fastigheter
+DIS;Walt Disney
+DKNG;DraftKings
+DLB;Dolby Laboratories
+DMYD-B.ST;Diamyd Medical
+DOCU;DocuSign
+DOM.ST;Dometic Group
+DPZ;Dominos Pizza
+DRS;Leonardo
+DUNI.ST;Duni
+DUOL;Duolingo
+DUST.ST;Dustin Group
+DYVOX.ST;Dynavox Group
+EA;Electronic Arts
+EEM;Emerging Markets
+EG7.ST;Enad Global 7
+EH;EHang Holdings
+EKTA-B.ST;Elekta B
+ELAN;Elanco Animal Health
+ELUX-B.ST;Electrolux B
+EMBRAC-B.ST;Embracer Group
+EME;EMCOR Group
+ENGCON-B.ST;Engcon
+EOLU-B.ST;Eolus Vind
+EPEN.ST;Ependion
+EPI-A.ST;Epiroc A
+EPRO-B.ST;Electrolux Professional
+EQNR;Equinor
+EQT.ST;EQT
+ERIC-B.ST;Ericsson B
+ESSITY-B.ST;Essity B
+ETSY;Etsy
+EURJPY=X;EUR/JPY
+EURSEK=X;EUR/SEK
+EURUSD=X;EUR/USD
+EVO.ST;Evolution Gaming
+EWRK.ST;eWork Group
+F;Ford
+FABG.ST;Fabege
+FAG.ST;Fagerhult
+FCX;Freeport-McMoRan
+FG.ST;Fasadgruppen Group AB
+FLNG;FLEX LNG
+FMM-B.ST;FM Mattsson Mora Group
+FND;Floor & Decor
+FNOVA-B.ST;Fortinova Fastigheter
+FNV;Franco-Nevada
+FOI-B.ST;Fenix Outdoor International B
+FORTUM.HE;Fortum
+FOUR;Shift4 Payments
+FPAR-D.ST;FastPartner
+FRPT;Freshpet
+FSLY;Fastly
+FTNT;Fortinet
+FTS;Fortis Inc
+FUTU;Futu Holdings
+FVRR;Fiverr International
+G5EN.ST;G5 Entertainment
+GBPJPY=X;GBP/JPY
+GC=F;Gold Aug25
+GD;General Dynamics
+GDX;Gold Miners
+GETI-B.ST;Getinge B
+GFI;Gold Fields
+GILD;Gilead Sciences
+GM;General Motors
+GMAB.CO;Genmab
+GOMX.ST;GomSpace Group
+GOOG;Alphabet C
+GREEN.ST;Green Landscaping Group
+GS;Goldman Sachs
+GSAT;Globalstar
+HANZA.ST;Hanza
+HASI;HA Sustainable Infrastructure
+HAYPP.ST;Haypp Group
+HBR.L;Harbour Energy
+HEBA-B.ST;Heba Fastighets
+HELFY;HelloFresh
+HEM.ST;Hemnet Group
+HEXA-B.ST;Hexagon
+HG=F;Copper Sep25
+HHP2.F;Hon Hai Precision Industry GDR
+HIMS;Hims & Hers Health
+HM-B.ST;Hennes & Mauritz B
+HMS.ST;HMS Networks
+HNSA.ST;Hansa Medical
+HO.PA;Thales
+HOFI.ST;Hoist Finance
+HOLM-B.ST;Holmen B
+HOOD;Robinhood Markets
+HPOL-B.ST;Hexpol
+HTRO.ST;Hexatronic Group
+HUBS;HubSpot
+HUFV-A.ST;Hufvudstaden A
+HUMBLE.ST;Humble Group
+HUSQ-B.ST;Husqvarna
+HYG;High yield bonds
+I5G.F;IG Group Holdings Plc
+IBM;IBM
+ICP1V.HE;Incap
+IDUN-B.ST;Idun Industrier
+IMP-A-SDB.ST;Implantica
+INDT.ST;Indutrade
+INDU-C.ST;Industrivarden
+INSM;Insmed
+INSTAL.ST;Instalco
+INTC;Intel
+INTRUM.ST;Intrum Justitia
+INTU;Intuit
+INVE-B.ST;Investor B
+INWI.ST;Inwido
+IONQ;IonQ
+IPCO.ST;International Petroleum
+ISRG;Intuitive Surgical
+IVSO.ST;INVISIO Communications
+JD;JD.com
+JM.ST;JM
+JNJ;Johnson & Johnson
+JOMA.ST;John Mattson
+JPM;JPMorgan
+KAMBI.ST;Kambi
+KBGGY;Kongsberg Gruppen
+KC=F;Coffee C Sep25
+KE=F;Wheat Sep25
+KEYS;Keysight Technologies
+KFAST-B.ST;K-Fast Holding
+KINV-B.ST;Kinnevik B
+KKR;KKR
+KMB;Kimberly-Clark
+KNOW.ST;KNOW IT
+KODK;Eastman Kodak
+KR;Kroger
+LAC;Lithium Americas
+LAGR-B.ST;Lagercrantz Group
+LATO-B.ST;Latour B
+LCID;Lucid Group
+LI;Li Auto ADR
+LIAB.ST;Lindab International
+LIFCO-B.ST;Lifco
+LIME.ST;Lime Technologies
+LINC.ST;Linc
+LLY;Eli Lilly
+LMND;Lemonade
+LMT;Lockheed Martin
+LOGC;ContextLogic
+LOGI-B.ST;Logistea B
+LOOMIS.ST;Loomis
+LQD;Investment Grade Bonds
+LRCX;Lam Research
+LUG.ST;Lundin Gold
+LULU;Lululemon Athletica
+LUMI.ST;Lundin Mining Corp
+LUND-B.ST;Lundbergforetagen
+LUV;Southwest Airlines
+LW;Lamb Weston
+LYFT;Lyft
+LYKO-A.ST;Lyko Group
+LYSCF;Lynas Rare Earths
+M4M1.F;Millicom International Cellular
+MA;Mastercard
+MAERSK-B.CO;AP Moller - Maersk B
+MARA;MARA Holdings
+MC.PA;LVMH
+MCAP.ST;MedCap
+MCD;McDonald's
+MCOV-B.ST;Medicover
+MDLZ;Mondelez International
+MEKO.ST;MEKO
+META;Meta Platforms
+MILDEF.ST;Mildef Group
+MIPS.ST;MIPS
+MKTX;MarketAxess Holdings
+MMGR-B.ST;Momentum Group
+MNST;Monster Beverage
+MOS;Mosaic
+MP;MP Materials
+MPCC.OL;MPC Container Ships
+MRK;Merck
+MRNA;Moderna
+MSAB-B.ST;Micro Systemation
+MSFT;Microsoft
+MSTR;MicroStrategy
+MTCH;Match Group
+MTG-B.ST;Modern Times Group B
+MTRS.ST;Munters Group
+MU;Micron Technology
+MYCR.ST;Mycronic
+NAS.OL;Norwegian Air Shuttle
+NCAB.ST;NCAB Group
+NCC-B.ST;NCC B
+NCLH;Norwegian Cruise Line
+NDA-SE.ST;Nordea Bank
+NEL.OL;NEL
+NEOBO.ST;Neobo Fastigheter
+NET;CloudFlare
+NETI-B.ST;Net Insight B
+NEWA-B.ST;New Wave Group
+NFLX;Netflix
+NG=F;Natural Gas Aug25
+NHY.OL;Norsk Hydro
+NIBE-B.ST;NIBE Industrier
+NIO;NIO
+NIVI-B.ST;Nivika Fastigheter B
+NKE;Nike
+NMAN.ST;Nederman
+NOKIA-SEK.ST;Nokia
+NOLA-B.ST;Nolato B
+NORCO.OL;Norconsult Norge
+NORION.ST;Norion Bank
+NOTE.ST;Note
+NOVO-B.CO;Novo Nordisk B
+NP3.ST;NP3 Fastigheter
+NSIT;Insight Enterprises
+NTES;NetEase
+NVAX;Novavax
+NVCR;NovoCure
+NVDA;NVIDIA
+NYF.ST;Nyfosa
+O;Realty Income
+OEM-B.ST;OEM International
+OET.OL;Okeanis Eco Tankers
+OKTA;Okta
+ON;ON Semiconductor
+OPCH;Option Care Health
+ORES.ST;Investment AB Oresund
+ORRON.ST;Orron Energy
+OTGLY;CD Projekt
+OTLY;Oatly Group
+OVV;Ovintiv
+OVZON.ST;Ovzon
+P911.DE;Porsche Vz.
+PA=F;Palladium Sep25
+PACT.ST;Proact IT
+PBR;Petrobras
+PCAR;PACCAR
+PCELL.ST;PowerCell Sweden
+PDD;PDD Holdings
+PDX.ST;Paradox Interactive
+PEAB-B.ST;Peab
+PEP;PepsiCo
+PFE;Pfizer
+PFSI;PennyMac Financial Services
+PINS;Pinterest
+PL=F;Platinum Oct25
+PLAZ-B.ST;Platzer Fastigheter Holding
+PLTR;Palantir Technologies
+PLUG;Plug Power
+PNDX-B.ST;Pandox
+PPRUY;Kering
+PR;Permian Resources
+PROSY;Prosus
+PUM.DE;Puma
+PWR;Quanta Services
+PXPHF;Pexip Holding
+PYPL;PayPal Holdings
+QCOM;Qualcomm
+QTCOM.HE;QT Group
+RATO-B.ST;Ratos B
+RAY-B.ST;RaySearch Laboratories
+RBLX;Roblox
+REAL;RealReal
+REG1V.HE;Revenio Group
+REJL-B.ST;Rejlers
+RHM.DE;Rheinmetall
+RIVN;Rivian Automotive
+RKLB;Rocket Lab USA
+RMS.PA;Hermes International
+RNO.PA;Renault
+ROKU;Roku
+RSI;Rush Street Interactive
+RTX;RTX
+RUSTA.ST;Rusta
+RVRC.ST;Rvrc Holding
+RVTY;Revvity
+RY;Royal Bank of Canada
+RYCEY;Rolls-Royce
+SAAB-B.ST;Saab B
+SAGA-B.ST;Sagax B
+SALT-B.ST;SaltX
+SAM;Boston Beer
+SAND.ST;Sandvik
+SANM;Sanmina
+SAVE.ST;Nordnet
+SB=F;Sugar No. 11 Oct25
+SBB-B.ST;Samhallsbyggnadsbolaget i Norden B
+SBUX;Starbucks
+SCA-B.ST;SCA B
+SCST.ST;Scandi Standard
+SDIP-B.ST;Sdiptech
+SE;Sea ADR
+SEB-A.ST;SEB A
+SECARE.ST;SwedenCare
+SECT-B.ST;Sectra
+SECU-B.ST;Securitas B
+SEDANA.ST;Sedana Medical
+SEYE.ST;Smart Eye
+SF.ST;Stillfront
+SHB-A.ST;Handelsbanken A
+SHEL;Shell
+SHOP;Shopify
+SHOT.ST;Scandic Hotels Group
+SI=F;Silver Sep25
+SINCH.ST;Sinch
+SIVE.ST;Sivers Semiconductors
+SKA-B.ST;Skanska B
+SKF-B.ST;SKF
+SKIS-B.ST;SkiStar
+SLP-B.ST;Swedish Logistic Property B
+SMCI;Super Micro Computer
+SNAP;Snap
+SNM.ST;ShaMaran Petroleum
+SNOW;Snowflake
+SNPS;Synopsys
+SOBI.ST;Swedish Orphan Biovitrum
+SOF-B.ST;Softronic
+SOFI;SoFi Technologies
+SONO;Sonos
+SONY;Sony ADR
+SPOT;Spotify
+SPT;Sprout Social
+SRTOY;Sartorius Stedim Biotech
+SSAB-A.ST;SSAB A
+SSAB-B.ST;SSAB B
+STEF-B.ST;Stendorren Fastigheter
+STE-R.ST;Stora Enso
+STNE;StoneCo
+STOR-B.ST;Storskogen Group
+STORY-B.ST;Storytel
+SUS.ST;Surgical Science Sweden
+SVOL-B.ST;Svolder
+SWEC-B.ST;Sweco B
+SWED-A.ST;Swedbank A
+SYNSAM.ST;Synsam
+SYSR.ST;Systemair
+T;AT&T
+TAK;Takeda Pharmaceutical ADR
+TCEHY;Tencent
+TCOM;Trip.com Group
+TDOC;Teladoc Health
+TEL;TE Connectivity
+TEL2-B.ST;Tele2 B
+TELIA.ST;Telia Co
+TEQ.ST;Teqnion
+TFBANK.ST;TF Bank
+THULE.ST;Thule Group
+TIETOS.ST;TietoEVRY
+TIGR;Up Fintech Holding Ltd
+TIP;TIPS (Inflation)
+TLT;Long Treasury ETF
+TME;Tencent Music Entertainment
+TNOM.HE;Talenom
+TOBII.ST;Tobii
+TOM.OL;Tomra Systems
+TREL-B.ST;Trelleborg B
+TRIAN-B.ST;Trianon
+TRIP;TripAdvisor
+TRMB;Trimble
+TROAX.ST;Troax Group
+TRUE-B.ST;Truecaller
+TSLA;Tesla
+TSM;TSMC
+TT;Trane Technologies
+TTD;Trade Desk
+TTWO;Take-Two
+TUI1.DE;TUI
+TXN;Texas Instruments
+U;Unity Software
+UAL;United Airlines
+UBER;Uber
+UBI.PA;Ubisoft Entertainment
+UNH;UnitedHealth Group
+UNP;Union Pacific
+UPS;UPS
+UPST;Upstart Holdings
+UPWK;Upwork
+USDCAD=X;USD/CAD
+USDJPY=X;USD/JPY
+USDSEK=X;USD/SEK
+UUP;US Dollar Index ETF
+V;Visa Inc
+VALE;Vale
+VARRY;Var Energi AS
+VBG-B.ST;VBG Group B
+VER.ST;Verve Group (SS Line)
+VESTUM.ST;Vestum
+VICO.ST;Vicore Pharma Holding
+VIMIAN.ST;Vimian Group
+VISC.ST;Viscaria
+VIT-B.ST;Vitec Software Group
+VITR.ST;Vitrolife
+VNV.ST;VNV Global
+VOLCAR-B.ST;Volvo Car
+VOLO.ST;Volati
+VOLV-B.ST;Volvo B
+VPLAY-B.ST;Viaplay Group
+VSSAB-B.ST;Viking Supply Ships
+VST;Vistra
+VWS.CO;Vestas Wind Systems
+VZ;Verizon Communications
+WALL-B.ST;Wallenstam
+WIHL.ST;Wihlborgs Fastigheter
+WMT;Walmart
+WPM;Wheaton Precious Metals
+WU;Western Union
+XANO-B.ST;XANO Industri
+XLE;Energy Sector
+XLF;Financials Sector
+XLK;Technology Sector
+XOM;Exxon Mobil
+XPEV;XPeng
+XSPRAY.ST;XSpray Pharma
+XVIVO.ST;Xvivo Perfusion
+XYZ;Block
+YUBICO.ST;Yubico
+ZAL.DE;Zalando
+ZAP.OL;Zaptec
+ZC=F;Corn Sep25
+ZEAL.CO;Zealand Pharma
+ZIM;ZIM Integrated Shipping Services
+ZION;Zions Bancorporation
+ZM;Zoom Communications
+ZN=F;US 10Y T-Note Sep25
+ZT=F;US 2Y T-Note Sep25

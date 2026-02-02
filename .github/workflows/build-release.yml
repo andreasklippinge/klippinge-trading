@@ -1,0 +1,100 @@
+# ============================================================================
+# Klippinge Trading Terminal - GitHub Actions Build & Release
+# ============================================================================
+#
+# Triggers:
+#   - Push a git tag like v1.0.0 → builds .exe + installer → uploads to GitHub Release
+#
+# Usage:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#   → GitHub Actions builds and publishes the release automatically
+
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0, v1.2.3
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+permissions:
+  contents: write  # Needed to create releases
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+      
+      - name: Update version in app_config.py
+        shell: python
+        run: |
+          import re
+          with open('app_config.py', 'r') as f:
+              content = f.read()
+          content = re.sub(
+              r'APP_VERSION = ".*?"',
+              f'APP_VERSION = "${{ steps.version.outputs.version }}"',
+              content
+          )
+          with open('app_config.py', 'w') as f:
+              f.write(content)
+      
+      - name: Build with PyInstaller
+        run: |
+          python build.py --skip-checks
+      
+      - name: Create portable ZIP
+        run: |
+          python build.py --zip --skip-checks
+        continue-on-error: true
+      
+      # Optional: Build Inno Setup installer
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y
+        continue-on-error: true
+      
+      - name: Build installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build/installer.iss
+        continue-on-error: true
+      
+      - name: List build outputs
+        run: dir dist\
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Klippinge Trading Terminal v${{ steps.version.outputs.version }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/KlippingeTrading-v*-Setup.exe
+            dist/KlippingeTrading-v*-portable-win64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

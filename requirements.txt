@@ -1,0 +1,32 @@
+# ============================================================================
+# Klippinge Investment Trading Terminal - Dependencies
+# ============================================================================
+# Install: pip install -r requirements.txt
+
+# ── GUI Framework ────────────────────────────────────────────────────────────
+PyQt5>=5.15.9
+pyqtgraph>=0.13.3
+
+# Optional: Web engine for Plotly maps (large dependency, uncomment if needed)
+# PyQtWebEngine>=5.15.6
+
+# ── Scientific Computing ─────────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+statsmodels>=0.14.0
+
+# ── Data & Finance ───────────────────────────────────────────────────────────
+yfinance>=0.2.28
+openpyxl>=3.1.0          # Excel file support
+
+# ── Web & Scraping ───────────────────────────────────────────────────────────
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+urllib3>=2.0.0
+
+# ── Optional: HMM Libraries (uncomment if using advanced regime detection) ──
+# hmmlearn>=0.3.0
+
+# ── Build Tools (dev only) ──────────────────────────────────────────────────
+# pyinstaller>=6.0

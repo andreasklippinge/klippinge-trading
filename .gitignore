@@ -1,0 +1,31 @@
+# Build output
+dist/
+build/temp/
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# User data (ska inte versionshanteras)
+Trading/engine_cache.pkl
+Trading/portfolio_history.json
+Trading/portfolio_positions.json
+news_cache.json
+.scheduler_last_run
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Secrets
+notification_config.json

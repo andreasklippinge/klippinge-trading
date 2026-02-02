@@ -1,0 +1,22 @@
+
+body {
+    background-color: #000000;
+    color: #cccccc;
+    font-family: 'Courier New', monospace !important;
+}
+
+/* Make graphs fill panels (already handled by default Dash behavior, but good to reinforce) */
+.panel-content .modebar {
+    display: none !important;
+}
+
+/* Ensure monospace font for all text */
+* {
+    font-family: 'Courier New', monospace !important;
+}
+
+/* Optional: Add some padding to the main content area */
+.main-dashboard-content {
+    padding: 10px 0;
+}
+            
