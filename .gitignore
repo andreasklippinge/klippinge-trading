@@ -1,15 +1,14 @@
 # Build output
 dist/
-build/temp/
+build/klippinge/
 *.spec.bak
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
 
-# User data (ska inte versionshanteras)
+# User data
 Trading/engine_cache.pkl
 Trading/portfolio_history.json
 Trading/portfolio_positions.json
@@ -20,12 +19,17 @@ news_cache.json
 .vscode/
 .idea/
 *.swp
-*.swo
 
 # OS
 Thumbs.db
 .DS_Store
-desktop.ini
 
 # Secrets
 notification_config.json
+
+# Distribution files (too large for git)
+*.zip
+Trading/Borsdata*.xlsx
+
+# Duplicate guide files with encoding issues
+FULLST*NDIG_GUIDE.md
