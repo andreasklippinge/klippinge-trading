@@ -13,7 +13,6 @@ A professional pairs trading and portfolio management terminal built with PyQt5.
 - **Portfolio Management** — Position tracking, daily snapshots, benchmark analysis vs S&P 500
 - **Automated Scanning** — Scheduled pair screening across 590+ Swedish stocks
 - **Morgan Stanley Mini Futures** — Live pricing and leveraged position sizing
-- **Interactive Brokers Integration** — Live streaming data for Swedish equities and OMX futures
 - **Discord Notifications** — Automated alerts for trade signals and scan results
 - **World Market Overview** — Real-time global market dashboard with volatility metrics
 

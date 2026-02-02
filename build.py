@@ -142,7 +142,6 @@ def build_exe(one_file: bool = False):
             '--add-data', 'index_tickers.csv;.',
             '--add-data', 'underliggande_matchade_tickers.csv;.',
             '--add-data', 'notification_config.json;.',
-            '--add-data', 'ib_ticker_mapping.json;.',
             '--add-data', 'logo.ico;.',
             '--add-data', 'assets/styles.css;assets',
             '--add-data', 'Trading/index_tickers.csv;Trading',

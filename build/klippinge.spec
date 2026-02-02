@@ -41,7 +41,6 @@ datas = [
     
     # Configuration files
     (proj('notification_config.json'), '.'),
-    (proj('ib_ticker_mapping.json'), '.'),
     
     # Icons & assets
     (proj('logo.ico'), '.'),
