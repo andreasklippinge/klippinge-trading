@@ -80,7 +80,7 @@ def check_prerequisites():
         for f in missing:
             print(f"       Missing: {f}")
     else:
-        print_step(3, f"Source files: {len(REQUIRED_FILES)}/{len(REQUIRED_FILES)} ✓")
+        print_step(3, f"Source files: {len(REQUIRED_FILES)}/{len(REQUIRED_FILES)} OK")
     
     # Check key dependencies are installed
     deps_ok = True
@@ -91,7 +91,7 @@ def check_prerequisites():
             errors.append(f"Missing dependency: {dep}")
             deps_ok = False
     
-    print_step(4, f"Dependencies: {'✓' if deps_ok else '❌'}")
+    print_step(4, f"Dependencies: {'OK' if deps_ok else '❌'}")
     
     if errors:
         print(f"\n❌ Prerequisites check failed:")
@@ -99,7 +99,7 @@ def check_prerequisites():
             print(f"   • {e}")
         sys.exit(1)
     
-    print(f"\n  ✓ All prerequisites met!")
+    print(f"\n  OK All prerequisites met!")
 
 
 def clean_build():
@@ -190,7 +190,7 @@ def build_exe(one_file: bool = False):
         print(f"\n  ❌ Build failed after {elapsed:.0f}s")
         sys.exit(1)
     
-    print(f"\n  ✓ Build completed in {elapsed:.0f}s")
+    print(f"\n  OK Build completed in {elapsed:.0f}s")
     
     # Report output
     dist_dir = Path('dist') / APP_NAME
@@ -237,7 +237,7 @@ def build_installer():
     result = subprocess.run(cmd)
     
     if result.returncode == 0:
-        print(f"\n  ✓ Installer created in dist/")
+        print(f"\n  OK Installer created in dist/")
     else:
         print(f"\n  ❌ Installer build failed")
 
@@ -258,7 +258,7 @@ def create_portable_zip():
     shutil.make_archive(str(zip_path), 'zip', 'dist', APP_NAME)
     
     size_mb = (Path(str(zip_path) + '.zip')).stat().st_size / (1024 * 1024)
-    print(f"  ✓ Created: {zip_path}.zip ({size_mb:.1f} MB)")
+    print(f"  OK Created: {zip_path}.zip ({size_mb:.1f} MB)")
 
 
 def post_build_report():
