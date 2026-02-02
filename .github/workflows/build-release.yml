@@ -3,12 +3,12 @@
 # ============================================================================
 #
 # Triggers:
-#   - Push a git tag like v1.0.0 → builds .exe + installer → uploads to GitHub Release
+#   - Push a git tag like v1.0.0 -> builds .exe + installer -> uploads to GitHub Release
 #
 # Usage:
 #   git tag v1.0.0
 #   git push origin v1.0.0
-#   → GitHub Actions builds and publishes the release automatically
+#   -> GitHub Actions builds and publishes the release automatically
 
 name: Build & Release
 
@@ -53,14 +53,14 @@ jobs:
         shell: python
         run: |
           import re
-          with open('app_config.py', 'r') as f:
+          with open('app_config.py', 'r', encoding='utf-8') as f:
               content = f.read()
           content = re.sub(
               r'APP_VERSION = ".*?"',
               f'APP_VERSION = "${{ steps.version.outputs.version }}"',
               content
           )
-          with open('app_config.py', 'w') as f:
+          with open('app_config.py', 'w', encoding='utf-8') as f:
               f.write(content)
       
       - name: Build with PyInstaller
