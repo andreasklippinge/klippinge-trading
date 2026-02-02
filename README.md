@@ -11,7 +11,7 @@ A professional pairs trading and portfolio management terminal built with PyQt5.
 - **Pairs Trading Analysis** — Cointegration testing, Ornstein-Uhlenbeck modeling, z-score signals
 - **HMM Regime Detection** — Bayesian Hidden Markov Models for market regime identification
 - **Portfolio Management** — Position tracking, daily snapshots, benchmark analysis vs S&P 500
-- **Automated Scanning** — Scheduled pair screening across 590+ Swedish stocks
+- **Automated Scanning** — Scheduled pair screening across 590+ stocks, currencies, indicies and crypto
 - **Morgan Stanley Mini Futures** — Live pricing and leveraged position sizing
 - **Discord Notifications** — Automated alerts for trade signals and scan results
 - **World Market Overview** — Real-time global market dashboard with volatility metrics
