@@ -76,7 +76,7 @@ def check_prerequisites():
     missing = [f for f in REQUIRED_FILES if not os.path.exists(f)]
     if missing:
         errors.append(f"Missing source files: {', '.join(missing)}")
-        print_step(3, f"Source files: {len(REQUIRED_FILES) - len(missing)}/{len(REQUIRED_FILES)} ❌")
+        print_step(3, f"Source files: {len(REQUIRED_FILES) - len(missing)}/{len(REQUIRED_FILES)} FAIL")
         for f in missing:
             print(f"       Missing: {f}")
     else:
@@ -91,10 +91,10 @@ def check_prerequisites():
             errors.append(f"Missing dependency: {dep}")
             deps_ok = False
     
-    print_step(4, f"Dependencies: {'OK' if deps_ok else '❌'}")
+    print_step(4, f"Dependencies: {'OK' if deps_ok else 'FAIL'}")
     
     if errors:
-        print(f"\n❌ Prerequisites check failed:")
+        print(f"\nFAIL Prerequisites check failed:")
         for e in errors:
             print(f"   • {e}")
         sys.exit(1)
@@ -187,7 +187,7 @@ def build_exe(one_file: bool = False):
     elapsed = time.time() - start
     
     if result.returncode != 0:
-        print(f"\n  ❌ Build failed after {elapsed:.0f}s")
+        print(f"\n  FAIL Build failed after {elapsed:.0f}s")
         sys.exit(1)
     
     print(f"\n  OK Build completed in {elapsed:.0f}s")
@@ -223,12 +223,12 @@ def build_installer():
             break
     
     if not iscc:
-        print("  ⚠ Inno Setup not found. Skipping installer build.")
+        print("  [WARN] Inno Setup not found. Skipping installer build.")
         print("  Install from: https://jrsoftware.org/isinfo.php")
         return
     
     if not os.path.exists(INNO_SCRIPT):
-        print(f"  ⚠ Inno Setup script not found: {INNO_SCRIPT}")
+        print(f"  [WARN] Inno Setup script not found: {INNO_SCRIPT}")
         return
     
     cmd = [iscc, INNO_SCRIPT]
@@ -239,7 +239,7 @@ def build_installer():
     if result.returncode == 0:
         print(f"\n  OK Installer created in dist/")
     else:
-        print(f"\n  ❌ Installer build failed")
+        print(f"\n  FAIL Installer build failed")
 
 
 def create_portable_zip():
@@ -248,7 +248,7 @@ def create_portable_zip():
     
     dist_dir = Path('dist') / APP_NAME
     if not dist_dir.exists():
-        print("  ❌ Build directory not found. Run build first.")
+        print("  FAIL Build directory not found. Run build first.")
         return
     
     zip_name = f"{APP_NAME}-v{VERSION}-portable-win64"
@@ -273,12 +273,12 @@ def post_build_report():
     for item in sorted(dist.iterdir()):
         if item.is_file():
             size_mb = item.stat().st_size / (1024 * 1024)
-            print(f"    📦 {item.name}  ({size_mb:.1f} MB)")
+            print(f"    [ZIP] {item.name}  ({size_mb:.1f} MB)")
         elif item.is_dir():
             total = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
             size_mb = total / (1024 * 1024)
             count = sum(1 for f in item.rglob('*') if f.is_file())
-            print(f"    📁 {item.name}/  ({count} files, {size_mb:.1f} MB)")
+            print(f"    [DIR] {item.name}/  ({count} files, {size_mb:.1f} MB)")
     
     print(f"\n  Next steps:")
     print(f"    1. Test the .exe: dist/{APP_NAME}/{APP_NAME}.exe")
