@@ -8,7 +8,7 @@ PyQt5>=5.15.9
 pyqtgraph>=0.13.3
 
 # Optional: Web engine for Plotly maps (large dependency, uncomment if needed)
-# PyQtWebEngine>=5.15.6
+PyQtWebEngine>=5.15.6
 
 # ── Scientific Computing ─────────────────────────────────────────────────────
 numpy>=1.24.0
