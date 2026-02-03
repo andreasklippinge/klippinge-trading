@@ -3788,11 +3788,10 @@ class PairsTradingTerminal(QMainWindow):
         # Load cached data
         QTimer.singleShot(100, self.load_initial_data)
         
-        # Auto-refresh timer (15 minutes = 900000 ms)
-        # OPTIMERING: Ändrat från 5 min till 15 min för att minska frysningar
+        # Auto-refresh timer (5 minutes = 300000 ms)
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_data)
-        self.auto_refresh_timer.start(300000)  # 15 minutes
+        self.auto_refresh_timer.start(300000)  # 5 minutes
         
         # Portfolio & engine cache sync timer (90 seconds) - for Google Drive sync
         self.sync_timer = QTimer(self)
@@ -3803,6 +3802,11 @@ class PairsTradingTerminal(QMainWindow):
         self.hmm_schedule_timer = QTimer(self)
         self.hmm_schedule_timer.timeout.connect(self.check_hmm_schedule)
         self.hmm_schedule_timer.start(60000)  # 1 minute
+        
+        # News feed auto-refresh timer (10 minutes = 600000 ms)
+        self.news_refresh_timer = QTimer(self)
+        self.news_refresh_timer.timeout.connect(self._refresh_news_feed_safe)
+        self.news_refresh_timer.start(600000)  # 10 minutes
         
         # Track last HMM update date
         self.last_hmm_update_date = None
@@ -3863,8 +3867,8 @@ class PairsTradingTerminal(QMainWindow):
         self.statusBar().showMessage("Auto-refreshing market data...")
         
         try:
-            # Starta market watch (smart filtering - endast öppna marknader)
-            self.refresh_market_watch()
+            # Starta market watch (hämta ALLA marknader varje gång)
+            self.refresh_market_watch(force_full=True)
             
             # Starta volatility refresh med fördröjning (så market watch hinner köra klart)
             QTimer.singleShot(5000, self._start_volatility_refresh_safe)
