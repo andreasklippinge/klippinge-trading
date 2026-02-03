@@ -4539,15 +4539,10 @@ class PairsTradingTerminal(QMainWindow):
         # Data menu
         data_menu = menubar.addMenu("Data")
         
-        refresh_market_action = QAction("Refresh Market Watch (Smart)", self)
+        refresh_market_action = QAction("Refresh Market Watch", self)
         refresh_market_action.setShortcut("F5")
-        refresh_market_action.triggered.connect(self.refresh_market_watch)
+        refresh_market_action.triggered.connect(lambda: self.refresh_market_watch(force_full=True))
         data_menu.addAction(refresh_market_action)
-        
-        refresh_market_full_action = QAction("Refresh Market Watch (All 69 Indices)", self)
-        refresh_market_full_action.setShortcut("Shift+F5")
-        refresh_market_full_action.triggered.connect(lambda: self.refresh_market_watch(force_full=True))
-        data_menu.addAction(refresh_market_full_action)
         
         refresh_vol_action = QAction("Refresh Volatility Data", self)
         refresh_vol_action.triggered.connect(self.refresh_market_data)
@@ -11616,11 +11611,10 @@ def main():
     window = PairsTradingTerminal()
     window.show()
 
-    # Check for updates in background (non-blocking)
+    # Start auto-updater (checks at startup + every 2 hours)
     try:
-        from auto_updater import AutoUpdater
-        window._updater = AutoUpdater(window)
-        window._updater.check_for_updates(silent=True)
+        from auto_updater import setup_auto_updater
+        window._updater = setup_auto_updater(window)
     except Exception as e:
         print(f"Auto-updater disabled: {e}")
     
