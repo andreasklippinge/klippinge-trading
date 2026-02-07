@@ -108,6 +108,21 @@ from app_config import (
     print_config, _is_frozen
 )
 
+# ── Screen scaling for different monitor sizes ──
+try:
+    from screen_scaling import (
+        get_scaled_typography,
+        get_scale_factor,
+        apply_screen_scaling,
+        get_layout_recommendations,
+        print_screen_info,
+        BASE_TYPOGRAPHY
+    )
+    SCREEN_SCALING_AVAILABLE = True
+except ImportError:
+    SCREEN_SCALING_AVAILABLE = False
+    print("Note: screen_scaling.py not found. Using default typography.")
+
 # ============================================================================
 # WEBENGINE MAP CONFIGURATION
 # ============================================================================
@@ -433,6 +448,29 @@ ENGINE_CACHE_FILE = Paths.engine_cache_file()
 PORTFOLIO_HISTORY_FILE = Paths.portfolio_history_file()
 
 # ============================================================================
+# GOOGLE DRIVE SYNC - Override paths for multi-computer sync
+# ============================================================================
+# If Google Drive paths exist, use them instead of local AppData
+_GDRIVE_TRADING_DIR = r"G:\Min enhet\Python\Aktieanalys\Python\Trading"
+
+if os.path.isdir(_GDRIVE_TRADING_DIR):
+    _gdrive_portfolio = os.path.join(_GDRIVE_TRADING_DIR, "portfolio_positions.json")
+    _gdrive_history = os.path.join(_GDRIVE_TRADING_DIR, "portfolio_history.json")
+    _gdrive_engine = os.path.join(_GDRIVE_TRADING_DIR, "pairs_engine_cache.pkl")
+    
+    if os.path.exists(_gdrive_portfolio) or not os.path.exists(PORTFOLIO_FILE):
+        PORTFOLIO_FILE = _gdrive_portfolio
+        print(f"[GDrive Sync] Portfolio: {PORTFOLIO_FILE}")
+    
+    if os.path.exists(_gdrive_history) or not os.path.exists(PORTFOLIO_HISTORY_FILE):
+        PORTFOLIO_HISTORY_FILE = _gdrive_history
+        print(f"[GDrive Sync] History: {PORTFOLIO_HISTORY_FILE}")
+    
+    if os.path.exists(_gdrive_engine) or not os.path.exists(ENGINE_CACHE_FILE):
+        ENGINE_CACHE_FILE = _gdrive_engine
+        print(f"[GDrive Sync] Engine cache: {ENGINE_CACHE_FILE}")
+
+# ============================================================================
 # COLOR PALETTE - Institutional Amber/Gold Theme
 # ============================================================================
 
@@ -478,10 +516,11 @@ COLORS = {
 }
 
 # ============================================================================
-# TYPOGRAPHY - Consistent Font Sizes Throughout Dashboard
+# TYPOGRAPHY - Dynamically Scaled Based on Screen Size
 # ============================================================================
 
-TYPOGRAPHY = {
+# Base typography (fallback if screen_scaling not available)
+_BASE_TYPOGRAPHY = {
     # Headers
     'header_large': 20,        # Main title (KLIPPINGE INVESTMENT)
     'header_section': 13,      # Section headers (ORNSTEIN-UHLENBECK DETAILS, etc.)
@@ -506,6 +545,17 @@ TYPOGRAPHY = {
     'clock_time': 18,          # World clock time
     'clock_city': 12,          # World clock city names
 }
+
+# Use scaled typography if available, otherwise use base
+if SCREEN_SCALING_AVAILABLE:
+    try:
+        TYPOGRAPHY = get_scaled_typography()
+        print(f"[Typography] Using scaled typography (factor: {get_scale_factor():.2f})")
+    except Exception as e:
+        print(f"[Typography] Scaling failed, using defaults: {e}")
+        TYPOGRAPHY = _BASE_TYPOGRAPHY.copy()
+else:
+    TYPOGRAPHY = _BASE_TYPOGRAPHY.copy()
 
 # ============================================================================
 # STYLESHEET - Professional Institutional Design
@@ -800,12 +850,13 @@ QMenu::separator {{
 
 /* ===== TOOLTIPS ===== */
 QToolTip {{
-    background-color: {COLORS['bg_elevated']};
-    color: {COLORS['text_primary']};
-    border: 1px solid {COLORS['accent_dark']};
-    padding: 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    background-color: #1a1a2e;
+    color: #e8e8e8;
+    border: 1px solid {COLORS['accent']};
+    padding: 10px 12px;
+    border-radius: 5px;
+    font-size: 12px;
+    font-family: 'Segoe UI', sans-serif;
 }}
 
 /* ===== STATUS BAR ===== */
@@ -896,28 +947,34 @@ def _release_lock(filepath: str):
     except Exception as e:
         print(f"[Portfolio] Error releasing lock: {e}")
 
-def save_portfolio(portfolio: list, filepath: str = PORTFOLIO_FILE) -> bool:
+def save_portfolio(portfolio: list, filepath: str = PORTFOLIO_FILE,
+                   trade_history: list = None) -> bool:
     """
-    Save portfolio positions to JSON file with file locking.
+    Save portfolio positions and trade history to JSON file with file locking.
     Safe for Google Drive sync between multiple computers.
-    
-    Args:
-        portfolio: List of position dictionaries
-        filepath: Path to save file
-        
-    Returns:
-        True if successful, False otherwise
     """
     if not _acquire_lock(filepath):
         print("[Portfolio] Could not save - file is locked")
         return False
     
     try:
+        # Preserve existing trade_history if not provided
+        existing_history = []
+        if trade_history is None:
+            try:
+                if os.path.exists(filepath):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                    existing_history = existing_data.get("trade_history", [])
+            except Exception:
+                pass
+        
         data = {
             "positions": portfolio,
+            "trade_history": trade_history if trade_history is not None else existing_history,
             "last_updated": datetime.now().isoformat(),
             "last_saved_by": socket.gethostname(),
-            "version": "1.1"
+            "version": "1.2"
         }
         
         # Ensure directory exists
@@ -1006,6 +1063,18 @@ def load_portfolio(filepath: str = PORTFOLIO_FILE) -> list:
         
     except Exception as e:
         print(f"[Portfolio] Error loading: {e}")
+        return []
+
+
+def load_trade_history(filepath: str = PORTFOLIO_FILE) -> list:
+    """Load trade history from portfolio JSON file."""
+    try:
+        if not os.path.exists(filepath):
+            return []
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get("trade_history", [])
+    except Exception:
         return []
 
 
@@ -1207,9 +1276,16 @@ def load_ticker_mapping(csv_path: str = None, force_reload: bool = False) -> tup
     
     try:
         # Try various paths - PRIORITIZE files with MS_Asset column!
+        # Google Drive paths FIRST for multi-computer sync
+        gdrive_matched = r"G:\Min enhet\Python\Aktieanalys\Python\Trading\underliggande_matchade_tickers.csv"
+        gdrive_index = r"G:\Min enhet\Python\Aktieanalys\Python\Trading\index_tickers.csv"
+        
         paths_to_try = [
             csv_path,
-            # Check underliggande_matchade_tickers.csv FIRST (has MS_Asset)
+            # Google Drive FIRST (for syncing between computers)
+            gdrive_matched if os.path.exists(gdrive_matched) else None,
+            gdrive_index if os.path.exists(gdrive_index) else None,
+            # Check underliggande_matchade_tickers.csv (has MS_Asset)
             find_matched_tickers_csv(),
             resource_path('underliggande_matchade_tickers.csv'),
             # Fallback to index_tickers.csv (no MS_Asset) LAST
@@ -1511,6 +1587,43 @@ def fetch_certificates_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
                 df['DailyLeverage'] = df[col].apply(parse_leverage)
                 break
         
+        # Parse financing level ("Finansieringsnivå") if present
+        def parse_number(x):
+            """Parse Swedish number format like '693,6187 SEK' or '5,688899' to float."""
+            if not isinstance(x, str):
+                return None
+            try:
+                # Remove SEK, spaces, and other non-numeric characters (except comma, dot, minus)
+                import re
+                clean = re.sub(r'[^\d,.\-]', '', x)
+                # Replace comma with dot for decimal
+                clean = clean.replace(',', '.')
+                return float(clean) if clean else None
+            except ValueError:
+                return None
+        
+        fin_cols = ['Finansieringsnivå', 'FinansieringsnivåNum', 'Financing Level']
+        for col in fin_cols:
+            if col in df.columns:
+                df['FinansieringsnivåNum'] = df[col].apply(parse_number) if col != 'FinansieringsnivåNum' else df[col]
+                break
+        
+        # Parse multiplier ("Multiplikator" or "Ratio")
+        mult_cols = ['Multiplikator', 'Multiplier']
+        for col in mult_cols:
+            if col in df.columns:
+                df['MultiplikatorNum'] = df[col].apply(parse_number)
+                break
+        
+        ratio_cols = ['Ratio', 'Kvot']
+        for col in ratio_cols:
+            if col in df.columns:
+                df['RatioNum'] = df[col].apply(parse_number)
+                # Calculate multiplier from ratio if not already set
+                if 'MultiplikatorNum' not in df.columns:
+                    df['MultiplikatorNum'] = 1.0 / df['RatioNum'].replace(0, float('nan'))
+                break
+        
         return df
         
     except Exception as e:
@@ -1560,6 +1673,17 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     if df_certs.empty:
         return None
     
+    # VIKTIGT: Verifiera att de hämtade certifikaten faktiskt är för rätt underliggande!
+    # Morgan Stanley kan returnera "populära produkter" om tillgången inte finns.
+    if 'Underliggande tillgång' in df_certs.columns:
+        # Filtrera på underliggande som matchar ms_name (case-insensitive)
+        mask = df_certs['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False)
+        df_certs = df_certs[mask]
+        
+        if df_certs.empty:
+            print(f"[Certificate] No certificates found matching underlying '{ms_name}' for {ticker}")
+            return None
+    
     # Filter by direction
     # For Bull/Bear: "Long" = Bull (positive leverage), "Short" = Bear (negative leverage)
     if 'Riktning' in df_certs.columns:
@@ -1603,14 +1727,37 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     # Get spot price for reference
     spot_price = get_spot_price(ticker)
     
+    # Get financing level and multiplier if available
+    financing_level = best.get('FinansieringsnivåNum', None)
+    multiplier = best.get('MultiplikatorNum', None)
+    ratio = best.get('RatioNum', None)
+    
+    # Calculate multiplier from ratio if not directly available
+    if multiplier is None and ratio is not None and ratio > 0:
+        multiplier = 1.0 / ratio
+    
+    # Calculate theoretical instrument price if we have the data
+    instrument_price = None
+    if financing_level is not None and spot_price is not None and multiplier is not None:
+        if direction.lower() == 'long':
+            # BULL: pris = multiplier × (spot - financing_level)
+            instrument_price = multiplier * (spot_price - financing_level)
+        else:
+            # BEAR: pris = multiplier × (financing_level - spot)
+            instrument_price = multiplier * (financing_level - spot_price)
+        instrument_price = max(0.01, abs(instrument_price))  # Ensure positive
+    
     return {
         'name': best.get('Namn', 'N/A'),
         'underlying': best.get('Underliggande tillgång', ms_name),
         'direction': direction,
-        'financing_level': None,  # Certificates don't have financing level
+        'financing_level': financing_level,
         'leverage': best['LeverageAbs'],  # Use absolute value for display
         'daily_leverage': best['DailyLeverage'],  # Keep original with sign
         'spot_price': spot_price,
+        'multiplier': multiplier,
+        'ratio': ratio,
+        'instrument_price': instrument_price,
         'isin': isin or 'N/A',
         'avanza_link': avanza_link,
         'ticker': ticker,
@@ -1780,17 +1927,33 @@ def find_best_minifuture(ticker: str, direction: str, ticker_to_ms: dict,
         df_asset = fetch_minifutures_for_asset(ms_asset)
         
         if not df_asset.empty:
-            
-            # Find Riktning column with flexible matching
-            riktning_col = None
+            # VIKTIGT: Verifiera att hämtade minifutures är för rätt underliggande!
+            # Morgan Stanley kan returnera "populära produkter" om tillgången inte finns.
+            underlying_col = None
             for col in df_asset.columns:
-                if 'riktning' in col.lower():
-                    riktning_col = col
+                if 'underliggande' in col.lower():
+                    underlying_col = col
                     break
             
-            if riktning_col:
-                mask = df_asset[riktning_col].str.contains(direction, case=False, na=False)
-                df_filtered = df_asset[mask].copy()
+            if underlying_col:
+                # Filtrera på underliggande som matchar ms_name
+                underlying_mask = df_asset[underlying_col].str.lower().str.contains(ms_name.lower(), na=False)
+                df_asset = df_asset[underlying_mask]
+                
+                if df_asset.empty:
+                    print(f"[MiniFuture] No products found matching underlying '{ms_name}' for {ticker}")
+            
+            if not df_asset.empty:
+                # Find Riktning column with flexible matching
+                riktning_col = None
+                for col in df_asset.columns:
+                    if 'riktning' in col.lower():
+                        riktning_col = col
+                        break
+                
+                if riktning_col:
+                    mask = df_asset[riktning_col].str.contains(direction, case=False, na=False)
+                    df_filtered = df_asset[mask].copy()
     
     # Fallback: Use the full DataFrame if direct fetch didn't work
     if df_filtered is None or df_filtered.empty:
@@ -2340,36 +2503,73 @@ class MarketWatchWorker(QObject):
     
     @Slot()
     def run(self):
+        """Fetch market data in batches for reliability.
+        
+        VIKTIGT: Undviker ThreadPoolExecutor inuti worker för att förhindra
+        sipBadCatcherResult-fel. Använder istället direkt batch-hämtning
+        med socket timeout för att förhindra hängning.
+        """
+        import socket
+        
+        # Spara original timeout och sätt en aggressiv timeout
+        original_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(15)  # 15 sekunder max per operation
+        
         try:
             import yfinance as yf
-            self.status_message.emit(f"Fetching market data for {len(self.tickers)} instruments...")
             
-            # Download 5 days of 30-min data
-            # FIX: threads=False förhindrar "Cannot join tz-naive with tz-aware DatetimeIndex" fel
-            # som uppstår när yfinance multi-threading mixar timezone-data för många tickers
-            try:
-                data = yf.download(self.tickers, period='5d', interval="30m", progress=False, threads=False, ignore_tz=True)
-            except (TypeError, RuntimeError) as e:
-                # Fallback: försök igen med lägre batch-storlek om det fortfarande misslyckas
-                print(f"[MarketDataWorker] First attempt failed ({e}), retrying with smaller batches...")
-                # Dela upp i batches om 50 tickers
-                all_data = []
-                batch_size = 50
-                for i in range(0, len(self.tickers), batch_size):
-                    batch = self.tickers[i:i+batch_size]
-                    try:
-                        batch_data = yf.download(batch, period='5d', interval="30m", progress=False, threads=False, ignore_tz=True)
-                        if not batch_data.empty:
-                            all_data.append(batch_data)
-                    except Exception as batch_e:
-                        print(f"[MarketDataWorker] Batch {i//batch_size + 1} failed: {batch_e}")
-                        continue
+            # Dela upp i mindre batches för stabilitet (10 tickers per batch)
+            batch_size = 10
+            all_data = []
+            total_batches = (len(self.tickers) + batch_size - 1) // batch_size
+            
+            self.status_message.emit(f"Fetching market data ({total_batches} batches)...")
+            print(f"[MarketWatch] Starting fetch of {len(self.tickers)} tickers in {total_batches} batches...")
+            
+            for i in range(0, len(self.tickers), batch_size):
+                batch = self.tickers[i:i+batch_size]
+                batch_num = i // batch_size + 1
                 
-                if all_data:
-                    data = pd.concat(all_data, axis=1)
-                else:
-                    data = pd.DataFrame()
+                # Uppdatera status för varje batch
+                self.status_message.emit(f"Market data: batch {batch_num}/{total_batches}...")
+                print(f"[MarketWatch] Fetching batch {batch_num}/{total_batches}: {batch[:3]}...")
+                
+                try:
+                    batch_data = yf.download(
+                        batch, 
+                        period='5d', 
+                        interval="30m", 
+                        progress=False, 
+                        threads=False,
+                        ignore_tz=True
+                    )['Close']
+                    
+                    if batch_data is not None and not batch_data.empty:
+                        all_data.append(batch_data)
+                        print(f"[MarketWatch] Batch {batch_num} OK: {len(batch_data)} rows")
+                    else:
+                        print(f"[MarketWatch] Batch {batch_num} returned empty data")
+                        
+                except socket.timeout:
+                    print(f"[MarketWatch] Batch {batch_num} timed out - skipping")
+                    continue
+                except Exception as e:
+                    print(f"[MarketWatch] Batch {batch_num} failed: {e}")
+                    continue
             
+            # Kombinera all data
+            if all_data:
+                try:
+                    data = pd.concat(all_data, axis=1)
+                    
+                    # Ta bort duplicerade kolumner (kan hända vid concat)
+                    data = data.loc[:, ~data.columns.duplicated()]
+                    print(f"[MarketWatch] Combined data: {len(data)} rows, {len(data.columns)} columns")
+                except Exception as e:
+                    print(f"[MarketWatch] Error concatenating data: {e}")
+                    data = all_data[0] if len(all_data) == 1 else pd.DataFrame()
+            else:
+                data = pd.DataFrame()
             
             if data.empty:
                 self.error.emit("No market data returned")
@@ -2383,7 +2583,9 @@ class MarketWatchWorker(QObject):
             else:
                 close = data
             
-            # Kopiera dict igen för säker signalering
+            print(f"[MarketWatch] Emitting result with {len(close.columns) if hasattr(close, 'columns') else 1} instruments")
+            
+            # Kopiera dict för säker signalering
             self.result.emit(close, dict(self.all_instruments))
             
         except Exception as e:
@@ -2391,6 +2593,8 @@ class MarketWatchWorker(QObject):
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
+            # Återställ original timeout
+            socket.setdefaulttimeout(original_timeout)
             self.finished.emit()
 
 
@@ -2414,8 +2618,7 @@ class VolatilityDataWorker(QObject):
             import yfinance as yf
             self.status_message.emit(f"Fetching volatility data for {len(self.tickers)} tickers...")
             
-            # Use shorter period to speed up
-            data = yf.download(self.tickers, period='max', progress=False, threads=False, ignore_tz=True)
+            data = yf.download(self.tickers, period='max', interval="1d", progress=False, threads=False, ignore_tz=True)['Close']
             
             if data.empty:
                 self.error.emit("No volatility data returned")
@@ -2467,28 +2670,11 @@ class PortfolioRefreshWorker(QObject):
             if self.engine is not None:
                 self.status_message.emit("Updating Z-scores...")
                 for pos in self.portfolio:
-                    if pos.get('status', 'OPEN') != 'OPEN':
-                        continue
                     try:
                         pair = pos['pair']
                         ou, spread, current_z = self.engine.get_pair_ou_params(pair, use_raw_data=True)
                         pos['previous_z'] = pos.get('current_z', pos['entry_z'])
                         pos['current_z'] = current_z
-                        
-                        # Check TP/SL conditions
-                        tp_z = pos.get('exit_z', 0.0)
-                        sl_z = pos.get('stop_z', 3.0)
-                        
-                        if pos['direction'] == 'LONG':
-                            if current_z >= tp_z:
-                                pos['status'] = 'TP HIT'
-                            elif current_z <= -abs(sl_z):
-                                pos['status'] = 'SL HIT'
-                        else:
-                            if current_z <= tp_z:
-                                pos['status'] = 'TP HIT'
-                            elif current_z >= abs(sl_z):
-                                pos['status'] = 'SL HIT'
                         
                         updated_z += 1
                     except Exception as e:
@@ -2533,7 +2719,7 @@ class PortfolioRefreshWorker(QObject):
 # ============================================================================
 
 class MarketClock(QFrame):
-    """Individual market clock widget (DST-aware)."""
+    """Individual market clock widget (DST-aware) with dynamic scaling."""
 
     def __init__(
         self,
@@ -2551,8 +2737,11 @@ class MarketClock(QFrame):
         self.market_open = market_open
         self.market_close = market_close
         self.lunch_break = lunch_break
-
-        self.setFixedSize(95, 52)
+        
+        # Default size (will be updated by dynamic layout)
+        self._base_width = 95
+        self._base_height = 52
+        self.setMinimumSize(80, 45)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -2588,6 +2777,32 @@ class MarketClock(QFrame):
         layout.addWidget(self.status_label)
 
         self.update_time()
+    
+    def scale_to(self, scale: float):
+        """Scale the clock widget based on window size."""
+        width = int(self._base_width * scale)
+        height = int(self._base_height * scale)
+        self.setFixedSize(max(80, width), max(45, height))
+        
+        # Scale fonts
+        city_font = max(9, int(12 * scale))
+        time_font = max(14, int(18 * scale))
+        status_font = max(8, int(11 * scale))
+        
+        self.city_label.setStyleSheet(
+            f"color:{COLORS['text_muted']}; font-size:{city_font}px; font-weight:600; letter-spacing:1px;"
+        )
+        self.time_label.setStyleSheet(
+            f"""
+            color:{COLORS['text_primary']};
+            font-size:{time_font}px;
+            font-weight:700;
+            font-family:'JetBrains Mono','Consolas',monospace;
+            """
+        )
+        self.status_label.setStyleSheet(
+            f"color:{COLORS['text_muted']}; font-size:{status_font}px;"
+        )
 
     def update_time(self):
         now = datetime.now(self.tz)
@@ -2658,15 +2873,17 @@ class MarketClock(QFrame):
 # ============================================================================
 
 class HeaderBar(QFrame):
-    """Professional header bar with logo, clocks, and market status."""
+    """Professional header bar with logo, clocks, and market status - dynamically scalable."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         
         # Fix #4: Cache clock references instead of using findChildren
         self._market_clocks = []
-
-        self.setFixedHeight(62)
+        
+        # Base dimensions for scaling
+        self._base_height = 62
+        self.setMinimumHeight(50)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 6, 20, 6)
@@ -2676,26 +2893,26 @@ class HeaderBar(QFrame):
         left_section = QHBoxLayout()
         left_section.setSpacing(12)
 
-        logo = QLabel("◈")
-        logo.setStyleSheet(
+        self.logo = QLabel("◈")
+        self.logo.setStyleSheet(
             f"color:{COLORS['accent']}; font-size:32px; font-weight:bold;"
         )
-        left_section.addWidget(logo)
+        left_section.addWidget(self.logo)
 
         title_layout = QVBoxLayout()
         title_layout.setSpacing(0)
 
-        title = QLabel("KLIPPINGE INVESTMENT")
-        title.setStyleSheet(
+        self.title = QLabel("KLIPPINGE INVESTMENT")
+        self.title.setStyleSheet(
             f"color:{COLORS['accent']}; font-size:20px; font-weight:700; letter-spacing:1px;"
         )
-        title_layout.addWidget(title)
+        title_layout.addWidget(self.title)
 
-        subtitle = QLabel("TRADING TERMINAL")
-        subtitle.setStyleSheet(
+        self.subtitle = QLabel("TRADING TERMINAL")
+        self.subtitle.setStyleSheet(
             f"color:{COLORS['accent']}; font-size:15px; font-weight:500; letter-spacing:2px;"
         )
-        title_layout.addWidget(subtitle)
+        title_layout.addWidget(self.subtitle)
 
         left_section.addLayout(title_layout)
         layout.addLayout(left_section)
@@ -2754,6 +2971,52 @@ class HeaderBar(QFrame):
         self.timer.start(1000)
 
         self.update_clocks()
+    
+    def scale_to(self, scale: float):
+        """Scale the header bar and all its children based on window size."""
+        # Scale header height
+        height = int(self._base_height * scale)
+        self.setFixedHeight(max(50, height))
+        
+        # Scale logo
+        logo_size = max(24, int(32 * scale))
+        self.logo.setStyleSheet(
+            f"color:{COLORS['accent']}; font-size:{logo_size}px; font-weight:bold;"
+        )
+        
+        # Scale title
+        title_size = max(16, int(20 * scale))
+        self.title.setStyleSheet(
+            f"color:{COLORS['accent']}; font-size:{title_size}px; font-weight:700; letter-spacing:1px;"
+        )
+        
+        # Scale subtitle
+        subtitle_size = max(12, int(15 * scale))
+        self.subtitle.setStyleSheet(
+            f"color:{COLORS['accent']}; font-size:{subtitle_size}px; font-weight:500; letter-spacing:2px;"
+        )
+        
+        # Scale status indicator
+        status_size = max(10, int(12 * scale))
+        # Keep current color state
+        current_style = self.status_indicator.styleSheet()
+        if COLORS['positive'] in current_style:
+            color = COLORS['positive']
+        else:
+            color = COLORS['negative']
+        self.status_indicator.setStyleSheet(
+            f"color:{color}; font-size:{status_size}px; font-weight:600; letter-spacing:1px;"
+        )
+        
+        # Scale timestamp
+        ts_size = max(8, int(10 * scale))
+        self.timestamp.setStyleSheet(
+            f"color:{COLORS['text_muted']}; font-size:{ts_size}px; font-family:'JetBrains Mono','Consolas',monospace;"
+        )
+        
+        # Scale all market clocks
+        for clock in self._market_clocks:
+            clock.scale_to(scale)
 
     def update_clocks(self):
         # Fix #4: Use cached clock references instead of findChildren
@@ -2868,11 +3131,17 @@ class LoadingOverlay(QWidget):
 # ============================================================================
 
 class MetricCard(QFrame):
-    """Metric display card with gradient background."""
+    """Metric display card with gradient background - dynamically scalable."""
     
-    def __init__(self, label: str, value: str = "-", parent=None):
+    def __init__(self, label: str, value: str = "-", tooltip: str = "", parent=None):
         super().__init__(parent)
-        # self.setMinimumHeight(90)
+        self._base_label_font = 12
+        self._base_value_font = 22
+        self._current_color = COLORS['text_primary']
+        
+        if tooltip:
+            self.setToolTip(tooltip)
+        
         self.setStyleSheet(f"""
             QFrame {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -2883,6 +3152,14 @@ class MetricCard(QFrame):
             }}
             QFrame:hover {{
                 border-color: {COLORS['accent_dark']};
+            }}
+            QToolTip {{
+                background-color: #1a1a2e;
+                color: #e8e8e8;
+                border: 1px solid {COLORS['accent']};
+                padding: 10px 12px;
+                border-radius: 5px;
+                font-size: 12px;
             }}
         """)
         
@@ -2916,9 +3193,33 @@ class MetricCard(QFrame):
         layout.addWidget(self.value_widget)
         layout.addStretch()
     
+    def scale_to(self, scale: float):
+        """Scale the metric card based on window size."""
+        label_font = max(9, int(self._base_label_font * scale))
+        value_font = max(16, int(self._base_value_font * scale))
+        
+        self.label_widget.setStyleSheet(f"""
+            color: {COLORS['text_muted']}; 
+            font-size: {label_font}px; 
+            text-transform: uppercase; 
+            letter-spacing: 1px; 
+            background: transparent; 
+            border: none;
+        """)
+        
+        self.value_widget.setStyleSheet(f"""
+            color: {self._current_color}; 
+            font-size: {value_font}px; 
+            font-weight: 600; 
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+            background: transparent; 
+            border: none;
+        """)
+    
     def set_value(self, value: str, color: str = None):
         if color is None:
             color = COLORS['text_primary']
+        self._current_color = color
         self.value_widget.setText(value)
         self.value_widget.setStyleSheet(f"""
             color: {color}; 
@@ -2988,14 +3289,109 @@ class CompactMetricCard(QFrame):
         """)
 
 
+class VolatilitySparkline(QWidget):
+    """Sparkline chart for volatility cards with median line - dynamically scalable."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.values = []
+        self.color = QColor(COLORS['accent'])
+        self.median_value = None
+        self._base_height = 35
+        self.setMinimumHeight(25)
+        self.setMinimumWidth(80)
+        self.setStyleSheet("background: transparent; border: none;")
+    
+    def scale_to(self, scale: float):
+        """Scale the sparkline height based on window size."""
+        height = max(25, int(self._base_height * scale))
+        self.setFixedHeight(height)
+    
+    def set_data(self, values: list, color: str = None, median: float = None):
+        """Set data for sparkline."""
+        if color is None:
+            color = COLORS['accent']
+        self.values = values if values else []
+        self.color = QColor(color)
+        self.median_value = median
+        self.update()
+    
+    def paintEvent(self, event):
+        """Draw the sparkline with optional median line."""
+        if len(self.values) < 2:
+            return
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Calculate bounds
+        min_v = min(self.values)
+        max_v = max(self.values)
+        value_range = max_v - min_v if max_v != min_v else 1
+        
+        w = self.width()
+        h = self.height()
+        padding_x = 4
+        padding_y = 3
+        
+        # Helper function to convert value to y coordinate
+        def value_to_y(val):
+            return h - padding_y - ((val - min_v) / value_range) * (h - 2 * padding_y)
+        
+        # Create points
+        points = []
+        for i, val in enumerate(self.values):
+            x = padding_x + (i / (len(self.values) - 1)) * (w - 2 * padding_x)
+            y = value_to_y(val)
+            points.append((x, y))
+        
+        # Draw filled area (gradient)
+        fill_color = QColor(self.color)
+        fill_color.setAlpha(30)
+        painter.setBrush(QBrush(fill_color))
+        painter.setPen(Qt.NoPen)
+        
+        polygon = QPolygonF()
+        polygon.append(QPointF(points[0][0], h))
+        for x, y in points:
+            polygon.append(QPointF(x, y))
+        polygon.append(QPointF(points[-1][0], h))
+        painter.drawPolygon(polygon)
+        
+        # Draw median line if available
+        if self.median_value is not None and min_v <= self.median_value <= max_v:
+            median_y = value_to_y(self.median_value)
+            pen = QPen(QColor(COLORS['text_muted']), 1, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(padding_x, median_y), QPointF(w - padding_x, median_y))
+        
+        # Draw main line
+        pen = QPen(self.color, 1.5)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        
+        for i in range(len(points) - 1):
+            painter.drawLine(
+                QPointF(points[i][0], points[i][1]),
+                QPointF(points[i+1][0], points[i+1][1])
+            )
+        
+        # Draw end point (current value)
+        painter.setBrush(QBrush(self.color))
+        painter.drawEllipse(QPointF(points[-1][0], points[-1][1]), 3, 3)
+
+
 class VolatilityCard(QFrame):
-    """Volatility indicator card with gradient background."""
+    """Volatility indicator card with gradient background and sparkline chart."""
     
     def __init__(self, ticker: str, name: str, description: str = "", parent=None):
         super().__init__(parent)
         self.ticker = ticker
         self.name = name
-        self.setMinimumHeight(125)
+        self._history_data = []  # Store historical data for sparkline
+        
+        self.setMinimumHeight(165)  # Increased to accommodate sparkline
         self.setStyleSheet(f"""
             QFrame {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -3012,8 +3408,8 @@ class VolatilityCard(QFrame):
         """)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(5)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
         
         # Row 1: Name and change %
         row1 = QHBoxLayout()
@@ -3046,7 +3442,11 @@ class VolatilityCard(QFrame):
         self.mode_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
         layout.addWidget(self.mode_label)
         
-        # Row 4: Description
+        # Row 4: Sparkline chart (NEW!)
+        self.sparkline = VolatilitySparkline()
+        layout.addWidget(self.sparkline)
+        
+        # Row 5: Description
         self.desc_label = QLabel(description)
         self.desc_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-style: italic; background: transparent; border: none;")
         self.desc_label.setWordWrap(True)
@@ -3055,7 +3455,13 @@ class VolatilityCard(QFrame):
         layout.addStretch()
     
     def update_data(self, value: float, change_pct: float, percentile: float, 
-                    median: float, mode: float, description: str):
+                    median: float, mode: float, description: str,
+                    history: list = None):
+        """Update card with new data.
+        
+        Args:
+            history: Optional list of historical values for sparkline (last ~60 days)
+        """
         # Value with color based on level
         self.value_label.setText(f"{value:.2f}")
         
@@ -3083,15 +3489,59 @@ class VolatilityCard(QFrame):
         
         # Description
         self.desc_label.setText(description)
+        
+        # Update sparkline if history provided
+        if history is not None and len(history) > 1:
+            self._history_data = history
+            # Determine color based on trend (last value vs first value)
+            if history[-1] > history[0]:
+                spark_color = COLORS['negative']  # Rising = more fear
+            else:
+                spark_color = COLORS['positive']  # Falling = less fear
+            self.sparkline.set_data(history, spark_color, median)
+    
+    def scale_to(self, scale: float):
+        """Scale the volatility card based on window size."""
+        # Scale fonts
+        name_font = max(11, int(13 * scale))
+        value_font = max(14, int(18 * scale))
+        pct_font = max(11, int(13 * scale))
+        stat_font = max(10, int(12 * scale))
+        desc_font = max(10, int(12 * scale))
+        
+        self.name_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: {name_font}px; font-weight: 600; background: transparent; border: none;")
+        self.value_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: {value_font}px; font-family: 'JetBrains Mono', 'Consolas', monospace; font-weight: 600; background: transparent; border: none;")
+        
+        # Keep pct_label color
+        current_style = self.pct_label.styleSheet()
+        for color in [COLORS['positive'], COLORS['accent'], COLORS['warning'], COLORS['negative']]:
+            if color in current_style:
+                self.pct_label.setStyleSheet(f"color: {color}; font-size: {pct_font}px; background: transparent; border: none;")
+                break
+        
+        self.median_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {stat_font}px; background: transparent; border: none;")
+        self.mode_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {stat_font}px; background: transparent; border: none;")
+        self.desc_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {desc_font}px; font-style: italic; background: transparent; border: none;")
+        
+        # Scale sparkline
+        self.sparkline.scale_to(scale)
 
 class SparklineWidget(QWidget):
-    """Mini sparkline chart widget for market watch."""
+    """Mini sparkline chart widget for market watch - dynamically scalable."""
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.prices = []
         self.color = QColor(COLORS['positive'])
-        self.setFixedSize(50, 18)
+        self._base_width = 50
+        self._base_height = 18
+        self.setMinimumSize(40, 14)
+    
+    def scale_to(self, scale: float):
+        """Scale the sparkline based on window size."""
+        width = max(40, int(self._base_width * scale))
+        height = max(14, int(self._base_height * scale))
+        self.setFixedSize(width, height)
     
     def set_data(self, prices: list, color: str = None):
         """Set price data and color for sparkline."""
@@ -3152,14 +3602,28 @@ class SparklineWidget(QWidget):
 
 
 class SectionHeader(QLabel):
-    """Section header label with amber accent."""
+    """Section header label with amber accent - dynamically scalable."""
     
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
+        self._base_font = 13
         self.setObjectName("sectionHeader")
         self.setStyleSheet(f"""
             color: {COLORS['accent']}; 
             font-size: {TYPOGRAPHY['header_section']}px; 
+            font-weight: 600; 
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            padding: 8px 0;
+            background: transparent;
+        """)
+    
+    def scale_to(self, scale: float):
+        """Scale the section header based on window size."""
+        font_size = max(10, int(self._base_font * scale))
+        self.setStyleSheet(f"""
+            color: {COLORS['accent']}; 
+            font-size: {font_size}px; 
             font-weight: 600; 
             letter-spacing: 1.5px;
             text-transform: uppercase;
@@ -3248,13 +3712,17 @@ class CompactHMMCard(QFrame):
 
 
 class NewsItem(QFrame):
-    """Compact news item widget - shows only title, ticker and time."""
+    """Compact news item widget - shows only title, ticker and time - dynamically scalable."""
     
     clicked = Signal(str)  # Emits URL when clicked
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.url = ""
+        self._base_ticker_size = (50, 25)
+        self._base_time_size = (50, 25)
+        self._base_font_size = 13
+        
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(f"""
             QFrame {{
@@ -3288,9 +3756,8 @@ class NewsItem(QFrame):
                 border-radius: 3px;
             }}
         """)
-        self.ticker_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.ticker_label.setFixedSize(50,25)
         self.ticker_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.ticker_label.setMinimumSize(40, 20)
         
         layout.addWidget(self.ticker_label)
                 
@@ -3298,8 +3765,35 @@ class NewsItem(QFrame):
         self.time_label = QLabel("")
         self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; background: transparent; border: none; text-align: center;")
         self.time_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.time_label.setFixedSize(50,25)
+        self.time_label.setMinimumSize(40, 20)
         layout.addWidget(self.time_label)
+    
+    def scale_to(self, scale: float):
+        """Scale the news item based on window size."""
+        # Scale ticker badge
+        tw = max(40, int(self._base_ticker_size[0] * scale))
+        th = max(20, int(self._base_ticker_size[1] * scale))
+        self.ticker_label.setFixedSize(tw, th)
+        
+        # Scale time label
+        self.time_label.setFixedSize(tw, th)
+        
+        # Scale fonts
+        title_font = max(11, int(self._base_font_size * scale))
+        badge_font = max(9, int(11 * scale))
+        
+        self.title_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: {title_font}px; background: transparent; border: none;")
+        self.ticker_label.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['accent']};
+                border: 1px solid {COLORS['accent']};
+                font-size: {badge_font}px;
+                font-weight: 600;
+                padding: 2px 5px;
+                border-radius: 3px;
+            }}
+        """)
+        self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {badge_font}px; background: transparent; border: none; text-align: center;")
     
     def set_news(self, title: str, time_str: str, url: str, ticker: str):
         """Set the news item data."""
@@ -3364,7 +3858,10 @@ def save_news_cache(news_items: list):
 
 
 class NewsFeedWorker(QObject):
-    """Worker thread for fetching news from yfinance for all tickers."""
+    """Worker thread for fetching news from yfinance for all tickers.
+    
+    OPTIMIZED: Uses ThreadPoolExecutor for parallel fetching (~5-10x faster).
+    """
     
     finished = Signal()
     result = Signal(list)  # List of news items
@@ -3375,11 +3872,92 @@ class NewsFeedWorker(QObject):
         super().__init__()
         self.csv_path = csv_path or SCHEDULED_CSV_PATH
     
-    def run(self):
-        """Fetch news for all tickers from CSV file."""
+    def _fetch_ticker_news(self, ticker_symbol: str, cutoff_ts: float) -> list:
+        """Fetch news for a single ticker. Returns list of news items."""
+        import yfinance as yf
+        from datetime import datetime
+        
+        news_items = []
         try:
-            import yfinance as yf
+            ticker = yf.Ticker(ticker_symbol)
+            news_list = ticker.news
+            
+            if not news_list:
+                return []
+            
+            for item in news_list:
+                # Handle both old and new yfinance formats
+                if 'content' in item:
+                    content = item['content']
+                    content_type = content.get('contentType', '')
+                    
+                    # Filter: only STORY type
+                    if content_type != 'STORY':
+                        continue
+                    
+                    news_id = content.get('id', '')
+                    title = content.get('title', 'No title')
+                    
+                    # Get URL from clickThroughUrl
+                    click_url = content.get('clickThroughUrl', {})
+                    url = click_url.get('url', '') if isinstance(click_url, dict) else ''
+                    
+                    # Get publish time
+                    pub_date_str = content.get('pubDate', '')
+                    if pub_date_str:
+                        try:
+                            dt = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00'))
+                            timestamp = dt.timestamp()
+                        except:
+                            timestamp = 0
+                    else:
+                        timestamp = 0
+                    
+                    # Get provider/source
+                    provider = content.get('provider', {})
+                    source = provider.get('displayName', 'Unknown') if isinstance(provider, dict) else 'Unknown'
+                else:
+                    # Old yfinance format
+                    news_id = item.get('uuid', item.get('id', ''))
+                    title = item.get('title', 'No title')
+                    url = item.get('link', '')
+                    timestamp = item.get('providerPublishTime', 0)
+                    source = item.get('publisher', 'Unknown')
+                
+                # Skip if older than 24h
+                if timestamp < cutoff_ts:
+                    continue
+                
+                # Format time string
+                if timestamp > 0:
+                    dt = datetime.fromtimestamp(timestamp)
+                    if dt.date() == datetime.now().date():
+                        time_str = dt.strftime('%H:%M')
+                    else:
+                        time_str = dt.strftime('%d %b %H:%M')
+                else:
+                    time_str = ""
+                
+                news_items.append({
+                    'id': news_id,
+                    'title': title,
+                    'source': source,
+                    'time': time_str,
+                    'timestamp': timestamp,
+                    'ticker': ticker_symbol,
+                    'url': url
+                })
+                
+        except Exception as e:
+            pass  # Skip problematic tickers silently
+        
+        return news_items
+    
+    def run(self):
+        """Fetch news for all tickers from CSV file using parallel execution."""
+        try:
             from datetime import datetime, timedelta
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
             # Load existing cache
             cached_news = load_news_cache()
@@ -3402,7 +3980,7 @@ class NewsFeedWorker(QObject):
                 tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
                 print(f"[NewsFeed] Using default tickers: {tickers}")
             
-            self.status_message.emit(f"Fetching news for {len(tickers)} tickers...")
+            self.status_message.emit(f"Fetching news for {len(tickers)} tickers (parallel)...")
             
             # 24 hour cutoff
             cutoff = datetime.now() - timedelta(hours=24)
@@ -3411,94 +3989,34 @@ class NewsFeedWorker(QObject):
             all_news = list(cached_news)  # Start with cached
             new_count = 0
             
-            # Fetch news for each ticker
-            for i, ticker_symbol in enumerate(tickers):
-                if i % 20 == 0:
-                    self.status_message.emit(f"Fetching news... {i}/{len(tickers)} tickers")
+            # PARALLEL FETCH using ThreadPoolExecutor
+            # Use 5 workers - reduced from 10 to avoid overwhelming yfinance API
+            MAX_WORKERS = 5
+            completed = 0
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Submit all tasks
+                future_to_ticker = {
+                    executor.submit(self._fetch_ticker_news, ticker, cutoff_ts): ticker
+                    for ticker in tickers
+                }
                 
-                try:
-                    ticker = yf.Ticker(ticker_symbol)
-                    news_list = ticker.news
+                # Collect results as they complete
+                for future in as_completed(future_to_ticker):
+                    completed += 1
+                    if completed % 20 == 0:
+                        self.status_message.emit(f"Fetching news... {completed}/{len(tickers)} tickers")
                     
-                    if not news_list:
-                        continue
-                    
-                    for item in news_list:
-                        # Handle both old and new yfinance formats
-                        # New format has 'content' dict, old format has fields directly
-                        if 'content' in item:
-                            content = item['content']
-                            content_type = content.get('contentType', '')
-                            
-                            # Filter: only STORY type
-                            if content_type != 'STORY':
-                                continue
-                            
-                            news_id = content.get('id', '')
-                            title = content.get('title', 'No title')
-                            
-                            # Get URL from clickThroughUrl
-                            click_url = content.get('clickThroughUrl', {})
-                            url = click_url.get('url', '') if isinstance(click_url, dict) else ''
-                            
-                            # Get publish time
-                            pub_date_str = content.get('pubDate', '')
-                            if pub_date_str:
-                                try:
-                                    # Parse ISO format: "2026-01-28T00:50:04Z"
-                                    dt = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00'))
-                                    timestamp = dt.timestamp()
-                                except:
-                                    timestamp = 0
-                            else:
-                                timestamp = 0
-                            
-                            # Get provider/source
-                            provider = content.get('provider', {})
-                            source = provider.get('displayName', 'Unknown') if isinstance(provider, dict) else 'Unknown'
-                        else:
-                            # Old yfinance format
-                            news_id = item.get('uuid', item.get('id', ''))
-                            title = item.get('title', 'No title')
-                            url = item.get('link', '')
-                            timestamp = item.get('providerPublishTime', 0)
-                            source = item.get('publisher', 'Unknown')
-                        
-                        # Skip if older than 24h
-                        if timestamp < cutoff_ts:
-                            continue
-                        
-                        # Skip duplicates
-                        if news_id in cached_ids:
-                            continue
-                        
-                        # Format time string
-                        if timestamp > 0:
-                            dt = datetime.fromtimestamp(timestamp)
-                            if dt.date() == datetime.now().date():
-                                time_str = dt.strftime('%H:%M')
-                            else:
-                                time_str = dt.strftime('%d %b %H:%M')
-                        else:
-                            time_str = ""
-                        
-                        news_item = {
-                            'id': news_id,
-                            'title': title,
-                            'source': source,
-                            'time': time_str,
-                            'timestamp': timestamp,
-                            'ticker': ticker_symbol,
-                            'url': url
-                        }
-                        
-                        all_news.append(news_item)
-                        cached_ids.add(news_id)
-                        new_count += 1
-                        
-                except Exception as e:
-                    # Skip problematic tickers silently
-                    continue
+                    try:
+                        news_items = future.result()
+                        for news_item in news_items:
+                            news_id = news_item.get('id')
+                            if news_id and news_id not in cached_ids:
+                                all_news.append(news_item)
+                                cached_ids.add(news_id)
+                                new_count += 1
+                    except Exception as e:
+                        pass  # Skip failed tickers
             
             # Sort by timestamp (newest first)
             all_news.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
@@ -3562,7 +4080,8 @@ class NewsFeedWidget(QWidget):
         
         # Refresh button with visible icon
         self.refresh_btn = QPushButton("↻")
-        self.refresh_btn.setFixedSize(25, 25)
+        self._base_btn_size = 25
+        self.refresh_btn.setMinimumSize(22, 22)
         
         self.refresh_btn.setStyleSheet(f"""
             QPushButton {{
@@ -3623,6 +4142,17 @@ class NewsFeedWidget(QWidget):
         
         # Load cached news immediately
         self._load_cached_news()
+    
+    def scale_to(self, scale: float):
+        """Scale the news feed widget based on window size."""
+        # Scale refresh button
+        btn_size = max(22, int(self._base_btn_size * scale))
+        self.refresh_btn.setFixedSize(btn_size, btn_size)
+        
+        # Scale all news items
+        for item in self.news_items:
+            if hasattr(item, 'scale_to'):
+                item.scale_to(scale)
     
     def _load_cached_news(self):
         """Load and display cached news immediately."""
@@ -3731,6 +4261,7 @@ class PairsTradingTerminal(QMainWindow):
         self.selected_pair: Optional[str] = None  # For analytics tab
         self.signal_selected_pair: Optional[str] = None  # For signals tab (separate to avoid conflicts)
         self.portfolio: List[Dict] = []
+        self.trade_history: List[Dict] = []  # Closed positions history
         self.worker_thread: Optional[QThread] = None
         self.worker = None  # Fix #8: Track worker for cleanup
         self.current_mini_futures: Dict = {}
@@ -3788,7 +4319,14 @@ class PairsTradingTerminal(QMainWindow):
         # Load cached data
         QTimer.singleShot(100, self.load_initial_data)
         
-        # Auto-refresh timer (5 minutes = 300000 ms)
+        # =====================================================================
+        # INDEPENDENT REFRESH TIMERS
+        # Market watch + volatility: chained (both use yf.download), 5 min
+        # News: fully independent (uses Ticker.news endpoint), 15 min
+        # Watchdog: force-resets stuck thread flags, 30s check interval
+        # =====================================================================
+        
+        # Market watch + volatility: every 5 minutes
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_data)
         self.auto_refresh_timer.start(300000)  # 5 minutes
@@ -3803,13 +4341,21 @@ class PairsTradingTerminal(QMainWindow):
         self.hmm_schedule_timer.timeout.connect(self.check_hmm_schedule)
         self.hmm_schedule_timer.start(60000)  # 1 minute
         
-        # News feed auto-refresh timer (10 minutes = 600000 ms)
+        # News feed: every 15 minutes (defers if yfinance busy)
         self.news_refresh_timer = QTimer(self)
         self.news_refresh_timer.timeout.connect(self._refresh_news_feed_safe)
-        self.news_refresh_timer.start(600000)  # 10 minutes
+        self.news_refresh_timer.start(900000)  # 15 minutes
+        
+        # Watchdog: detect and recover from stuck threads (30s interval)
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(self._watchdog_check)
+        self._watchdog_timer.start(30000)  # 30 seconds
         
         # Track last HMM update date
         self.last_hmm_update_date = None
+        
+        # Apply initial dynamic layout after window is shown
+        QTimer.singleShot(200, self._apply_dynamic_layout)
     
     # =========================================================================
     # WINDOW ACTIVATION FIX (Windows-specific)
@@ -3854,32 +4400,383 @@ class PairsTradingTerminal(QMainWindow):
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
     
-    def auto_refresh_data(self):
-        """Auto-refresh market data, Z-scores and MF prices.
+    # =========================================================================
+    # DYNAMIC LAYOUT - Resize handling for different window sizes
+    # =========================================================================
+    
+    def resizeEvent(self, event):
+        """Handle window resize - dynamically adjust layout elements."""
+        super().resizeEvent(event)
         
-        OPTIMERING: Serialiserade anrop för att undvika yfinance race conditions.
-        Ordning: market_watch → (fördröjd) volatility → portfolio
+        # Get new window size
+        new_width = event.size().width()
+        new_height = event.size().height()
+        
+        # Debounce: only update if size changed significantly (> 50px)
+        if not hasattr(self, '_last_resize_width'):
+            self._last_resize_width = 0
+            self._last_resize_height = 0
+        
+        width_changed = abs(new_width - self._last_resize_width) > 50
+        height_changed = abs(new_height - self._last_resize_height) > 50
+        
+        if width_changed or height_changed:
+            self._last_resize_width = new_width
+            self._last_resize_height = new_height
+            
+            # Use timer to debounce rapid resize events
+            if not hasattr(self, '_resize_timer'):
+                self._resize_timer = QTimer(self)
+                self._resize_timer.setSingleShot(True)
+                self._resize_timer.timeout.connect(self._apply_dynamic_layout)
+            
+            self._resize_timer.start(150)  # 150ms debounce
+    
+    def _apply_dynamic_layout(self):
+        """Apply layout changes based on current window size.
+        
+        Dynamically adjusts:
+        - News feed width
+        - Volatility card heights
+        - Table row heights and font sizes
+        - Chart heights
+        - Metric card sizes
+        - General spacing and fonts
         """
-        # Vänta tills startup är klar
+        try:
+            width = self.width()
+            height = self.height()
+            
+            # Calculate scale factor based on window width
+            # Reference: 1920px = 1.0 scale factor
+            scale = width / 1920.0
+            scale = max(0.7, min(1.4, scale))  # Clamp between 0.7 and 1.4
+            
+            # Define layout parameters for each category
+            if width < 1400:
+                category = "small"
+                params = {
+                    'news_min': 250, 'news_max': 300,
+                    'vol_card_height': 145,
+                    'table_row_height': 26,
+                    'table_font': 11,
+                    'header_font': 12,
+                    'metric_value_font': 18,
+                    'metric_label_font': 10,
+                    'chart_height': 200,
+                    'spacing': 4,
+                }
+            elif width < 2000:
+                category = "medium"
+                params = {
+                    'news_min': 300, 'news_max': 380,
+                    'vol_card_height': 165,
+                    'table_row_height': 30,
+                    'table_font': 13,
+                    'header_font': 13,
+                    'metric_value_font': 22,
+                    'metric_label_font': 12,
+                    'chart_height': 250,
+                    'spacing': 5,
+                }
+            elif width < 3000:
+                category = "large"
+                params = {
+                    'news_min': 350, 'news_max': 450,
+                    'vol_card_height': 175,
+                    'table_row_height': 34,
+                    'table_font': 14,
+                    'header_font': 14,
+                    'metric_value_font': 26,
+                    'metric_label_font': 13,
+                    'chart_height': 300,
+                    'spacing': 6,
+                }
+            else:
+                category = "xlarge"
+                params = {
+                    'news_min': 400, 'news_max': 520,
+                    'vol_card_height': 190,
+                    'table_row_height': 38,
+                    'table_font': 15,
+                    'header_font': 15,
+                    'metric_value_font': 28,
+                    'metric_label_font': 14,
+                    'chart_height': 350,
+                    'spacing': 8,
+                }
+            
+            # Store current params for other methods to use
+            self._layout_params = params
+            self._layout_scale = scale
+            
+            # ─── NEWS FEED ───
+            if hasattr(self, 'news_feed') and self.news_feed:
+                self.news_feed.setMinimumWidth(params['news_min'])
+                self.news_feed.setMaximumWidth(params['news_max'])
+            
+            # ─── VOLATILITY CARDS ───
+            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'move_card']:
+                if hasattr(self, card_name):
+                    card = getattr(self, card_name)
+                    if card:
+                        card.setMinimumHeight(params['vol_card_height'])
+            
+            # ─── TABLES ───
+            # Portfolio table
+            if hasattr(self, 'portfolio_table') and self.portfolio_table:
+                self._apply_table_scaling(self.portfolio_table, params)
+            
+            # Signals table
+            if hasattr(self, 'signals_table') and self.signals_table:
+                self._apply_table_scaling(self.signals_table, params)
+            
+            # Pairs table
+            if hasattr(self, 'pairs_table') and self.pairs_table:
+                self._apply_table_scaling(self.pairs_table, params)
+            
+            # Market watch tables
+            for table_name in ['us_table', 'eu_table', 'asia_table', 'commodities_table', 'crypto_table', 'macro_table']:
+                if hasattr(self, table_name):
+                    table = getattr(self, table_name)
+                    if table:
+                        self._apply_table_scaling(table, params)
+            
+            # ─── METRIC CARDS ───
+            self._apply_metric_scaling(params)
+            
+            # ─── SECTION HEADERS ───
+            self._apply_header_scaling(params)
+            
+            # ─── CHARTS / PLOTS ───
+            self._apply_chart_scaling(params)
+            
+            # ─── HEADER BAR (logo, title, clocks) ───
+            self._apply_header_bar_scaling(scale)
+            
+            # ─── VOLATILITY SPARKLINES ───
+            self._apply_volatility_sparkline_scaling(scale)
+            
+            # ─── NEWS ITEMS ───
+            self._apply_news_item_scaling(scale)
+            
+            # ─── MARKET WATCH SPARKLINES ───
+            self._apply_market_sparkline_scaling(scale)
+            
+            # ─── OU ANALYTICS METRIC CARDS ───
+            self._apply_ou_metric_scaling(scale)
+            
+            # Log for debugging (only when category changes)
+            if not hasattr(self, '_last_layout_category') or self._last_layout_category != category:
+                self._last_layout_category = category
+                print(f"[Layout] Window {width}x{height} -> {category} (scale: {scale:.2f})")
+                
+        except Exception as e:
+            print(f"[Layout] Error applying dynamic layout: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _apply_table_scaling(self, table: QTableWidget, params: dict):
+        """Apply scaling to a table widget."""
+        try:
+            # Row height
+            table.verticalHeader().setDefaultSectionSize(params['table_row_height'])
+            
+            # Font
+            font = table.font()
+            font.setPointSize(params['table_font'])
+            table.setFont(font)
+            
+            # Header font
+            header = table.horizontalHeader()
+            header_font = header.font()
+            header_font.setPointSize(params['header_font'])
+            header.setFont(header_font)
+            
+        except Exception as e:
+            pass  # Silently ignore table scaling errors
+    
+    def _apply_metric_scaling(self, params: dict):
+        """Apply scaling to metric cards."""
+        try:
+            # Find all metric cards and update their font sizes
+            metric_cards = [
+                ('tickers_metric', 'Tickers'),
+                ('pairs_metric', 'Pairs'),
+                ('viable_metric', 'Viable'),
+                ('positions_metric', 'Positions'),
+            ]
+            
+            for attr_name, _ in metric_cards:
+                if hasattr(self, attr_name):
+                    card = getattr(self, attr_name)
+                    if card:
+                        # Find value and label widgets within the card
+                        for child in card.findChildren(QLabel):
+                            text = child.text()
+                            # Value labels are typically numeric or short
+                            if text.isdigit() or (len(text) < 5 and not text.islower()):
+                                font = child.font()
+                                font.setPointSize(params['metric_value_font'])
+                                child.setFont(font)
+                            else:
+                                # Label
+                                font = child.font()
+                                font.setPointSize(params['metric_label_font'])
+                                child.setFont(font)
+        except Exception as e:
+            pass  # Silently ignore metric scaling errors
+    
+    def _apply_header_scaling(self, params: dict):
+        """Apply scaling to section headers."""
+        try:
+            scale = self._layout_scale if hasattr(self, '_layout_scale') else 1.0
+            # Find SectionHeader widgets and update via scale_to
+            for child in self.findChildren(QLabel):
+                if child.objectName() == "sectionHeader":
+                    if hasattr(child, 'scale_to'):
+                        child.scale_to(scale)
+                    else:
+                        # Fallback for headers without scale_to
+                        font = child.font()
+                        font.setPointSize(params['header_font'])
+                        child.setFont(font)
+        except Exception as e:
+            pass  # Silently ignore header scaling errors
+    
+    def _apply_chart_scaling(self, params: dict):
+        """Apply scaling to pyqtgraph chart widgets."""
+        try:
+            # Main price/zscore plots
+            chart_configs = [
+                ('ou_price_plot', params['chart_height']),
+                ('ou_zscore_plot', int(params['chart_height'] * 0.5)),
+                ('ou_path_plot', int(params['chart_height'] * 0.5)),
+                ('ou_dist_plot', int(params['chart_height'] * 0.5)),
+                ('signal_price_plot', params['chart_height']),
+                ('signal_zscore_plot', int(params['chart_height'] * 0.5)),
+            ]
+            
+            for attr_name, height in chart_configs:
+                if hasattr(self, attr_name):
+                    chart = getattr(self, attr_name)
+                    if chart:
+                        chart.setMinimumHeight(height)
+                        
+        except Exception as e:
+            pass  # Silently ignore chart scaling errors
+    
+    def _apply_header_bar_scaling(self, scale: float):
+        """Apply scaling to header bar with logo, title and clocks."""
+        try:
+            if hasattr(self, 'header_bar') and self.header_bar:
+                self.header_bar.scale_to(scale)
+        except Exception as e:
+            pass  # Silently ignore header bar scaling errors
+    
+    def _apply_volatility_sparkline_scaling(self, scale: float):
+        """Apply scaling to volatility cards including their sparklines."""
+        try:
+            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'move_card']:
+                if hasattr(self, card_name):
+                    card = getattr(self, card_name)
+                    if card and hasattr(card, 'scale_to'):
+                        card.scale_to(scale)
+        except Exception as e:
+            pass  # Silently ignore volatility card scaling errors
+    
+    def _apply_news_item_scaling(self, scale: float):
+        """Apply scaling to the news feed widget and all news items."""
+        try:
+            if hasattr(self, 'news_feed') and self.news_feed:
+                if hasattr(self.news_feed, 'scale_to'):
+                    self.news_feed.scale_to(scale)
+        except Exception as e:
+            pass  # Silently ignore news item scaling errors
+    
+    def _apply_market_sparkline_scaling(self, scale: float):
+        """Apply scaling to market watch sparklines."""
+        try:
+            # Find all SparklineWidget instances
+            for child in self.findChildren(QWidget):
+                if child.__class__.__name__ == 'SparklineWidget' and hasattr(child, 'scale_to'):
+                    child.scale_to(scale)
+        except Exception as e:
+            pass  # Silently ignore market sparkline scaling errors
+    
+    def _apply_ou_metric_scaling(self, scale: float):
+        """Apply scaling to OU analytics metric cards."""
+        try:
+            # OU parameter cards
+            ou_cards = [
+                'ou_theta_card', 'ou_mu_card', 'ou_halflife_card',
+                'ou_zscore_card', 'ou_hedge_card', 'ou_status_card',
+                # Expected move cards
+                'exp_spread_change_card', 'exp_y_only_card', 'exp_x_only_card',
+                'exp_y_half_card', 'exp_x_half_card',
+            ]
+            
+            for card_name in ou_cards:
+                if hasattr(self, card_name):
+                    card = getattr(self, card_name)
+                    if card and hasattr(card, 'scale_to'):
+                        card.scale_to(scale)
+        except Exception as e:
+            pass  # Silently ignore OU metric scaling errors
+    
+    def auto_refresh_data(self):
+        """Auto-refresh market watch + portfolio (every 5 minutes).
+        
+        Market watch fetches all indices/macro via yf.download.
+        When it completes, volatility refresh chains automatically.
+        News runs on its own independent 15-minute timer.
+        """
         if not self._startup_complete:
             return
         
-        self.statusBar().showMessage("Auto-refreshing market data...")
-        
         try:
-            # Starta market watch (hämta ALLA marknader varje gång)
             self.refresh_market_watch(force_full=True)
-            
-            # Starta volatility refresh med fördröjning (så market watch hinner köra klart)
-            QTimer.singleShot(5000, self._start_volatility_refresh_safe)
-            
-            # Portfolio refresh körs separat (ingen yfinance)
             self._auto_refresh_portfolio()
-            
             self.last_updated_label.setText(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         except Exception as e:
-            self.statusBar().showMessage(f"Auto-refresh error: {str(e)[:50]}")
-            print(f"Auto-refresh error: {e}")
+            print(f"[AutoRefresh] Error: {e}")
+    
+    def _watchdog_check(self):
+        """Watchdog: reset stuck flags so the next timer cycle isn't blocked.
+        
+        CRITICAL SAFETY RULES:
+        1. NEVER call thread.terminate() — it kills the Python interpreter
+        2. NEVER set thread/worker to None — let the finish handler do cleanup
+           (otherwise old thread continues running and we start a new one = parallel chaos)
+        3. Only reset the _running flag — the isRunning() guard in refresh methods
+           prevents starting new threads while the old one is still alive
+        """
+        now = time.time()
+        
+        # Market watch: if flag stuck but thread already finished, just reset flag
+        if self._market_watch_running:
+            elapsed = now - getattr(self, '_market_watch_last_start', now)
+            # Only reset if thread is actually dead (not just slow)
+            thread = self._market_watch_thread
+            if thread is not None and not thread.isRunning():
+                print(f"[Watchdog] Market watch flag stuck (thread dead, {elapsed:.0f}s) — resetting")
+                self._market_watch_running = False
+            elif elapsed > 300:
+                # Thread still alive after 5 min — flag reset allows next cycle
+                # but isRunning() guard prevents starting parallel thread
+                print(f"[Watchdog] Market watch flag reset ({elapsed:.0f}s) — thread still alive, will skip next start")
+                self._market_watch_running = False
+        
+        # Volatility: same logic
+        if self._volatility_running:
+            elapsed = now - getattr(self, '_volatility_last_start', now)
+            thread = self._volatility_thread
+            if thread is not None and not thread.isRunning():
+                print(f"[Watchdog] Volatility flag stuck (thread dead, {elapsed:.0f}s) — resetting")
+                self._volatility_running = False
+            elif elapsed > 120:
+                print(f"[Watchdog] Volatility flag reset ({elapsed:.0f}s)")
+                self._volatility_running = False
     
     def _auto_refresh_portfolio(self):
         """Auto-refresh Z-scores and MF prices asynchronously (no popups).
@@ -3928,12 +4825,28 @@ class PairsTradingTerminal(QMainWindow):
         self._portfolio_refresh_thread = None
     
     def _on_portfolio_refresh_received(self, updated_portfolio: list, z_count: int, mf_count: int):
-        """Handle refreshed portfolio data - runs on GUI thread (safe)."""
+        """Handle refreshed portfolio data - runs on GUI thread (safe).
+        
+        MERGE updates into current portfolio instead of replacing.
+        Prevents race condition: worker snapshots portfolio, user closes position
+        while worker runs, worker finishes → would re-add closed position.
+        """
         try:
-            # Update local portfolio with refreshed data
-            self.portfolio = updated_portfolio
+            # Build lookup from worker results
+            updated_lookup = {p['pair']: p for p in updated_portfolio}
             
-            # Save and update display
+            # Only update z-scores/prices for positions that STILL exist
+            for pos in self.portfolio:
+                pair = pos['pair']
+                if pair in updated_lookup:
+                    up = updated_lookup[pair]
+                    if 'current_z' in up:
+                        pos['previous_z'] = pos.get('current_z', pos['entry_z'])
+                        pos['current_z'] = up['current_z']
+                    for key in ['mf_current_price_y', 'mf_current_price_x']:
+                        if key in up and up[key]:
+                            pos[key] = up[key]
+            
             self._save_and_sync_portfolio()
             # OPTIMERING: Uppdatera endast om Portfolio-tabben är laddad
             if self._tabs_loaded.get(4, False):
@@ -4295,7 +5208,17 @@ class PairsTradingTerminal(QMainWindow):
                 
                 pair = pos.get('pair', 'Unknown')
                 direction = pos.get('direction', 'LONG')
-                current_z = pos.get('current_z', 0.0)
+                
+                # FIX: Hämta AKTUELL z-score istället för lagrad (synkar med Signals)
+                current_z = pos.get('current_z', 0.0)  # Fallback
+                if self.engine is not None:
+                    try:
+                        _, _, live_z = self.engine.get_pair_ou_params(pair, use_raw_data=True)
+                        current_z = live_z
+                        # Uppdatera även positionen för konsistens
+                        pos['current_z'] = current_z
+                    except Exception as e:
+                        print(f"[Discord] Could not get live z-score for {pair}: {e}")
                 
                 # Calculate P&L for Y leg (long leg)
                 entry_y = pos.get('mf_entry_price_y', 0.0)
@@ -4590,8 +5513,8 @@ class PairsTradingTerminal(QMainWindow):
         self._tab_containers[1] = self._create_lazy_container("ARBITRAGE SCANNER")
         self.tabs.addTab(self._tab_containers[1], "|◊| ARBITRAGE SCANNER")
         
-        self._tab_containers[2] = self._create_lazy_container("ORNSTEIN-UHLENBECK ANALYTICS")
-        self.tabs.addTab(self._tab_containers[2], "|∂x| ORNSTEIN-UHLENBECK ANALYTICS")
+        self._tab_containers[2] = self._create_lazy_container("OU ANALYTICS")
+        self.tabs.addTab(self._tab_containers[2], "|∂x| OU ANALYTICS")
         
         self._tab_containers[3] = self._create_lazy_container("PAIR SIGNALS")
         self.tabs.addTab(self._tab_containers[3], "|⧗| PAIR SIGNALS")
@@ -4736,10 +5659,10 @@ class PairsTradingTerminal(QMainWindow):
         left_layout.addWidget(SectionHeader("GLOBAL MARKETS"),
                               alignment=Qt.AlignCenter)
         
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
+        self.market_scroll = QScrollArea()
+        self.market_scroll.setWidgetResizable(True)
+        self.market_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.market_scroll.setStyleSheet("QScrollArea { border: none; }")
         
         self.market_list = QWidget()
         self.market_list_layout = QVBoxLayout(self.market_list)
@@ -4748,8 +5671,8 @@ class PairsTradingTerminal(QMainWindow):
         
         self.market_items = {}
         
-        scroll.setWidget(self.market_list)
-        left_layout.addWidget(scroll)
+        self.market_scroll.setWidget(self.market_list)
+        left_layout.addWidget(self.market_scroll)
         
         left_panel.setMinimumWidth(300)
         left_panel.setMaximumWidth(380)
@@ -4919,13 +5842,28 @@ class PairsTradingTerminal(QMainWindow):
             self.news_feed.refresh_news(SCHEDULED_CSV_PATH)
     
     def _refresh_news_feed_safe(self):
-        """Safely refresh news feed - waits for other yfinance operations to complete."""
-        # Don't run if market watch is still running
+        """Refresh news feed — defers if yfinance price operations are active.
+        
+        News uses yfinance Ticker.news with ThreadPoolExecutor(10 workers).
+        Running that in parallel with yf.download(threads=10) = 20+ connections
+        which overwhelms yfinance and causes massive timeouts.
+        
+        If busy, simply skips — the chain from _on_volatility_thread_finished
+        or the next 15-min timer tick will retry.
+        """
         if self._market_watch_running or self._volatility_running:
-            # Retry in 5 seconds
-            QTimer.singleShot(5000, self._refresh_news_feed_safe)
+            print("[News] Skipped — yfinance busy (market watch or volatility running)")
             return
         
+        # Also check threads physically alive
+        if (self._market_watch_thread is not None and self._market_watch_thread.isRunning()):
+            print("[News] Skipped — market watch thread still alive")
+            return
+        if (self._volatility_thread is not None and self._volatility_thread.isRunning()):
+            print("[News] Skipped — volatility thread still alive")
+            return
+        
+        self._last_news_fetch_time = time.time()
         self._refresh_news_feed()
     
     def _stat_label(self, text: str) -> QLabel:
@@ -5174,6 +6112,19 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.setHorizontalHeaderLabels([
             "Pair", "Half-life (days)", "Engle-Granger p-value", "Johansen trace", "Hurst exponent", "Correlation"
         ])
+        # Tooltips for scanner columns
+        _scanner_tips = [
+            "Stock pair Y/X. Spread = Y - β·X - α",
+            "Days for spread to move halfway to equilibrium.\nln(2)/θ × 252. Ideal: 5-60 days.",
+            "Engle-Granger cointegration p-value.\np < 0.05 = significant mean reversion.",
+            "Johansen trace statistic.\nHigher = stronger cointegration evidence.",
+            "Hurst exponent. H < 0.5 = mean-reverting (good).\nH ≈ 0.5 = random walk. H > 0.5 = trending.",
+            "Pearson correlation between Y and X.\nHigher = more stable hedge. > 0.8 desirable.",
+        ]
+        for col, tip in enumerate(_scanner_tips):
+            item = self.viable_table.horizontalHeaderItem(col)
+            if item:
+                item.setToolTip(tip)
         self.viable_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.viable_table.horizontalHeader().setMinimumSectionSize(100)
         self.viable_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -5333,12 +6284,18 @@ class PairsTradingTerminal(QMainWindow):
         # =========================
         left_layout.addWidget(SectionHeader("ORNSTEIN-UHLENBECK DETAILS"))
         
-        self.ou_theta_card = MetricCard("MEAN REVERSION", "-")
-        self.ou_mu_card = MetricCard("MEAN SPREAD", "-")
-        self.ou_halflife_card = MetricCard("HALF-LIFE", "-")
-        self.ou_zscore_card = MetricCard("CURRENT Z-SCORE", "-")
-        self.ou_hedge_card = MetricCard("BETA", "-")
-        self.ou_status_card = MetricCard("STATUS", "-")
+        self.ou_theta_card = MetricCard("MEAN REVERSION", "-",
+            tooltip="θ — Speed of mean reversion (annualized).\nHigher = faster reversion. Typical: 5-100.")
+        self.ou_mu_card = MetricCard("MEAN SPREAD", "-",
+            tooltip="μ — Long-term equilibrium spread level.\nDerived from Kalman state: a/(1-b).")
+        self.ou_halflife_card = MetricCard("HALF-LIFE", "-",
+            tooltip="Trading days to move halfway to equilibrium.\nln(2)/θ × 252. Ideal for trading: 5-60 days.")
+        self.ou_zscore_card = MetricCard("CURRENT Z-SCORE", "-",
+            tooltip="Std deviations from equilibrium: (S-μ)/σ_eq.\n|z|>2 = entry signal. Positive = above mean.")
+        self.ou_hedge_card = MetricCard("BETA", "-",
+            tooltip="Hedge ratio β from EG regression: Y = α+β·X+ε.\nFor 1 share Y, short β shares X.")
+        self.ou_status_card = MetricCard("STATUS", "-",
+            tooltip="VIABLE = passes all tests:\n• EG p<0.05 • Hurst<0.5 • HL 1-252d")
         
         left_layout.addWidget(self.ou_theta_card)
         left_layout.addWidget(self.ou_mu_card)
@@ -5349,15 +6306,46 @@ class PairsTradingTerminal(QMainWindow):
         
         
         # =========================
+        # Kalman Filter Diagnostics
+        # =========================
+        left_layout.addWidget(SectionHeader("KALMAN FILTER"))
+        
+        self.kalman_stability_card = MetricCard("PARAM STABILITY", "-",
+            tooltip="θ stability over last 60 days (1-CV).\n>0.7 good, 0.4-0.7 caution, <0.4 unstable.")
+        self.kalman_ess_card = MetricCard("EFFECTIVE N", "-",
+            tooltip="Effective sample size adjusted for autocorrelation.\nLower than N = redundant observations.")
+        self.kalman_theta_ci_card = MetricCard("θ (95% CI)", "-",
+            tooltip="95% CI for half-life (days) from Kalman covariance.\n'inf' = cannot exclude random walk (θ≈0).")
+        self.kalman_mu_ci_card = MetricCard("μ (95% CI)", "-",
+            tooltip="95% CI for equilibrium spread level.\nWide CI = uncertain reversion target.")
+        self.kalman_innovation_card = MetricCard("INNOV. RATIO", "-",
+            tooltip="Actual/expected innovation variance. Should ≈ 1.0.\n>1.5 = model underestimates uncertainty.")
+        self.kalman_regime_card = MetricCard("REGIME CHANGE", "-",
+            tooltip="CUSUM on innovations. Threshold=4.0.\nHigh = structural break, parameters unreliable.")
+        
+        left_layout.addWidget(self.kalman_stability_card)
+        left_layout.addWidget(self.kalman_ess_card)
+        left_layout.addWidget(self.kalman_theta_ci_card)
+        left_layout.addWidget(self.kalman_mu_ci_card)
+        left_layout.addWidget(self.kalman_innovation_card)
+        left_layout.addWidget(self.kalman_regime_card)
+        
+        
+        # =========================
         # Expected Move
         # =========================
         left_layout.addWidget(SectionHeader("EXPECTED MOVE"))
         
-        self.exp_spread_change_card = MetricCard("Δ SPREAD", "-")
-        self.exp_y_only_card = MetricCard("Y (100%)", "-")
-        self.exp_x_only_card = MetricCard("X (100%)", "-")
-        self.exp_y_half_card = MetricCard("Y (50%)", "-")
-        self.exp_x_half_card = MetricCard("X (50%)", "-")
+        self.exp_spread_change_card = MetricCard("Δ SPREAD", "-",
+            tooltip="Expected spread change over 1 half-life.\nBased on OU: E[S_t] = μ + (S₀-μ)·e^(-θt).")
+        self.exp_y_only_card = MetricCard("Y (100%)", "-",
+            tooltip="Y price move if Y absorbs 100% of convergence.")
+        self.exp_x_only_card = MetricCard("X (100%)", "-",
+            tooltip="X price move if X absorbs 100% of convergence.")
+        self.exp_y_half_card = MetricCard("Y (50%)", "-",
+            tooltip="Y price move if convergence split 50/50 between legs.")
+        self.exp_x_half_card = MetricCard("X (50%)", "-",
+            tooltip="X price move if convergence split 50/50 between legs.")
         
         left_layout.addWidget(self.exp_spread_change_card)
         left_layout.addWidget(self.exp_y_only_card)
@@ -5392,29 +6380,33 @@ class PairsTradingTerminal(QMainWindow):
         if ensure_pyqtgraph():
             DateAxisItem = get_date_axis_item_class()
             
-            # Row 1: Price comparison (full width) with DateAxisItem
-            right_layout.addWidget(SectionHeader("BETA ADJUSTED PRICE COMPARISON"))
+            # ===== ROW 1: Price comparison (full width, stretch 2) =====
+            price_container = QWidget()
+            price_vlayout = QVBoxLayout(price_container)
+            price_vlayout.setSpacing(2)
+            price_vlayout.setContentsMargins(0, 0, 0, 0)
+            price_vlayout.addWidget(SectionHeader("BETA ADJUSTED PRICE COMPARISON"))
             
-            # Create custom date axis for price plot
             self.ou_price_date_axis = DateAxisItem(orientation='bottom')
             self.ou_price_plot = pg.PlotWidget(axisItems={'bottom': self.ou_price_date_axis})
             self.ou_price_plot.setLabel('left', 'Price')
             self.ou_price_plot.showGrid(x=False, y=False, alpha=0.3)
             self.ou_price_plot.addLegend()
             self.ou_price_plot.setMinimumHeight(200)
-            # Enable mouse interaction
             self.ou_price_plot.setMouseEnabled(x=True, y=True)
             self.ou_price_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
-            right_layout.addWidget(self.ou_price_plot)
+            price_vlayout.addWidget(self.ou_price_plot)
             
-            # Row 2: Z-score and Expected Path side by side
-            row2 = QHBoxLayout()
-            row2.setSpacing(10)
+            # ===== ROW 2: Z-score + Expected Path + Conditional Distribution (stretch 1) =====
+            bottom_container = QWidget()
+            bottom_hlayout = QHBoxLayout(bottom_container)
+            bottom_hlayout.setSpacing(10)
+            bottom_hlayout.setContentsMargins(0, 0, 0, 0)
             
+            # Z-score plot (wider — stretch 2 in row)
             zscore_col = QVBoxLayout()
             zscore_col.addWidget(SectionHeader("SPREAD Z-SCORE"))
             
-            # Create custom date axis for zscore plot
             self.ou_zscore_date_axis = DateAxisItem(orientation='bottom')
             self.ou_zscore_plot = pg.PlotWidget(axisItems={'bottom': self.ou_zscore_date_axis})
             self.ou_zscore_plot.setLabel('left', 'Z')
@@ -5423,22 +6415,21 @@ class PairsTradingTerminal(QMainWindow):
             self.ou_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
             self.ou_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
             self.ou_zscore_plot.setMinimumHeight(100)
-            # Enable mouse interaction
             self.ou_zscore_plot.setMouseEnabled(x=True, y=True)
             self.ou_zscore_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
-            self.ou_zscore_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
             
-            # SYNC: Manual bidirectional sync via signals (better than setXLink for autoRange)
-            self._syncing_plots = False  # Prevent infinite loop
+            # SYNC: Bidirectional x-axis sync between price and zscore
+            self._syncing_plots = False
+            self._ou_syncing_plots = False
             
             def sync_price_to_zscore(viewbox, range):
-                if not self._syncing_plots:
+                if not self._syncing_plots and not self._ou_syncing_plots:
                     self._syncing_plots = True
                     self.ou_zscore_plot.setXRange(range[0][0], range[0][1], padding=0)
                     self._syncing_plots = False
             
             def sync_zscore_to_price(viewbox, range):
-                if not self._syncing_plots:
+                if not self._syncing_plots and not self._ou_syncing_plots:
                     self._syncing_plots = True
                     self.ou_price_plot.setXRange(range[0][0], range[0][1], padding=0)
                     self._syncing_plots = False
@@ -5447,8 +6438,9 @@ class PairsTradingTerminal(QMainWindow):
             self.ou_zscore_plot.sigRangeChanged.connect(sync_zscore_to_price)
             
             zscore_col.addWidget(self.ou_zscore_plot)
-            row2.addLayout(zscore_col)
+            bottom_hlayout.addLayout(zscore_col, stretch=2)
             
+            # Expected Path plot
             path_col = QVBoxLayout()
             path_col.addWidget(SectionHeader("EXPECTED PATH"))
             self.ou_path_plot = pg.PlotWidget()
@@ -5457,25 +6449,9 @@ class PairsTradingTerminal(QMainWindow):
             self.ou_path_plot.showGrid(x=False, y=False, alpha=0.3)
             self.ou_path_plot.setMinimumHeight(100)
             path_col.addWidget(self.ou_path_plot)
-            row2.addLayout(path_col)
+            bottom_hlayout.addLayout(path_col, stretch=1)
             
-            right_layout.addLayout(row2)
-            
-            # Row 3: ACF and Conditional Distribution side by side
-            row3 = QHBoxLayout()
-            row3.setSpacing(10)
-            
-            acf_col = QVBoxLayout()
-            acf_col.addWidget(SectionHeader("AUTOCORRELATION (ACF)"))
-            self.ou_acf_plot = pg.PlotWidget()
-            self.ou_acf_plot.setLabel('left', 'ACF')
-            self.ou_acf_plot.setLabel('bottom', 'Lag (days)')
-            self.ou_acf_plot.showGrid(x=False, y=False, alpha=0.3)
-            self.ou_acf_plot.addLine(y=0, pen=pg.mkPen('#666666', width=1))
-            self.ou_acf_plot.setMinimumHeight(100)
-            acf_col.addWidget(self.ou_acf_plot)
-            row3.addLayout(acf_col)
-            
+            # Conditional Distribution plot
             dist_col = QVBoxLayout()
             dist_col.addWidget(SectionHeader("CONDITIONAL DISTRIBUTION"))
             self.ou_dist_plot = pg.PlotWidget()
@@ -5484,11 +6460,13 @@ class PairsTradingTerminal(QMainWindow):
             self.ou_dist_plot.showGrid(x=False, y=False, alpha=0.3)
             self.ou_dist_plot.setMinimumHeight(100)
             dist_col.addWidget(self.ou_dist_plot)
-            row3.addLayout(dist_col)
+            bottom_hlayout.addLayout(dist_col, stretch=1)
             
-            right_layout.addLayout(row3)
+            # Add both rows with 2:1 height ratio
+            right_layout.addWidget(price_container, stretch=2)
+            right_layout.addWidget(bottom_container, stretch=1)
             
-            # Initialize crosshair managers (will be populated with data when plots update)
+            # Initialize crosshair managers
             self.price_crosshair = None
             self.zscore_crosshair = None
             
@@ -6137,9 +7115,9 @@ class PairsTradingTerminal(QMainWindow):
         
         # Positions table with dynamic columns
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(14)
+        self.positions_table.setColumnCount(13)
         self.positions_table.setHorizontalHeaderLabels([
-            "PAIR", "DIRECTION", "Z-SCORE", "STOP-LOSS", "STATUS",
+            "PAIR", "DIRECTION", "Z-SCORE", "STATUS",
             "Y LEG", "ENTRY PRICE", "QUANTITY", "P/L",
             "X LEG", "ENTRY PRICE", "QUANTITY", "P/L",
             "CLOSE POSITION"
@@ -6157,17 +7135,16 @@ class PairsTradingTerminal(QMainWindow):
         self.positions_table.setColumnWidth(0, 110)   # PAIR
         self.positions_table.setColumnWidth(1, 110)    # DIR
         self.positions_table.setColumnWidth(2, 110)    # Z
-        self.positions_table.setColumnWidth(3, 110)    # SL
-        self.positions_table.setColumnWidth(4, 110)    # STATUS
-        self.positions_table.setColumnWidth(5, 250)   # MINI Y (namn)
-        self.positions_table.setColumnWidth(6, 110)   # ENTRY Y
-        self.positions_table.setColumnWidth(7, 110)    # QTY Y
-        self.positions_table.setColumnWidth(8, 130)   # P/L Y
-        self.positions_table.setColumnWidth(9, 250)   # MINI X (namn)
-        self.positions_table.setColumnWidth(10, 110)  # ENTRY X
-        self.positions_table.setColumnWidth(11, 110)   # QTY X
-        self.positions_table.setColumnWidth(12, 130)  # P/L X
-        self.positions_table.setColumnWidth(13, 150)   # CLOSE
+        self.positions_table.setColumnWidth(3, 110)    # STATUS
+        self.positions_table.setColumnWidth(4, 250)   # MINI Y (namn)
+        self.positions_table.setColumnWidth(5, 110)   # ENTRY Y
+        self.positions_table.setColumnWidth(6, 110)    # QTY Y
+        self.positions_table.setColumnWidth(7, 130)   # P/L Y
+        self.positions_table.setColumnWidth(8, 250)   # MINI X (namn)
+        self.positions_table.setColumnWidth(9, 110)  # ENTRY X
+        self.positions_table.setColumnWidth(10, 110)   # QTY X
+        self.positions_table.setColumnWidth(11, 130)  # P/L X
+        self.positions_table.setColumnWidth(12, 150)   # CLOSE
         
         # Allow horizontal scrolling if needed
         header.setSectionResizeMode(QHeaderView.Interactive)
@@ -6223,6 +7200,10 @@ class PairsTradingTerminal(QMainWindow):
         
         self.portfolio_subtabs.addTab(current_tab, "📋 CURRENT POSITIONS")
         
+        # Trade History sub-tab
+        history_tab = self._create_trade_history_subtab()
+        self.portfolio_subtabs.addTab(history_tab, "📜 TRADE HISTORY")
+        
         # Benchmark Analysis sub-tab
         benchmark_tab = self._create_benchmark_analysis_subtab()
         self.portfolio_subtabs.addTab(benchmark_tab, "📈 BENCHMARK ANALYSIS")
@@ -6236,11 +7217,165 @@ class PairsTradingTerminal(QMainWindow):
         return tab
     
     def _on_portfolio_subtab_changed(self, index: int):
-        """Handle portfolio sub-tab change - auto-load benchmark data when switching to benchmark tab."""
-        # Index 1 = Benchmark Analysis tab
+        """Handle portfolio sub-tab change."""
         if index == 1:
-            # Always load/update benchmark data when switching to this tab
+            self._update_trade_history_display()
+        elif index == 2:
             self._load_or_update_benchmark()
+    
+    def _create_trade_history_subtab(self) -> QWidget:
+        """Create Trade History sub-tab showing closed positions."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 10, 15, 10)
+        
+        # Summary bar
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 6px;
+                padding: 8px;
+            }}
+        """)
+        summary_layout = QHBoxLayout(summary_frame)
+        summary_layout.setContentsMargins(10, 6, 10, 6)
+        summary_layout.setSpacing(20)
+        
+        self.th_total_label = QLabel("Total Trades: <span style='color:#e8e8e8; font-weight:600;'>0</span>")
+        self.th_total_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        summary_layout.addWidget(self.th_total_label)
+        
+        self.th_winrate_label = QLabel("Win Rate: <span style='color:#888;'>-</span>")
+        self.th_winrate_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        summary_layout.addWidget(self.th_winrate_label)
+        
+        self.th_realized_label = QLabel("Total Realized: <span style='color:#888;'>0 SEK</span>")
+        self.th_realized_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        summary_layout.addWidget(self.th_realized_label)
+        
+        summary_layout.addStretch()
+        layout.addWidget(summary_frame)
+        
+        # Trade history table
+        self.trade_history_table = QTableWidget()
+        self.trade_history_table.verticalHeader().setVisible(False)
+        self.trade_history_table.verticalHeader().setDefaultSectionSize(40)
+        self.trade_history_table.setColumnCount(10)
+        self.trade_history_table.setHorizontalHeaderLabels([
+            "PAIR", "DIRECTION", "ENTRY DATE", "CLOSE DATE",
+            "ENTRY Z", "CLOSE Z", "RESULT",
+            "REALIZED P/L (SEK)", "REALIZED P/L (%)", "CAPITAL"
+        ])
+        header = self.trade_history_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+        self.trade_history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.trade_history_table.setAlternatingRowColors(True)
+        self.trade_history_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['bg_card']};
+                alternate-background-color: {COLORS['bg_elevated']};
+                gridline-color: {COLORS['border_subtle']};
+                font-size: 13px;
+            }}
+            QTableWidget::item {{
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_elevated']};
+                color: {COLORS['accent']};
+                font-weight: 600;
+                font-size: 12px;
+                padding: 10px 8px;
+                border: none;
+                border-bottom: 2px solid {COLORS['accent']};
+            }}
+        """)
+        layout.addWidget(self.trade_history_table)
+        
+        return tab
+    
+    def _update_trade_history_display(self):
+        """Update the trade history table with closed positions."""
+        self.trade_history_table.setRowCount(len(self.trade_history))
+        
+        total_realized_sek = 0
+        wins = 0
+        
+        for i, trade in enumerate(reversed(self.trade_history)):  # Newest first
+            # PAIR
+            pair_item = QTableWidgetItem(trade.get('pair', ''))
+            pair_item.setForeground(QColor(COLORS['accent']))
+            self.trade_history_table.setItem(i, 0, pair_item)
+            
+            # DIRECTION
+            d = trade.get('direction', '')
+            dir_item = QTableWidgetItem(d)
+            dir_item.setForeground(QColor("#22c55e" if d == 'LONG' else "#ef4444"))
+            self.trade_history_table.setItem(i, 1, dir_item)
+            
+            # ENTRY DATE
+            self.trade_history_table.setItem(i, 2, QTableWidgetItem(trade.get('entry_date', '')))
+            
+            # CLOSE DATE
+            self.trade_history_table.setItem(i, 3, QTableWidgetItem(trade.get('close_date', '')))
+            
+            # ENTRY Z
+            ez = trade.get('entry_z', 0)
+            ez_item = QTableWidgetItem(f"{ez:.2f}")
+            ez_item.setForeground(QColor("#e8e8e8"))
+            self.trade_history_table.setItem(i, 4, ez_item)
+            
+            # CLOSE Z
+            cz = trade.get('close_z', 0)
+            cz_item = QTableWidgetItem(f"{cz:.2f}")
+            cz_item.setForeground(QColor("#e8e8e8"))
+            self.trade_history_table.setItem(i, 5, cz_item)
+            
+            # RESULT
+            result = trade.get('result', '')
+            is_profit = result == 'PROFIT'
+            if is_profit:
+                wins += 1
+            result_item = QTableWidgetItem(result)
+            result_item.setForeground(QColor("#22c55e" if is_profit else "#ef4444"))
+            self.trade_history_table.setItem(i, 6, result_item)
+            
+            # REALIZED P/L (SEK)
+            pnl_sek = trade.get('realized_pnl_sek', 0)
+            total_realized_sek += pnl_sek
+            pnl_sek_item = QTableWidgetItem(f"{pnl_sek:+.0f}")
+            pnl_sek_item.setForeground(QColor("#22c55e" if pnl_sek >= 0 else "#ef4444"))
+            self.trade_history_table.setItem(i, 7, pnl_sek_item)
+            
+            # REALIZED P/L (%)
+            pnl_pct = trade.get('realized_pnl_pct', 0)
+            pnl_pct_item = QTableWidgetItem(f"{pnl_pct:+.1f}%")
+            pnl_pct_item.setForeground(QColor("#22c55e" if pnl_pct >= 0 else "#ef4444"))
+            self.trade_history_table.setItem(i, 8, pnl_pct_item)
+            
+            # CAPITAL
+            cap = trade.get('capital', 0)
+            cap_item = QTableWidgetItem(f"{cap:,.0f}")
+            cap_item.setForeground(QColor("#e8e8e8"))
+            self.trade_history_table.setItem(i, 9, cap_item)
+        
+        # Update summary
+        n = len(self.trade_history)
+        self.th_total_label.setText(f"Total Trades: <span style='color:#e8e8e8; font-weight:600;'>{n}</span>")
+        
+        if n > 0:
+            wr = wins / n * 100
+            wr_color = "#22c55e" if wr >= 50 else "#ef4444"
+            self.th_winrate_label.setText(f"Win Rate: <span style='color:{wr_color}; font-weight:600;'>{wr:.0f}%</span> ({wins}/{n})")
+        else:
+            self.th_winrate_label.setText("Win Rate: <span style='color:#888;'>-</span>")
+        
+        r_color = "#22c55e" if total_realized_sek >= 0 else "#ef4444"
+        self.th_realized_label.setText(f"Total Realized: <span style='color:{r_color}; font-weight:600;'>{total_realized_sek:+,.0f} SEK</span>")
     
     # ========================================================================
     # BENCHMARK ANALYSIS - Faktisk P&L baserad på positioner
@@ -8285,6 +9420,7 @@ class PairsTradingTerminal(QMainWindow):
     def _on_startup_portfolio_loaded(self, positions: list):
         """Handle portfolio loaded from startup worker."""
         self.portfolio = positions
+        self.trade_history = load_trade_history(PORTFOLIO_FILE)
         if self._tabs_loaded.get(4, False):
             self.update_portfolio_display()
         self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
@@ -8303,19 +9439,22 @@ class PairsTradingTerminal(QMainWindow):
         self.update_hmm_display()
     
     def _on_startup_finished(self):
-        """Handle startup worker finished - start market data fetching."""
+        """Handle startup worker finished - start market data fetching.
+        
+        NOTE: Uses one-shot flag because QThread.finished can fire twice
+        (once from quit(), once from deleteLater destruction).
+        """
+        if getattr(self, '_startup_finished_done', False):
+            print("[Startup] _on_startup_finished already ran, skipping duplicate")
+            return
+        self._startup_finished_done = True
+        
         # Markera att startup är klar
         self._startup_complete = True
         
-        # OPTIMERING: Kör FULL market watch vid startup för att fylla cachen med alla marknader
-        # Efterföljande refreshes använder smart filtering (endast öppna marknader)
+        # Start the refresh chain: market watch → volatility → news (sequentiell)
+        # News chains from volatility completion with 15-min cooldown check
         QTimer.singleShot(500, lambda: self.refresh_market_watch(force_full=True))
-        
-        # Starta volatility refresh EFTER market watch (5 sekunder fördröjning)
-        QTimer.singleShot(5000, self._start_volatility_refresh_safe)
-        
-        # Ladda nyhetsflödet efter en längre fördröjning
-        QTimer.singleShot(8000, self._refresh_news_feed_safe)
     
     def load_saved_portfolio(self):
         """Load saved portfolio positions from file."""
@@ -8375,7 +9514,7 @@ class PairsTradingTerminal(QMainWindow):
             # Använd standardconfig om ingen finns
             if not config:
                 config = {
-                    'min_half_life': 5,
+                    'min_half_life': 1,
                     'max_half_life': 60,
                     'max_adf_pvalue': 0.05,
                     'min_hurst': 0.0,
@@ -8475,11 +9614,34 @@ class PairsTradingTerminal(QMainWindow):
         self._sync_thread = None
     
     def _on_portfolio_synced(self, new_positions: list):
-        """Handle portfolio sync from background thread."""
-        self.portfolio = new_positions
+        """Handle portfolio sync from background thread.
+        
+        Protects trade_history: positions closed locally won't be re-added
+        if another computer syncs an older version of the file.
+        """
+        # Merge trade_history: keep local entries + any new ones from file
+        file_history = load_trade_history(PORTFOLIO_FILE)
+        merged_history = list(self.trade_history)  # Start with local
+        local_keys = {(t['pair'], t.get('entry_date', '')) for t in merged_history}
+        for fh in file_history:
+            key = (fh['pair'], fh.get('entry_date', ''))
+            if key not in local_keys:
+                merged_history.append(fh)
+                local_keys.add(key)
+        self.trade_history = merged_history
+        
+        # Filter out positions that are in trade_history (already closed)
+        closed_keys = {(t['pair'], t.get('entry_date', '')) for t in self.trade_history}
+        filtered = [p for p in new_positions 
+                    if (p['pair'], p.get('entry_date', '')) not in closed_keys]
+        self.portfolio = filtered
+        
         if os.path.exists(PORTFOLIO_FILE):
             self._portfolio_file_mtime = os.path.getmtime(PORTFOLIO_FILE)
-        # OPTIMERING: Uppdatera endast om Portfolio-tabben är laddad
+        
+        # Re-save with correct state (so other computers pick up the close)
+        self._save_and_sync_portfolio()
+        
         if self._tabs_loaded.get(4, False):
             self.update_portfolio_display()
         self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
@@ -8506,8 +9668,26 @@ class PairsTradingTerminal(QMainWindow):
                 new_positions = load_portfolio(PORTFOLIO_FILE)
                 
                 if new_positions is not None:
-                    self.portfolio = new_positions
+                    # Merge trade_history: keep local + file entries
+                    file_history = load_trade_history(PORTFOLIO_FILE)
+                    merged_history = list(self.trade_history)
+                    local_keys = {(t['pair'], t.get('entry_date', '')) for t in merged_history}
+                    for fh in file_history:
+                        key = (fh['pair'], fh.get('entry_date', ''))
+                        if key not in local_keys:
+                            merged_history.append(fh)
+                            local_keys.add(key)
+                    self.trade_history = merged_history
+                    
+                    # Filter out positions that are in trade_history
+                    closed_keys = {(t['pair'], t.get('entry_date', '')) for t in self.trade_history}
+                    filtered = [p for p in new_positions
+                                if (p['pair'], p.get('entry_date', '')) not in closed_keys]
+                    self.portfolio = filtered
                     self._portfolio_file_mtime = current_mtime
+                    
+                    # Re-save so other computers see the close
+                    self._save_and_sync_portfolio()
                     self.update_portfolio_display()
                     self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
                     self.statusBar().showMessage(f"Portfolio synced: {len(self.portfolio)} position(s) from another device")
@@ -8546,9 +9726,8 @@ class PairsTradingTerminal(QMainWindow):
         self.sync_from_drive()
     
     def _save_and_sync_portfolio(self):
-        """Save portfolio and update mtime to prevent unnecessary reloads."""
-        if save_portfolio(self.portfolio):
-            # Uppdatera mtime så sync-timern inte laddar om direkt
+        """Save portfolio + trade history, update mtime."""
+        if save_portfolio(self.portfolio, trade_history=self.trade_history):
             if os.path.exists(PORTFOLIO_FILE):
                 self._portfolio_file_mtime = os.path.getmtime(PORTFOLIO_FILE)
     
@@ -9083,9 +10262,8 @@ class PairsTradingTerminal(QMainWindow):
         
         OPTIMERING: Flyttar tung yfinance.download till bakgrundstråd.
         
-        Args:
-            force_full: If True, fetch ALL indices regardless of market hours.
-                       If False (default), only fetch indices for open markets.
+        Note: All indices are always fetched regardless of market hours.
+        The force_full parameter is kept for API compatibility but is ignored.
         """
         # Vänta tills startup är klar (förhindra tidiga anrop)
         if not self._startup_complete:
@@ -9094,8 +10272,24 @@ class PairsTradingTerminal(QMainWindow):
         
         # Don't start if already running - använd säker flagga
         if self._market_watch_running:
-            self.statusBar().showMessage("Market watch already updating...")
+            print("[MarketWatch] Skipped - already running (flag)")
             return
+        
+        # CRITICAL: Also check if old thread is still alive (even if flag was reset by watchdog)
+        # This prevents the bug where watchdog resets flag → new thread starts → TWO parallel fetches
+        if self._market_watch_thread is not None and self._market_watch_thread.isRunning():
+            print("[MarketWatch] Skipped - old thread still alive")
+            return
+        
+        # Cooldown: prevent re-entry within 90 seconds (batches with timeouts can take 80s+)
+        now = time.time()
+        if hasattr(self, '_market_watch_last_start') and (now - self._market_watch_last_start) < 90:
+            print(f"[MarketWatch] Skipped - cooldown ({now - self._market_watch_last_start:.0f}s < 90s)")
+            return
+        
+        # SET FLAG IMMEDIATELY to prevent re-entrant calls
+        self._market_watch_running = True
+        self._market_watch_last_start = now
         
         # Clear existing items
         while self.market_list_layout.count():
@@ -9207,63 +10401,23 @@ class PairsTradingTerminal(QMainWindow):
         }
         
         # =====================================================================
-        # SMART MARKET FILTERING - Only fetch data for open markets
-        # Macro data (currencies, commodities, yields) fetches ALWAYS (24h markets)
+        # ALWAYS FETCH ALL INDICES - No market filtering
+        # Macro data (currencies, commodities, yields) always fetched (24h markets)
         # =====================================================================
-        if force_full:
-            # Force full refresh - fetch all indices
-            filtered_indices = indices
-            print(f"[MarketWatch] FULL REFRESH: Fetching all {len(indices)} indices")
-            self.statusBar().showMessage(f"Full refresh: Fetching all {len(indices)} indices + {len(macro)} macro...")
-        else:
-            # Get currently open market regions from header clocks
-            open_regions = self.header_bar.get_open_markets()
-            
-            # Regions without dedicated clocks - always include if any related market is open
-            # Africa trades roughly aligned with Europe/Middle East
-            if 'EUROPE' in open_regions or 'MIDDLE EAST' in open_regions:
-                open_regions.add('AFRICA')
-            
-            # Filter indices to only include open markets
-            if open_regions:
-                # Some markets are open - filter to just those regions
-                filtered_indices = {
-                    ticker: (name, region) 
-                    for ticker, (name, region) in indices.items()
-                    if region in open_regions
-                }
-                closed_count = len(indices) - len(filtered_indices)
-                
-                # Status message
-                open_list = ', '.join(sorted(open_regions))
-                print(f"[MarketWatch] Open markets: {open_list}")
-                print(f"[MarketWatch] Fetching {len(filtered_indices)} indices (skipping {closed_count} from closed markets)")
-                self.statusBar().showMessage(f"Fetching {len(filtered_indices)} indices + {len(macro)} macro ({closed_count} closed markets skipped)...")
-            else:
-                # No markets open (weekend/off-hours) - fetch minimal set for display
-                # Just fetch major indices for reference (they'll show last close)
-                MAJOR_INDICES = {'^GSPC', '^NDX', '^DJI', '^FTSE', '^GDAXI', '^N225', '^HSI'}
-                filtered_indices = {
-                    ticker: (name, region)
-                    for ticker, (name, region) in indices.items()
-                    if ticker in MAJOR_INDICES
-                }
-                print(f"[MarketWatch] All markets closed - fetching {len(filtered_indices)} major indices only")
-                self.statusBar().showMessage(f"Markets closed - fetching {len(filtered_indices)} major indices + {len(macro)} macro...")
+        filtered_indices = indices
+        print(f"[MarketWatch] Fetching all {len(indices)} indices + {len(macro)} macro...")
+        self.statusBar().showMessage(f"Fetching {len(indices)} indices + {len(macro)} macro...")
         
-        # Combine filtered indices with macro (macro ALWAYS fetched - 24h markets)
+        # Combine all indices with macro
         all_instruments = {**filtered_indices, **macro}
         
         # Store FULL instruments dict for display (all markets, not just open ones)
         self._all_instruments_full = {**indices, **macro}
         
-        # Store full indices dict for display purposes (to show closed markets greyed out)
+        # Store full indices dict for display purposes
         self._all_indices_cache = indices
         
-        # Sätt flagga INNAN vi skapar tråden
-        self._market_watch_running = True
-        
-        # Create and start worker
+        # Create and start worker (flag already set at guard)
         self._market_watch_thread = QThread()
         self._market_watch_worker = MarketWatchWorker(all_instruments)
         self._market_watch_worker.moveToThread(self._market_watch_thread)
@@ -9280,22 +10434,32 @@ class PairsTradingTerminal(QMainWindow):
         self.statusBar().showMessage("Fetching market data in background...")
     
     def _on_market_watch_thread_finished(self):
-        """Handle market watch thread completion - clear references and flag."""
+        """Handle market watch thread completion — clean up and chain to volatility.
+        
+        Always cleans up refs (even if watchdog already reset the flag).
+        Uses generation counter to prevent stale completions from chaining.
+        """
+        # Track which generation completed
+        gen = getattr(self, '_market_watch_generation', 0)
+        was_running = self._market_watch_running
         self._market_watch_running = False
         
-        # VIKTIGT: Använd deleteLater() istället för att direkt sätta till None
-        # Detta låter Qt städa upp ordentligt
+        elapsed = time.time() - getattr(self, '_market_watch_last_start', 0)
+        print(f"[MarketWatch] Thread finished ({elapsed:.1f}s, gen={gen}, was_running={was_running})")
+        
+        # Always clean up references
         if self._market_watch_worker is not None:
             self._market_watch_worker.deleteLater()
         if self._market_watch_thread is not None:
             self._market_watch_thread.deleteLater()
         
-        # Rensa referenserna efter deleteLater() är scheduled
         self._market_watch_worker = None
         self._market_watch_thread = None
         
-        # NOTERA: Volatility triggas INTE här längre - körs separat från _on_startup_finished
-        # Detta förhindrar multipla volatility-körningar
+        # Only chain to volatility if this was the expected completion
+        # (not a stale thread that finished after watchdog reset)
+        if was_running:
+            QTimer.singleShot(2000, self._start_volatility_refresh_safe)
     
     def _start_volatility_refresh_safe(self):
         """Safely start volatility refresh after a delay."""
@@ -9406,7 +10570,16 @@ class PairsTradingTerminal(QMainWindow):
             scatter_spots = []
             widgets_added = 0
             fresh_count = 0
-            cached_count = 0
+            
+            # DEBUG: Visa column mismatch
+            instrument_tickers = set(instruments.keys())
+            data_columns = set(display_close.columns)
+            matching = instrument_tickers & data_columns
+            missing = instrument_tickers - data_columns
+            print(f"[MarketWatch] Instrument tickers: {len(instrument_tickers)}, Data columns: {len(data_columns)}")
+            print(f"[MarketWatch] Matching tickers: {len(matching)}, Missing: {len(missing)}")
+            if len(missing) > 0 and len(missing) < 20:
+                print(f"[MarketWatch] Missing tickers: {missing}")
             
             for category in category_order:
                 if category not in categories:
@@ -9425,7 +10598,7 @@ class PairsTradingTerminal(QMainWindow):
                         continue
                     
                     # Track if this is cached data (market closed)
-                    is_cached = ticker not in freshly_updated_tickers
+                    # Process this ticker
                     
                     try:
                         ticker_series = display_close[ticker].dropna()
@@ -9477,44 +10650,30 @@ class PairsTradingTerminal(QMainWindow):
                             else:
                                 change = 0.0
                         
-                        # Create market item frame - dimmed style for cached/closed markets
+                        # Create market item frame
                         item_frame = QFrame()
-                        if is_cached:
-                            # Dimmed style for closed markets (cached data)
-                            item_frame.setStyleSheet(f"""
-                                QFrame {{
-                                    background: {COLORS['bg_card']};
-                                    border: 1px solid {COLORS['border_subtle']};
-                                    border-radius: 3px;
-                                    opacity: 0.7;
-                                }}
-                            """)
-                        else:
-                            item_frame.setStyleSheet(f"""
-                                QFrame {{
-                                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                        stop:0 {COLORS['bg_elevated']}, 
-                                        stop:1 {COLORS['bg_card']});
-                                    border: 1px solid {COLORS['border_subtle']};
-                                    border-radius: 3px;
-                                }}
-                                QFrame:hover {{
-                                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                        stop:0 {COLORS['bg_hover']}, 
-                                        stop:1 {COLORS['bg_elevated']});
-                                    border-color: {COLORS['accent_dark']};
-                                }}
-                            """)
+                        item_frame.setStyleSheet(f"""
+                            QFrame {{
+                                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                    stop:0 {COLORS['bg_elevated']}, 
+                                    stop:1 {COLORS['bg_card']});
+                                border: 1px solid {COLORS['border_subtle']};
+                                border-radius: 3px;
+                            }}
+                            QFrame:hover {{
+                                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                    stop:0 {COLORS['bg_hover']}, 
+                                    stop:1 {COLORS['bg_elevated']});
+                                border-color: {COLORS['accent_dark']};
+                            }}
+                        """)
                         item_layout = QHBoxLayout(item_frame)
                         item_layout.setContentsMargins(8, 5, 8, 5)
                         item_layout.setSpacing(8)
                         
-                        # Name label - dimmed for closed markets
+                        # Name label
                         display_name = name.upper()
-                        if is_cached:
-                            name_color = COLORS['text_muted']
-                        else:
-                            name_color = COLORS['text_primary']
+                        name_color = COLORS['text_primary']
                         
                         name_label = QLabel(display_name)
                         name_label.setStyleSheet(f"color: {name_color}; font-size: 13px; font-weight: 500; background: transparent; border: none;")
@@ -9560,11 +10719,8 @@ class PairsTradingTerminal(QMainWindow):
                         self.market_list_layout.addWidget(item_frame)
                         widgets_added += 1
                         
-                        # Track fresh vs cached
-                        if is_cached:
-                            cached_count += 1
-                        else:
-                            fresh_count += 1
+                        # Count processed items
+                        fresh_count += 1
                         
                         # Add to scatter map data
                         if category in ['AMERICA', 'EUROPE', 'ASIA', 'OCEANIA', 'MIDDLE EAST', 'AFRICA']:
@@ -9577,8 +10733,10 @@ class PairsTradingTerminal(QMainWindow):
                             })
                         
                     except Exception as e:
+                        print(f"[MarketWatch] Error processing ticker {ticker}: {e}")
                         pass
             
+            print(f"[MarketWatch] Loop complete: {widgets_added} widgets created, {fresh_count} tickers processed")
             self.market_list_layout.addStretch()
             
             # Update map if available
@@ -9586,11 +10744,27 @@ class PairsTradingTerminal(QMainWindow):
                 map_data = self.build_map_data(scatter_spots)
                 self.update_plotly_map(map_data)
             
-            # Force layout update
+            # VIKTIGT: Force complete layout refresh
+            # 1. Säg till market_list att beräkna om sin storlek
+            self.market_list.adjustSize()
+            
+            # 2. Uppdatera layouten
+            self.market_list_layout.activate()
+            
+            # 3. Force scroll-area att uppdatera sitt innehåll
+            if hasattr(self, 'market_scroll'):
+                self.market_scroll.setWidget(self.market_list)
+                self.market_scroll.updateGeometry()
+            
+            # 4. Process events för att säkerställa rendering
+            QApplication.processEvents()
+            
+            # 5. Slutlig repaint
             self.market_list.update()
             self.market_list.repaint()
             
-            self.statusBar().showMessage(f"Market data updated: {fresh_count} live, {cached_count} cached (closed markets)")
+            print(f"[MarketWatch] UI updated: {widgets_added} widgets, {fresh_count} items")
+            self.statusBar().showMessage(f"Market data updated: {fresh_count} indices")
                     
         except Exception as e:
             import traceback
@@ -9736,14 +10910,19 @@ class PairsTradingTerminal(QMainWindow):
         
         # Don't start if already running - använd säker flagga
         if self._volatility_running:
-            self.statusBar().showMessage("Volatility data already updating...")
-            print("[Volatility] Already running, skipping")
+            print("[Volatility] Already running (flag), skipping")
+            return
+        
+        # Also check if old thread is still alive
+        if self._volatility_thread is not None and self._volatility_thread.isRunning():
+            print("[Volatility] Old thread still alive, skipping")
             return
         
         tickers = ['^VIX', '^VVIX', '^SKEW', '^MOVE']
         
         # Sätt flagga INNAN vi skapar tråden
         self._volatility_running = True
+        self._volatility_last_start = time.time()
         print(f"[Volatility] Creating thread for {tickers}")
         
         try:
@@ -9771,11 +10950,16 @@ class PairsTradingTerminal(QMainWindow):
             self._volatility_running = False
     
     def _on_volatility_thread_finished(self):
-        """Handle volatility thread completion - clear references and flag."""
-        print("[Volatility] Thread finished")
+        """Handle volatility thread completion — clean up and chain to news.
+        
+        Always cleans up refs. Only chains to news if this was expected completion.
+        """
+        was_running = self._volatility_running
         self._volatility_running = False
         
-        # Använd deleteLater() för säker cleanup
+        elapsed = time.time() - getattr(self, '_volatility_last_start', 0)
+        print(f"[Volatility] Thread finished ({elapsed:.1f}s, was_running={was_running})")
+        
         if self._volatility_worker is not None:
             self._volatility_worker.deleteLater()
         if self._volatility_thread is not None:
@@ -9783,7 +10967,13 @@ class PairsTradingTerminal(QMainWindow):
         
         self._volatility_worker = None
         self._volatility_thread = None
-        print("[Volatility] References cleared")
+        
+        # Chain: start news refresh if 15+ min since last fetch
+        # Only if this was expected completion (not stale thread after watchdog)
+        if was_running:
+            last_news = getattr(self, '_last_news_fetch_time', 0)
+            if time.time() - last_news >= 900:  # 900s = 15 min
+                QTimer.singleShot(2000, self._refresh_news_feed_safe)
     
     def _on_volatility_data_received(self, close):
         """Handle received volatility data - runs on GUI thread (safe)."""
@@ -9791,6 +10981,9 @@ class PairsTradingTerminal(QMainWindow):
             if len(close) == 0:
                 print("No volatility data returned")
                 return
+            
+            # Antal dagar för sparkline (senaste ~30 handelsdagar)
+            SPARKLINE_DAYS = 30
             
             # VIX
             try:
@@ -9820,7 +11013,10 @@ class PairsTradingTerminal(QMainWindow):
                         else:
                             desc = "Extreme fear - crisis levels"
                         
-                        self.vix_card.update_data(vix_val, vix_chg, vix_pct, median, mode, desc)
+                        # Hämta senaste dagarna för sparkline
+                        history = vix_series.tail(SPARKLINE_DAYS).tolist()
+                        
+                        self.vix_card.update_data(vix_val, vix_chg, vix_pct, median, mode, desc, history=history)
             except Exception as e:
                 print(f"VIX error: {e}")
             
@@ -9851,8 +11047,11 @@ class PairsTradingTerminal(QMainWindow):
                             desc = "VIX itself highly volatile"
                         else:
                             desc = "Crisis-level VIX uncertainty"
+                        
+                        # Hämta senaste dagarna för sparkline
+                        history = vvix_series.tail(SPARKLINE_DAYS).tolist()
          
-                        self.vvix_card.update_data(vvix_val, vvix_chg, vvix_pct, median, mode, desc)
+                        self.vvix_card.update_data(vvix_val, vvix_chg, vvix_pct, median, mode, desc, history=history)
                     else:
                         self.vvix_card.value_label.setText("N/A")
                         self.vvix_card.desc_label.setText("No VVIX data available")
@@ -9887,8 +11086,11 @@ class PairsTradingTerminal(QMainWindow):
                             desc = "Significant crash hedging"
                         else:
                             desc = "Major crash protection demand"
+                        
+                        # Hämta senaste dagarna för sparkline
+                        history = skew_series.tail(SPARKLINE_DAYS).tolist()
 
-                        self.skew_card.update_data(skew_val, skew_chg, skew_pct, median, mode, desc)
+                        self.skew_card.update_data(skew_val, skew_chg, skew_pct, median, mode, desc, history=history)
                     else:
                         self.skew_card.value_label.setText("N/A")
                         self.skew_card.desc_label.setText("No SKEW data available")
@@ -9923,8 +11125,11 @@ class PairsTradingTerminal(QMainWindow):
                             desc = "Major rate movements expected"
                         else:
                             desc = "Crisis-level rate uncertainty"
+                        
+                        # Hämta senaste dagarna för sparkline
+                        history = move_series.tail(SPARKLINE_DAYS).tolist()
 
-                        self.move_card.update_data(move_val, move_chg, move_pct, median, mode, desc)
+                        self.move_card.update_data(move_val, move_chg, move_pct, median, mode, desc, history=history)
                     else:
                         self.move_card.value_label.setText("N/A")
                         self.move_card.desc_label.setText("No MOVE data available")
@@ -9975,7 +11180,7 @@ class PairsTradingTerminal(QMainWindow):
         
         config = {
             'lookback_period': self.lookback_combo.currentText(),
-            'min_half_life': 5,
+            'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
             'min_correlation': 0.70,
@@ -10172,7 +11377,11 @@ class PairsTradingTerminal(QMainWindow):
             self.tabs.setCurrentIndex(2)
     
     def update_ou_pair_list(self):
-        """Update OU analytics pair dropdown."""
+        """Update OU analytics pair dropdown.
+        
+        When 'Viable only' is checked, re-validates each pair using current
+        Kalman half-life (not just scan-time OLS half-life).
+        """
         self.ou_pair_combo.clear()
         
         if self.engine is None:
@@ -10180,7 +11389,17 @@ class PairsTradingTerminal(QMainWindow):
         
         if self.viable_only_check.isChecked():
             if self.engine.viable_pairs is not None:
-                pairs = self.engine.viable_pairs['pair'].tolist()
+                min_hl = self.engine.config.get('min_half_life', 1)
+                max_hl = self.engine.config.get('max_half_life', 60)
+                pairs = []
+                for p in self.engine.viable_pairs['pair'].tolist():
+                    try:
+                        ou, _, _ = self.engine.get_pair_ou_params(p, use_raw_data=True)
+                        hl = ou.half_life_days()
+                        if min_hl <= hl <= max_hl:
+                            pairs.append(p)
+                    except Exception:
+                        pass
             else:
                 pairs = []
         else:
@@ -10210,13 +11429,17 @@ class PairsTradingTerminal(QMainWindow):
             # Get pair stats
             if self.engine.viable_pairs is not None and pair in self.engine.viable_pairs['pair'].values:
                 pair_stats = self.engine.viable_pairs[self.engine.viable_pairs['pair'] == pair].iloc[0]
-                is_viable = True
+                # Re-check viability using CURRENT Kalman half-life (scan used OLS)
+                current_hl = ou.half_life_days()
+                min_hl = self.engine.config.get('min_half_life', 1)
+                max_hl = self.engine.config.get('max_half_life', 60)
+                is_viable = (min_hl <= current_hl <= max_hl)
             else:
                 pair_stats = self.engine.pairs_stats[self.engine.pairs_stats['pair'] == pair].iloc[0]
                 is_viable = pair_stats.get('is_viable', False)
             
-            # Update metric cards
-            self.ou_theta_card.set_value(f"{pair_stats['theta']:.2f}")
+            # Update metric cards (using Kalman-filtered estimates from ou object)
+            self.ou_theta_card.set_value(f"{ou.theta:.2f}")
             self.ou_mu_card.set_value(f"{ou.mu:.2f}")
             self.ou_halflife_card.set_value(f"{ou.half_life_days():.2f} days")
             
@@ -10228,6 +11451,46 @@ class PairsTradingTerminal(QMainWindow):
             status_text = "✅ VIABLE" if is_viable else "⚠️ NON-VIABLE"
             status_color = "#00c853" if is_viable else "#ffc107"
             self.ou_status_card.set_value(status_text, status_color)
+            
+            # Update Kalman diagnostics (if available)
+            kalman = getattr(ou, '_kalman', None)
+            if kalman is not None:
+                # Stability: 0-1 scale, higher = more stable parameters
+                stab = kalman.param_stability
+                stab_color = "#00c853" if stab > 0.7 else ("#ffc107" if stab > 0.4 else "#ff1744")
+                self.kalman_stability_card.set_value(f"{stab:.1%}", stab_color)
+                
+                # Effective sample size
+                self.kalman_ess_card.set_value(f"{kalman.effective_sample_size:.0f}")
+                
+                # θ confidence interval
+                theta_lo = max(0, kalman.theta - 1.96 * kalman.theta_std)
+                theta_hi = kalman.theta + 1.96 * kalman.theta_std
+                hl_lo = np.log(2) / theta_hi * 252 if theta_hi > 0 else np.inf
+                hl_hi = np.log(2) / theta_lo * 252 if theta_lo > 0 else np.inf
+                self.kalman_theta_ci_card.set_value(f"{hl_lo:.0f}-{hl_hi:.0f}d")
+                
+                # μ confidence interval
+                mu_lo = kalman.mu - 1.96 * kalman.mu_std
+                mu_hi = kalman.mu + 1.96 * kalman.mu_std
+                self.kalman_mu_ci_card.set_value(f"[{mu_lo:.2f}, {mu_hi:.2f}]")
+                
+                # Innovation ratio (should be ~1.0 if filter is well-calibrated)
+                ir = kalman.innovation_ratio
+                ir_color = "#00c853" if 0.5 < ir < 2.0 else "#ff1744"
+                self.kalman_innovation_card.set_value(f"{ir:.2f}", ir_color)
+                
+                # Regime change CUSUM score
+                rc = kalman.regime_change_score
+                rc_color = "#ff1744" if rc > 4.0 else ("#ffc107" if rc > 2.0 else "#00c853")
+                rc_text = f"{rc:.1f}" + (" ⚠" if rc > 4.0 else "")
+                self.kalman_regime_card.set_value(rc_text, rc_color)
+            else:
+                # Kalman not available (fallback method used)
+                for card in [self.kalman_stability_card, self.kalman_ess_card,
+                             self.kalman_theta_ci_card, self.kalman_mu_ci_card,
+                             self.kalman_innovation_card, self.kalman_regime_card]:
+                    card.set_value("N/A", "#666666")
             
             # Calculate Expected Move to Mean
             # Spread: S = Y - β*X - α
@@ -10317,11 +11580,45 @@ class PairsTradingTerminal(QMainWindow):
         
         # ===== Z-SCORE =====
         self.ou_zscore_plot.clear()
-        zscore = (spread - ou.mu) / ou.eq_std
-        self.ou_zscore_plot.plot(x_axis, zscore.values, pen=pg.mkPen('#9c27b0', width=2))
+        
+        # Use Kalman time-varying z-scores if available (no look-ahead bias)
+        kalman = getattr(ou, '_kalman', None)
+        if kalman is not None and kalman.zscore_history is not None:
+            # Kalman history has n-1 points (AR(1) loses first obs)
+            # Pad front with NaN to align with x_axis
+            kalman_z = kalman.zscore_history
+            n_pad = len(x_axis) - len(kalman_z)
+            if n_pad > 0:
+                zscore_values = np.concatenate([np.full(n_pad, np.nan), kalman_z])
+            else:
+                zscore_values = kalman_z[-len(x_axis):]
+            
+            # Also plot the static z-score as faint reference (clamped at ±3)
+            # Static Z = uses final global μ and σ for ALL points (has look-ahead bias)
+            # Kalman Z = uses time-varying μ_t and expanding-window σ_t at each point (no bias)
+            static_z = np.clip(((spread - ou.mu) / ou.eq_std).values, -3, 3)
+            self.ou_zscore_plot.addLegend(offset=(60, 5))
+            self.ou_zscore_plot.plot(x_axis, static_z, 
+                pen=pg.mkPen('#9c27b0', width=1, style=Qt.DashLine),
+                name='Static Z')
+            self.ou_zscore_plot.plot(x_axis, zscore_values, 
+                pen=pg.mkPen('#00e5ff', width=2),
+                name='Kalman Z')
+            zscore = pd.Series(zscore_values, index=spread.index)
+        else:
+            zscore_values = np.clip(((spread - ou.mu) / ou.eq_std).values, -3, 3)
+            self.ou_zscore_plot.plot(x_axis, zscore_values, pen=pg.mkPen('#9c27b0', width=2))
+            zscore = (spread - ou.mu) / ou.eq_std
+        
         self.ou_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
         self.ou_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
         self.ou_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+        
+        # ===== AUTO-RANGE: Reset view to show full data after plotting =====
+        self._ou_syncing_plots = True
+        self.ou_price_plot.enableAutoRange()
+        self.ou_zscore_plot.enableAutoRange()
+        QTimer.singleShot(50, lambda: setattr(self, '_ou_syncing_plots', False))
         
         # ===== SETUP CROSSHAIRS FOR INTERACTIVITY =====
         # Remove old crosshairs if they exist
@@ -10373,7 +11670,9 @@ class PairsTradingTerminal(QMainWindow):
         
         # ===== EXPECTED PATH =====
         self.ou_path_plot.clear()
-        days_range = np.arange(0, 70)
+        hl_days = ou.half_life_days()
+        path_end = max(30, int(hl_days + 10)) if hl_days < 500 else 70
+        days_range = np.arange(0, path_end + 1)
         taus = days_range / 252
         expected_path = np.array([ou.conditional_mean(current_spread, t) for t in taus])
         ci_results = [ou.confidence_interval(current_spread, t, 0.90) for t in taus]
@@ -10388,47 +11687,6 @@ class PairsTradingTerminal(QMainWindow):
         self.ou_path_plot.addLine(y=ou.mu, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
         self.ou_path_plot.addLine(x=ou.half_life_days(), pen=pg.mkPen('#ffaa00', width=1, style=Qt.DashLine))
         
-        # ===== ACF PLOT =====
-        # The dashed lines near 0 are 95% SIGNIFICANCE BANDS (±1.96/√n).
-        # They show the threshold for statistically significant autocorrelation.
-        # ACF values WITHIN these bands are NOT significantly different from zero.
-        # The orange line is the theoretical OU decay curve: ρ(τ) = exp(-θτ)
-        if hasattr(self, 'ou_acf_plot'):
-            self.ou_acf_plot.clear()
-            max_lag = min(60, len(spread) // 4)
-            
-            # Empirical ACF
-            spread_centered = spread - spread.mean()
-            empirical_acf = []
-            for lag in range(max_lag + 1):
-                if lag == 0:
-                    empirical_acf.append(1.0)
-                else:
-                    acf_val = spread_centered.autocorr(lag)
-                    empirical_acf.append(acf_val if not np.isnan(acf_val) else 0)
-            
-            # Theoretical ACF for OU process: ρ(τ) = exp(-θτ)
-            lags = np.arange(max_lag + 1)
-            theoretical_acf_ou = np.exp(-ou.theta * lags / 252)  # θ is annualized
-            
-            # Plot empirical as bars
-            bar_width = 0.4
-            for i, acf_val in enumerate(empirical_acf):
-                color = '#3b82f6' if acf_val >= 0 else '#ef4444'
-                bar = pg.BarGraphItem(x=[i], height=[acf_val], width=bar_width, brush=color)
-                self.ou_acf_plot.addItem(bar)
-            
-            # Plot OU theoretical decay as line (orange)
-            self.ou_acf_plot.plot(lags, theoretical_acf_ou, pen=pg.mkPen('#d4a574', width=2), name='OU Theoretical')
-            
-            # 95% Significance bands: values WITHIN these lines are NOT significant
-            # Formula: ±1.96/√n (Bartlett's approximation for white noise)
-            n = len(spread)
-            sig_level = 1.96 / np.sqrt(n)
-            self.ou_acf_plot.addLine(y=sig_level, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.ou_acf_plot.addLine(y=-sig_level, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.ou_acf_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
-    
     def update_signals_list(self):
         """Update signals dropdown."""
         self.signal_combo.clear()
@@ -10438,10 +11696,18 @@ class PairsTradingTerminal(QMainWindow):
             return
         
         signals = []
-        # Fix #5: Use itertuples instead of iterrows
+        min_hl = self.engine.config.get('min_half_life', 1)
+        max_hl = self.engine.config.get('max_half_life', 60)
+        
         for row in self.engine.viable_pairs.itertuples():
             try:
                 ou, spread, z = self.engine.get_pair_ou_params(row.pair, use_raw_data=True)
+                
+                # Re-check viability with CURRENT Kalman half-life
+                current_hl = ou.half_life_days()
+                if not (min_hl <= current_hl <= max_hl):
+                    continue
+                
                 if abs(z) >= SIGNAL_TAB_THRESHOLD:
                     signals.append((row.pair, z))
             except:
@@ -10542,11 +11808,34 @@ class PairsTradingTerminal(QMainWindow):
             
             # ===== Z-SCORE =====
             self.signal_zscore_plot.clear()
-            zscore = (spread - ou.mu) / ou.eq_std
-            self.signal_zscore_plot.plot(x_axis, zscore.values, pen=pg.mkPen('#9c27b0', width=2))
+            
+            # Use Kalman time-varying z-scores if available
+            kalman = getattr(ou, '_kalman', None)
+            if kalman is not None and kalman.zscore_history is not None:
+                kalman_z = kalman.zscore_history
+                n_pad = len(x_axis) - len(kalman_z)
+                if n_pad > 0:
+                    zscore_values = np.concatenate([np.full(n_pad, np.nan), kalman_z])
+                else:
+                    zscore_values = kalman_z[-len(x_axis):]
+                
+                self.signal_zscore_plot.plot(x_axis, zscore_values, pen=pg.mkPen('#00e5ff', width=2))
+                zscore = pd.Series(zscore_values, index=spread.index)
+            else:
+                zscore = (spread - ou.mu) / ou.eq_std
+                self.signal_zscore_plot.plot(x_axis, zscore.values, pen=pg.mkPen('#9c27b0', width=2))
+            
             self.signal_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
             self.signal_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
             self.signal_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+            
+            # ===== AUTO-RANGE: Reset view to show full data after plotting =====
+            # Temporarily block sync signals to avoid recursive range triggering
+            self._signal_syncing_plots = True
+            self.signal_price_plot.enableAutoRange()
+            self.signal_zscore_plot.enableAutoRange()
+            # Use QTimer to unblock after the event loop processes the range changes
+            QTimer.singleShot(50, lambda: setattr(self, '_signal_syncing_plots', False))
             
             # ===== SETUP SYNCHRONIZED CROSSHAIRS =====
             # Remove old crosshairs if they exist
@@ -10597,6 +11886,14 @@ class PairsTradingTerminal(QMainWindow):
         else:  # Short spread
             dir_y, dir_x = 'Short', 'Long'
             direction = 'SHORT'
+        
+        # VIKTIGT: Rensa BÅDA korten FÖRST innan vi hämtar nya produkter
+        # Detta förhindrar att gamla produkter visas om sökningen misslyckas
+        self._clear_mini_future_card('y', y_ticker, dir_y)
+        self._clear_mini_future_card('x', x_ticker, dir_x)
+        self._clear_mf_position_sizing()
+        self.current_mini_futures = {'y': None, 'x': None}
+        QApplication.processEvents()
         
         # Load ticker mapping
         ticker_to_ms, ms_to_ticker, ticker_to_ms_asset = load_ticker_mapping(force_reload=True)
@@ -10653,7 +11950,7 @@ class PairsTradingTerminal(QMainWindow):
     
     def _update_mf_position_sizing(self, pair: str, y_ticker: str, x_ticker: str, 
                                     dir_y: str, dir_x: str, mf_y: dict, mf_x: dict, direction: str):
-        """Calculate and display mini futures position sizing."""
+        """Calculate and display mini futures position sizing with actual allocation tracking."""
         try:
             # Get hedge ratio
             pair_stats = self.engine.viable_pairs[self.engine.viable_pairs['pair'] == pair].iloc[0]
@@ -10668,6 +11965,56 @@ class PairsTradingTerminal(QMainWindow):
             # Store for later use
             self.current_mf_positions = mf_positions
             
+            # Helper function to calculate instrument price and actual allocation
+            def calc_actual_allocation(mf_data, target_capital, dir_leg):
+                """Calculate units and actual allocation for any instrument type."""
+                if not mf_data:
+                    return None, None, None, None
+                
+                product_type = mf_data.get('product_type', 'Mini Future')
+                spot_price = mf_data.get('spot_price', 0)
+                leverage = mf_data.get('leverage', 1)
+                fin_level = mf_data.get('financing_level')
+                
+                # Check if instrument_price was pre-calculated (for certificates with multiplier)
+                instrument_price = mf_data.get('instrument_price')
+                
+                if instrument_price is None:
+                    # Calculate instrument price based on product type
+                    if product_type == 'Mini Future' and fin_level is not None:
+                        if dir_leg == 'Long':
+                            instrument_price = spot_price - fin_level
+                        else:
+                            instrument_price = fin_level - spot_price
+                    elif product_type == 'Certificate':
+                        # Certificate with financing level and multiplier
+                        multiplier = mf_data.get('multiplier')
+                        if fin_level is not None and multiplier is not None:
+                            if dir_leg == 'Long':
+                                instrument_price = multiplier * (spot_price - fin_level)
+                            else:
+                                instrument_price = multiplier * (fin_level - spot_price)
+                        else:
+                            # Fallback approximation (may not be accurate)
+                            instrument_price = spot_price / leverage if leverage > 0 else 100
+                    else:
+                        # Generic fallback
+                        instrument_price = spot_price / leverage if leverage > 0 else 100
+                
+                # Ensure positive price
+                instrument_price = max(0.01, abs(instrument_price))
+                
+                # Calculate units (whole numbers only)
+                units = max(1, int(target_capital / instrument_price))
+                actual_allocation = units * instrument_price
+                deviation_pct = abs(actual_allocation - target_capital) / target_capital * 100 if target_capital > 0 else 0
+                
+                return instrument_price, units, actual_allocation, deviation_pct
+            
+            # Calculate actual allocations for both legs
+            inst_price_y, units_y, actual_y, dev_y = calc_actual_allocation(mf_y, mf_positions['capital_y'], dir_y)
+            inst_price_x, units_x, actual_x, dev_x = calc_actual_allocation(mf_x, mf_positions['capital_x'], dir_x)
+            
             # Update Y leg display
             action_y = "LONG POSITION:" if dir_y == "Long" else "SHORT POSITION:"
             color_y = "#00c853" if dir_y == "Long" else "#ff1744"
@@ -10677,7 +12024,18 @@ class PairsTradingTerminal(QMainWindow):
                 self.mf_pos_y_action.setStyleSheet(f"color: {color_y}; font-size: 11px; font-weight: 600; background: transparent; border: none;")
                 self.mf_pos_y_capital.setText(f"{mf_positions['capital_y']:,.0f} SEK")
                 self.mf_pos_y_capital.setStyleSheet(f"color: {color_y}; font-size: 20px; font-weight: 600; background: transparent; border: none;")
-                self.mf_pos_y_info.setText("capital allocation")
+                
+                # Show units and actual allocation
+                if units_y and inst_price_y:
+                    self.mf_pos_y_info.setText(f"{units_y} units @ {inst_price_y:.2f} SEK = {actual_y:,.0f} SEK")
+                    if dev_y > 10:
+                        self.mf_pos_y_info.setStyleSheet("color: #ff9800; font-size: 10px; background: transparent; border: none;")
+                    else:
+                        self.mf_pos_y_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                else:
+                    self.mf_pos_y_info.setText("capital allocation")
+                    self.mf_pos_y_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                    
                 self.mf_pos_y_exposure.setText(f"→ {mf_positions['exposure_y']:,.0f} SEK exposure ({mf_y['leverage']:.2f}x)")
             else:
                 self.mf_pos_y_action.setText(f"{y_ticker}")
@@ -10696,7 +12054,18 @@ class PairsTradingTerminal(QMainWindow):
                 self.mf_pos_x_action.setStyleSheet(f"color: {color_x}; font-size: 11px; font-weight: 600; background: transparent; border: none;")
                 self.mf_pos_x_capital.setText(f"{mf_positions['capital_x']:,.0f} SEK")
                 self.mf_pos_x_capital.setStyleSheet(f"color: {color_x}; font-size: 20px; font-weight: 600; background: transparent; border: none;")
-                self.mf_pos_x_info.setText("capital allocation")
+                
+                # Show units and actual allocation
+                if units_x and inst_price_x:
+                    self.mf_pos_x_info.setText(f"{units_x} units @ {inst_price_x:.2f} SEK = {actual_x:,.0f} SEK")
+                    if dev_x > 10:
+                        self.mf_pos_x_info.setStyleSheet("color: #ff9800; font-size: 10px; background: transparent; border: none;")
+                    else:
+                        self.mf_pos_x_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                else:
+                    self.mf_pos_x_info.setText("capital allocation")
+                    self.mf_pos_x_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                    
                 self.mf_pos_x_exposure.setText(f"→ {mf_positions['exposure_x']:,.0f} SEK exposure ({mf_x['leverage']:.2f}x)")
             else:
                 self.mf_pos_x_action.setText(f"{x_ticker}")
@@ -10713,14 +12082,34 @@ class PairsTradingTerminal(QMainWindow):
             self.mf_pos_total_exposure.setText(f"Total exposure: {mf_positions['total_exposure']:,.0f} SEK")
             self.mf_pos_eff_leverage.setText(f"Effective leverage: {mf_positions['effective_leverage']:.2f}x")
             
-            # Update minimum capital info
+            # Update info with ACTUAL total allocation (both legs)
             if mf_y or mf_x:
-                if mf_positions['is_at_minimum']:
-                    info_text = f"ℹ️Minimum capital required: {mf_positions['min_total_capital']:,.0f} SEK "
-                    info_text += f"(binding constraint: {mf_positions['binding_leg']} leg). Position is at minimum size."
+                actual_total = (actual_y or 0) + (actual_x or 0)
+                target_total = mf_positions['capital_y'] + mf_positions['capital_x']
+                
+                if actual_total > 0:
+                    total_deviation = abs(actual_total - target_total) / target_total * 100 if target_total > 0 else 0
+                    
+                    # Build detailed breakdown
+                    parts = []
+                    if actual_y:
+                        parts.append(f"Y: {actual_y:,.0f}")
+                    if actual_x:
+                        parts.append(f"X: {actual_x:,.0f}")
+                    breakdown = " + ".join(parts)
+                    
+                    if total_deviation > 15:
+                        info_text = f"⚠️ Actual: {actual_total:,.0f} SEK ({breakdown}) — {total_deviation:.1f}% from target {target_total:,.0f} SEK"
+                    elif total_deviation > 5:
+                        info_text = f"ℹ️ Actual: {actual_total:,.0f} SEK ({breakdown}) — {total_deviation:.1f}% deviation"
+                    else:
+                        info_text = f"✓ Actual: {actual_total:,.0f} SEK ({breakdown}) — within {total_deviation:.1f}% of target"
                 else:
-                    info_text = f"ℹ️Minimum capital required: {mf_positions['min_total_capital']:,.0f} SEK "
-                    info_text += f"(binding constraint: {mf_positions['binding_leg']} leg). Scaled up to match {notional:,.0f} SEK notional."
+                    if mf_positions['is_at_minimum']:
+                        info_text = f"ℹ️ Minimum capital: {mf_positions['min_total_capital']:,.0f} SEK (binding: {mf_positions['binding_leg']} leg)"
+                    else:
+                        info_text = f"ℹ️ Target: {target_total:,.0f} SEK (binding: {mf_positions['binding_leg']} leg)"
+                        
                 self.mf_min_cap_label.setText(info_text)
             else:
                 self.mf_min_cap_label.setText("ℹ️ No mini futures available for position sizing calculation")
@@ -10828,15 +12217,55 @@ class PairsTradingTerminal(QMainWindow):
         else:
             self._update_mini_future_card_not_found(ticker, direction, ticker_to_ms, leg)
     
+    def _clear_mini_future_card(self, leg: str, ticker: str, direction: str):
+        """Clear a mini future card to 'Searching...' state before fetching new data.
+        
+        This prevents stale data from showing if the new search fails.
+        """
+        action = "BUY" if direction == "Long" else "SELL"
+        
+        if leg == 'y':
+            self.mini_y_ticker.setText(f"{action} {ticker} MINI {direction.upper()}")
+            self.mini_y_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+            self.mini_y_name.setText("⏳ Searching Morgan Stanley...")
+            self.mini_y_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; font-weight: 500; background: transparent; border: none")
+            self.mini_y_info.setText("")
+            self.mini_y_frame.setStyleSheet(f"""
+                QFrame#metricCard {{
+                    background-color: {COLORS['bg_elevated']};
+                    border: none;
+                    border-radius: 4px;
+                }}
+            """)
+            # Clear click handler
+            self.mini_y_frame.setCursor(Qt.ArrowCursor)
+            self.mini_y_frame.mousePressEvent = lambda e: None
+        else:
+            self.mini_x_ticker.setText(f"{action} {ticker} MINI {direction.upper()}")
+            self.mini_x_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+            self.mini_x_name.setText("⏳ Searching Morgan Stanley...")
+            self.mini_x_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; font-weight: 500; background: transparent; border: none")
+            self.mini_x_info.setText("")
+            self.mini_x_frame.setStyleSheet(f"""
+                QFrame#metricCard {{
+                    background-color: {COLORS['bg_elevated']};
+                    border: none;
+                    border-radius: 4px;
+                }}
+            """)
+            # Clear click handler
+            self.mini_x_frame.setCursor(Qt.ArrowCursor)
+            self.mini_x_frame.mousePressEvent = lambda e: None
+    
     def _update_mini_future_card_not_found(self, ticker: str, direction: str, ticker_to_ms: dict, leg: str):
         """Update mini future card when not found."""
         ms_name = ticker_to_ms.get(ticker, ticker)
         
         if leg == 'y':
             self.mini_y_ticker.setText(f"{ticker} - NO PRODUCT FOUND")
-            self.mini_y_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent;")
+            self.mini_y_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent; border: none")
             self.mini_y_name.setText(f"No mini future or certificate for {ticker}")
-            self.mini_y_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent;")
+            self.mini_y_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent; border: none")
             self.mini_y_info.setText(f"Searched for: {ms_name} ({direction})")
             self.mini_y_frame.setStyleSheet(f"""
                 QFrame#metricCard {{
@@ -10847,9 +12276,9 @@ class PairsTradingTerminal(QMainWindow):
             """)
         else:
             self.mini_x_ticker.setText(f"{ticker} - NO PRODUCT FOUND")
-            self.mini_x_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent;")
+            self.mini_x_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent; border: none")
             self.mini_x_name.setText(f"No mini future or certificate for {ticker}")
-            self.mini_x_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent;")
+            self.mini_x_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent; border: none")
             self.mini_x_info.setText(f"Searched for: {ms_name} ({direction})")
             self.mini_x_frame.setStyleSheet(f"""
                 QFrame#metricCard {{
@@ -11030,7 +12459,7 @@ class PairsTradingTerminal(QMainWindow):
             # Auto-save portfolio
             self._save_and_sync_portfolio()
             
-            self.statusBar().showMessage(f"Opened position for {pair} | SL: {strategy.get('stop_z', 3.0):.1f}σ | Win: {strategy.get('win_prob', 0)*100:.0f}%")
+            self.statusBar().showMessage(f"Opened position for {pair} | Win: {strategy.get('win_prob', 0)*100:.0f}%")
             
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to open position:\n{e}")
@@ -11046,8 +12475,8 @@ class PairsTradingTerminal(QMainWindow):
         self.positions_table.setRowCount(len(self.portfolio))
         
         # Update summary labels
-        open_count = len([p for p in self.portfolio if p.get('status', 'OPEN') == 'OPEN'])
-        closed_count = len([p for p in self.portfolio if p.get('status', 'OPEN') != 'OPEN'])
+        open_count = len(self.portfolio)
+        closed_count = len(self.trade_history)
         
         self.open_pos_label.setText(f"Open: <span style='color:#22c55e; font-weight:600;'>{open_count}</span>")
         self.closed_pos_label.setText(f"Closed: <span style='color:#888;'>{closed_count}</span>")
@@ -11073,19 +12502,24 @@ class PairsTradingTerminal(QMainWindow):
             z_item.setForeground(QColor("#e8e8e8"))
             self.positions_table.setItem(i, 2, z_item)
             
-            # SL (col 3) - Stop Loss Z-score
-            sl_z = pos.get('stop_z', 3.0)
-            sl_item = QTableWidgetItem(f"{sl_z:.2f}")
-            sl_item.setForeground(QColor("#e8e8e8"))
-            self.positions_table.setItem(i, 3, sl_item)
+            # STATUS (col 3) - Purely dynamic: SELL when z crosses zero toward profit
+            direction = pos['direction']
             
-            # STATUS (col 4)
-            status = pos.get('status', 'OPEN')
-            status_item = QTableWidgetItem(status)
-            status_item.setForeground(QColor("#e8e8e8"))
-            self.positions_table.setItem(i, 4, status_item)
+            if direction == 'LONG' and current_z > 0:
+                status_text = 'SELL'
+                status_color = '#ffaa00'  # Amber
+            elif direction == 'SHORT' and current_z < 0:
+                status_text = 'SELL'
+                status_color = '#ffaa00'
+            else:
+                status_text = 'OPEN'
+                status_color = '#e8e8e8'
             
-            # MINI Y (col 5) - Show NAME (ISIN in tooltip)
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QColor(status_color))
+            self.positions_table.setItem(i, 3, status_item)
+            
+            # MINI Y (col 4) - Show NAME (ISIN in tooltip)
             mini_y_isin = pos.get('mini_y_isin', '')
             mini_y_name = pos.get('mini_y_name', '')
             if mini_y_name:
@@ -11101,9 +12535,9 @@ class PairsTradingTerminal(QMainWindow):
             else:
                 mini_y_item = QTableWidgetItem("-")
                 mini_y_item.setForeground(QColor("#666666"))
-            self.positions_table.setItem(i, 5, mini_y_item)
+            self.positions_table.setItem(i, 4, mini_y_item)
             
-            # ENTRY Y (col 6) - Editable entry price
+            # ENTRY Y (col 5) - Editable entry price
             entry_y_widget = QDoubleSpinBox()
             entry_y_widget.setRange(0, 1000000)
             entry_y_widget.setDecimals(2)
@@ -11129,9 +12563,9 @@ class PairsTradingTerminal(QMainWindow):
                 }
             """)
             entry_y_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_entry_price(idx, 'y', val))
-            self.positions_table.setCellWidget(i, 6, entry_y_widget)
+            self.positions_table.setCellWidget(i, 5, entry_y_widget)
             
-            # QTY Y (col 7) - Editable quantity
+            # QTY Y (col 6) - Editable quantity
             qty_y_widget = QSpinBox()
             qty_y_widget.setRange(0, 100000)
             qty_y_widget.setValue(pos.get('mf_qty_y', 0))
@@ -11155,9 +12589,9 @@ class PairsTradingTerminal(QMainWindow):
                 }
             """)
             qty_y_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_qty(idx, 'y', val))
-            self.positions_table.setCellWidget(i, 7, qty_y_widget)
+            self.positions_table.setCellWidget(i, 6, qty_y_widget)
             
-            # P/L Y (col 8) - Calculated P/L for Y leg
+            # P/L Y (col 7) - Calculated P/L for Y leg
             entry_price_y = pos.get('mf_entry_price_y', 0.0)
             current_price_y = pos.get('mf_current_price_y', 0.0)
             qty_y = pos.get('mf_qty_y', 0)
@@ -11175,9 +12609,9 @@ class PairsTradingTerminal(QMainWindow):
             
             pnl_y_item = QTableWidgetItem(pnl_y_text)
             pnl_y_item.setForeground(QColor(pnl_y_color))
-            self.positions_table.setItem(i, 8, pnl_y_item)
+            self.positions_table.setItem(i, 7, pnl_y_item)
             
-            # MINI X (col 9) - Show NAME (ISIN in tooltip)
+            # MINI X (col 8) - Show NAME (ISIN in tooltip)
             mini_x_isin = pos.get('mini_x_isin', '')
             mini_x_name = pos.get('mini_x_name', '')
             if mini_x_name:
@@ -11193,9 +12627,9 @@ class PairsTradingTerminal(QMainWindow):
             else:
                 mini_x_item = QTableWidgetItem("-")
                 mini_x_item.setForeground(QColor("#666666"))
-            self.positions_table.setItem(i, 9, mini_x_item)
+            self.positions_table.setItem(i, 8, mini_x_item)
             
-            # ENTRY X (col 10) - Editable entry price
+            # ENTRY X (col 9) - Editable entry price
             entry_x_widget = QDoubleSpinBox()
             entry_x_widget.setRange(0, 1000000)
             entry_x_widget.setDecimals(2)
@@ -11221,9 +12655,9 @@ class PairsTradingTerminal(QMainWindow):
                 }
             """)
             entry_x_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_entry_price(idx, 'x', val))
-            self.positions_table.setCellWidget(i, 10, entry_x_widget)
+            self.positions_table.setCellWidget(i, 9, entry_x_widget)
             
-            # QTY X (col 11) - Editable quantity
+            # QTY X (col 10) - Editable quantity
             qty_x_widget = QSpinBox()
             qty_x_widget.setRange(0, 100000)
             qty_x_widget.setValue(pos.get('mf_qty_x', 0))
@@ -11247,9 +12681,9 @@ class PairsTradingTerminal(QMainWindow):
                 }
             """)
             qty_x_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_qty(idx, 'x', val))
-            self.positions_table.setCellWidget(i, 11, qty_x_widget)
+            self.positions_table.setCellWidget(i, 10, qty_x_widget)
             
-            # P/L X (col 12) - Calculated P/L for X leg
+            # P/L X (col 11) - Calculated P/L for X leg
             entry_price_x = pos.get('mf_entry_price_x', 0.0)
             current_price_x = pos.get('mf_current_price_x', 0.0)
             qty_x = pos.get('mf_qty_x', 0)
@@ -11267,9 +12701,9 @@ class PairsTradingTerminal(QMainWindow):
             
             pnl_x_item = QTableWidgetItem(pnl_x_text)
             pnl_x_item.setForeground(QColor(pnl_x_color))
-            self.positions_table.setItem(i, 12, pnl_x_item)
+            self.positions_table.setItem(i, 11, pnl_x_item)
             
-            # CLOSE button (col 13)
+            # CLOSE button (col 12)
             close_btn = QPushButton("✕")
             close_btn.setStyleSheet("""
                 QPushButton {
@@ -11285,7 +12719,7 @@ class PairsTradingTerminal(QMainWindow):
                 }
             """)
             close_btn.clicked.connect(lambda checked, idx=i: self.close_position(idx))
-            self.positions_table.setCellWidget(i, 13, close_btn)
+            self.positions_table.setCellWidget(i, 12, close_btn)
         
         # Update total P/L summary
         if total_invested > 0:
@@ -11294,6 +12728,20 @@ class PairsTradingTerminal(QMainWindow):
             self.unrealized_pnl_label.setText(f"Unrealized: <span style='color:{pnl_color};'>{total_pnl:+,.0f} SEK ({total_pnl_pct:+.2f}%)</span>")
         else:
             self.unrealized_pnl_label.setText("Unrealized: <span style='color:#888;'>+0.00%</span>")
+        
+        # Update realized P/L from trade history
+        total_realized = sum(t.get('realized_pnl_sek', 0) for t in self.trade_history)
+        if total_realized != 0:
+            r_color = "#22c55e" if total_realized >= 0 else "#ff1744"
+            self.realized_pnl_label.setText(f"Realized: <span style='color:{r_color};'>{total_realized:+,.0f} SEK</span>")
+        else:
+            self.realized_pnl_label.setText("Realized: <span style='color:#888;'>+0.00%</span>")
+        
+        # Update open/closed counts
+        n_open = len(self.portfolio)
+        n_closed = len(self.trade_history)
+        self.open_pos_label.setText(f"Open: <span style='color:#22c55e; font-weight:600;'>{n_open}</span>")
+        self.closed_pos_label.setText(f"Closed: <span style='color:#888;'>{n_closed}</span>")
     
     def _update_mf_entry_price(self, idx: int, leg: str, value: float):
         """Update mini future entry price for a position."""
@@ -11336,7 +12784,7 @@ class PairsTradingTerminal(QMainWindow):
         
         pnl_y_item = QTableWidgetItem(pnl_y_text)
         pnl_y_item.setForeground(QColor(pnl_y_color))
-        self.positions_table.setItem(idx, 8, pnl_y_item)
+        self.positions_table.setItem(idx, 7, pnl_y_item)
         
         # P/L X
         entry_price_x = pos.get('mf_entry_price_x', 0.0)
@@ -11354,7 +12802,7 @@ class PairsTradingTerminal(QMainWindow):
         
         pnl_x_item = QTableWidgetItem(pnl_x_text)
         pnl_x_item.setForeground(QColor(pnl_x_color))
-        self.positions_table.setItem(idx, 12, pnl_x_item)
+        self.positions_table.setItem(idx, 11, pnl_x_item)
         
         # Update summary
         self._update_total_pnl_summary()
@@ -11476,9 +12924,6 @@ class PairsTradingTerminal(QMainWindow):
         
         updated_count = 0
         for pos in self.portfolio:
-            if pos.get('status', 'OPEN') != 'OPEN':
-                continue
-                
             try:
                 pair = pos['pair']
                 ou, spread, current_z = self.engine.get_pair_ou_params(pair, use_raw_data=True)
@@ -11487,28 +12932,6 @@ class PairsTradingTerminal(QMainWindow):
                 pos['previous_z'] = pos.get('current_z', pos['entry_z'])
                 pos['current_z'] = current_z
                 
-                # Check TP/SL conditions
-                tp_z = pos.get('exit_z', 0.0)
-                sl_z = pos.get('stop_z', 3.0)
-                entry_z = pos['entry_z']
-                
-                if pos['direction'] == 'LONG':
-                    # Long spread: entered at negative Z, want Z to rise toward 0
-                    # TP when Z crosses above exit_z (closer to 0)
-                    # SL when Z goes more negative (below -stop_z)
-                    if current_z >= tp_z:
-                        pos['status'] = 'TP HIT'
-                    elif current_z <= -abs(sl_z):
-                        pos['status'] = 'SL HIT'
-                else:
-                    # Short spread: entered at positive Z, want Z to fall toward 0
-                    # TP when Z crosses below exit_z (closer to 0)
-                    # SL when Z goes more positive (above stop_z)
-                    if current_z <= tp_z:
-                        pos['status'] = 'TP HIT'
-                    elif current_z >= abs(sl_z):
-                        pos['status'] = 'SL HIT'
-                
                 updated_count += 1
                 
             except Exception as e:
@@ -11516,36 +12939,54 @@ class PairsTradingTerminal(QMainWindow):
         
         self.update_portfolio_display()
         
-        # Auto-save portfolio with updated Z-scores and status
+        # Auto-save portfolio with updated Z-scores
         self._save_and_sync_portfolio()
         
         self.statusBar().showMessage(f"Updated Z-scores for {updated_count} positions")
     
     def close_position(self, index: int):
-        """Close a position with P&L calculation."""
+        """Close a position with P&L calculation and move to trade history."""
         if 0 <= index < len(self.portfolio):
             pos = self.portfolio[index]
             
-            # Calculate Z change
             entry_z = pos['entry_z']
             current_z = pos.get('current_z', entry_z)
             z_change = current_z - entry_z
+            direction = pos['direction']
             
             # For LONG: profit when Z increases (becomes less negative)
             # For SHORT: profit when Z decreases
-            if pos['direction'] == 'LONG':
-                profit = z_change > 0
-            else:
-                profit = z_change < 0
+            profit = (z_change > 0) if direction == 'LONG' else (z_change < 0)
+            
+            # Calculate realized P/L from MF prices
+            pnl_y = 0
+            pnl_x = 0
+            total_capital = pos.get('mf_total_capital', pos.get('notional', 0))
+            
+            entry_y = pos.get('mf_entry_price_y')
+            current_y = pos.get('mf_current_price_y')
+            qty_y = pos.get('mf_qty_y', 0)
+            if entry_y and current_y and qty_y:
+                pnl_y = (current_y - entry_y) * qty_y
+            
+            entry_x = pos.get('mf_entry_price_x')
+            current_x = pos.get('mf_current_price_x')
+            qty_x = pos.get('mf_qty_x', 0)
+            if entry_x and current_x and qty_x:
+                pnl_x = (current_x - entry_x) * qty_x
+            
+            realized_pnl_sek = pnl_y + pnl_x
+            realized_pnl_pct = (realized_pnl_sek / total_capital * 100) if total_capital > 0 else 0
             
             status = pos.get('status', 'MANUAL CLOSE')
             
-            # Ask for confirmation with details
+            # Confirmation dialog
             msg = f"Close position for {pos['pair']}?\n\n"
-            msg += f"Direction: {pos['direction']}\n"
+            msg += f"Direction: {direction}\n"
             msg += f"Entry Z: {entry_z:.2f}\n"
             msg += f"Current Z: {current_z:.2f}\n"
             msg += f"Z Change: {z_change:+.2f}\n"
+            msg += f"Realized P/L: {realized_pnl_sek:+.0f} SEK ({realized_pnl_pct:+.1f}%)\n"
             msg += f"Status: {status}"
             
             reply = QMessageBox.question(self, "Close Position", msg,
@@ -11553,14 +12994,41 @@ class PairsTradingTerminal(QMainWindow):
             
             if reply == QMessageBox.Yes:
                 pos = self.portfolio.pop(index)
+                
+                # Create trade history record
+                result = "PROFIT" if profit else "LOSS"
+                trade_record = {
+                    'pair': pos['pair'],
+                    'direction': direction,
+                    'entry_date': pos.get('entry_date', ''),
+                    'close_date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    'entry_z': entry_z,
+                    'close_z': current_z,
+                    'result': result,
+                    'realized_pnl_sek': round(realized_pnl_sek, 2),
+                    'realized_pnl_pct': round(realized_pnl_pct, 2),
+                    'capital': total_capital,
+                    'status': status,
+                    # Preserve MF details for reference
+                    'mini_y_name': pos.get('mini_y_name', ''),
+                    'mini_x_name': pos.get('mini_x_name', ''),
+                    'mf_entry_price_y': entry_y,
+                    'mf_entry_price_x': entry_x,
+                    'mf_close_price_y': current_y,
+                    'mf_close_price_x': current_x,
+                    'mf_qty_y': qty_y,
+                    'mf_qty_x': qty_x,
+                }
+                self.trade_history.append(trade_record)
+                
                 self.update_portfolio_display()
                 self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
-                
-                # Auto-save portfolio
                 self._save_and_sync_portfolio()
                 
-                result = "PROFIT" if profit else "LOSS"
-                self.statusBar().showMessage(f"Closed {pos['pair']} - {result} (Z: {entry_z:.2f} → {current_z:.2f})")
+                self.statusBar().showMessage(
+                    f"Closed {pos['pair']} - {result} (Z: {entry_z:.2f} → {current_z:.2f}, "
+                    f"P/L: {realized_pnl_sek:+.0f} SEK)"
+                )
     
     def clear_all_positions(self):
         """Clear all positions."""
@@ -11599,13 +13067,32 @@ def main():
     logger = setup_logging()
     logger.info(f"Starting {APP_NAME} v{APP_VERSION}")
 
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    # Apply screen scaling BEFORE creating QApplication
+    if SCREEN_SCALING_AVAILABLE:
+        try:
+            apply_screen_scaling()
+            print_screen_info()
+        except Exception as e:
+            print(f"Screen scaling setup failed: {e}")
+    else:
+        # Fallback to standard High DPI settings
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     
-    font = QFont("Segoe UI", 10)
+    # Scale base font size based on screen
+    if SCREEN_SCALING_AVAILABLE:
+        try:
+            scale = get_scale_factor()
+            base_font_size = max(9, round(10 * scale))
+        except:
+            base_font_size = 10
+    else:
+        base_font_size = 10
+    
+    font = QFont("Segoe UI", base_font_size)
     app.setFont(font)
         
     window = PairsTradingTerminal()

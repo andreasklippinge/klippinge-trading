@@ -324,6 +324,464 @@ class OUProcess:
 
 
 # ============================================================================
+# KALMAN FILTER OU ESTIMATOR - Institutional-Grade Adaptive Parameter Tracking
+# ============================================================================
+# 
+# References:
+#   - Mehra (1970): Adaptive Kalman filtering with unknown noise covariances
+#   - Rauch, Tung, Striebel (1965): Maximum likelihood estimates of linear
+#     dynamic systems (RTS smoother)
+#   - Elliott, van der Hoek, Malcolm (2005): Pairs trading with Kalman filter
+#   - Triantafyllopoulos (2011): Time-varying parameter estimation via the 
+#     Kalman filter
+# ============================================================================
+
+@dataclass
+class KalmanOUResult:
+    """Complete result from Kalman filter OU estimation."""
+    # Current OU parameters (filtered estimates)
+    theta: float              # Mean reversion speed (annualized)
+    mu: float                 # Long-term mean
+    sigma: float              # Volatility (annualized)
+    eq_std: float             # Equilibrium standard deviation
+    half_life_days: float     # Half-life in trading days
+    ar1_coef: float           # AR(1) coefficient (b)
+    valid: bool = True
+    reason: str = ""
+    
+    # Kalman-specific diagnostics
+    theta_std: float = 0.0    # Std of theta estimate (from P matrix)
+    mu_std: float = 0.0       # Std of mu estimate
+    param_stability: float = 0.0     # Rolling stability metric [0-1]
+    regime_change_score: float = 0.0 # CUSUM score for structural breaks
+    innovation_ratio: float = 0.0    # Normalized innovation (should be ~1)
+    effective_sample_size: float = 0.0  # How many obs effectively used
+    
+    # Time series of tracked parameters (for plotting)
+    theta_history: Optional[np.ndarray] = None
+    mu_history: Optional[np.ndarray] = None
+    sigma_history: Optional[np.ndarray] = None
+    eq_std_history: Optional[np.ndarray] = None   # Time-varying equilibrium std
+    zscore_history: Optional[np.ndarray] = None    # Time-varying z-scores (using params at each t)
+    theta_upper: Optional[np.ndarray] = None   # 95% CI upper
+    theta_lower: Optional[np.ndarray] = None   # 95% CI lower
+    mu_upper: Optional[np.ndarray] = None
+    mu_lower: Optional[np.ndarray] = None
+
+
+class KalmanOUEstimator:
+    """
+    Kalman filter for adaptive Ornstein-Uhlenbeck parameter estimation.
+    
+    Models the discrete OU process as a linear state-space system:
+    
+        State:       x_t = [a_t, b_t]'   (intercept and AR(1) coefficient)
+        Transition:  x_t = x_{t-1} + w_t,  w_t ~ N(0, Q)
+        Observation: S_t = H_t · x_t + v_t,  v_t ~ N(0, R)
+                     where H_t = [1, S_{t-1}]
+    
+    Features:
+        - Adaptive Q estimation via innovation monitoring (Mehra 1970)
+        - RTS smoother for improved historical estimates
+        - Joseph form covariance update for numerical stability  
+        - CUSUM test on normalized innovations for regime change detection
+        - Delta method for confidence intervals on transformed parameters
+        - Automatic observation noise (R) estimation
+    
+    Args:
+        q_scale: Base process noise scaling factor (default 1e-5).
+                 Controls how fast parameters can drift.
+                 Higher = more responsive but noisier.
+        adaptive_q: If True, automatically adjust Q based on innovations.
+        smoother: If True, run RTS backward pass for better historical estimates.
+        cusum_threshold: Threshold for regime change detection (default 4.0).
+        min_warmup: Minimum observations before parameters are considered valid.
+    """
+    
+    def __init__(self, 
+                 q_scale: float = 1e-5,
+                 adaptive_q: bool = True,
+                 smoother: bool = True,
+                 cusum_threshold: float = 4.0,
+                 min_warmup: int = 30):
+        self.q_scale = q_scale
+        self.adaptive_q = adaptive_q
+        self.smoother = smoother
+        self.cusum_threshold = cusum_threshold
+        self.min_warmup = min_warmup
+        
+        # Filter state (initialized on first call)
+        self._x = None        # State vector [a, b]
+        self._P = None        # State covariance
+        self._R = None        # Observation noise variance (scalar)
+        self._Q = None        # Process noise covariance (2x2)
+        
+        # Innovation tracking for adaptive Q and diagnostics
+        self._innovation_window = 50
+        self._innovations = []       # Raw innovations y_t
+        self._norm_innovations = []  # Standardized innovations y_t / sqrt(S_t)
+    
+    def fit(self, spread: pd.Series, dt: float = 1/252) -> KalmanOUResult:
+        """
+        Run Kalman filter (+ optional RTS smoother) on spread series.
+        
+        This is the main entry point. Processes the entire series and returns
+        the final filtered (or smoothed) OU parameter estimates with full
+        diagnostics.
+        
+        Args:
+            spread: Spread time series (e.g., Engle-Granger residuals)
+            dt: Time step in years (1/252 for daily data)
+            
+        Returns:
+            KalmanOUResult with current parameters, confidence intervals,
+            stability metrics, and parameter history arrays.
+        """
+        spread = spread.dropna()
+        n = len(spread)
+        S = spread.values
+        
+        if n < self.min_warmup:
+            return KalmanOUResult(
+                theta=0, mu=0, sigma=0, eq_std=0,
+                half_life_days=np.inf, ar1_coef=0,
+                valid=False, reason=f'insufficient_data_{n}<{self.min_warmup}'
+            )
+        
+        # ── INITIALIZATION ──
+        # Use first min_warmup observations for robust initialization via OLS
+        init_chunk = S[:self.min_warmup]
+        S_lag = init_chunk[:-1]
+        S_cur = init_chunk[1:]
+        
+        X_init = np.column_stack([np.ones_like(S_lag), S_lag])
+        try:
+            beta_init = np.linalg.lstsq(X_init, S_cur, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            beta_init = np.array([0.0, 0.95])
+        
+        residuals_init = S_cur - X_init @ beta_init
+        R_init = float(np.var(residuals_init))
+        
+        if R_init < 1e-20:
+            R_init = 1e-10
+        
+        # Initialize state
+        x = beta_init.copy()              # [a, b]
+        P = np.eye(2) * 0.01             # Initial uncertainty
+        R = R_init                         # Observation noise
+        Q = np.eye(2) * self.q_scale       # Process noise
+        
+        # ── STORAGE for history and smoother ──
+        x_hist = np.zeros((n - 1, 2))    # Filtered state at each step
+        P_hist = np.zeros((n - 1, 2, 2)) # Filtered covariance at each step
+        x_pred_hist = np.zeros((n - 1, 2))    # Predicted state (for smoother)
+        P_pred_hist = np.zeros((n - 1, 2, 2)) # Predicted covariance (for smoother)
+        
+        innovations = np.zeros(n - 1)
+        norm_innovations = np.zeros(n - 1)
+        innovation_vars = np.zeros(n - 1)
+        
+        # Adaptive Q tracking
+        adaptive_window = min(self._innovation_window, n // 4)
+        q_history = np.zeros(n - 1)
+        
+        # ── FORWARD PASS (Kalman Filter) ──
+        for t in range(1, n):
+            idx = t - 1  # Storage index
+            
+            # === PREDICT ===
+            x_pred = x.copy()                  # F = I, so x_pred = x
+            P_pred = P + Q                     # P_pred = F·P·Fᵀ + Q = P + Q
+            
+            x_pred_hist[idx] = x_pred
+            P_pred_hist[idx] = P_pred
+            
+            # === OBSERVATION ===
+            H = np.array([1.0, S[t - 1]])     # H_t = [1, S_{t-1}]
+            y_pred = H @ x_pred                 # Predicted observation
+            y = S[t] - y_pred                   # Innovation
+            
+            # Innovation covariance: S = H·P_pred·Hᵀ + R (scalar)
+            S_inn = H @ P_pred @ H + R
+            S_inn = max(S_inn, 1e-20)           # Numerical guard
+            
+            innovations[idx] = y
+            innovation_vars[idx] = S_inn
+            norm_innovations[idx] = y / np.sqrt(S_inn)
+            
+            # === KALMAN GAIN ===
+            K = P_pred @ H / S_inn              # K = P_pred·Hᵀ·S⁻¹ (2x1 vector)
+            
+            # === UPDATE (Joseph form for numerical stability) ===
+            # P = (I - K·H)·P_pred·(I - K·H)ᵀ + K·R·Kᵀ
+            # This is always symmetric positive semi-definite
+            IKH = np.eye(2) - np.outer(K, H)
+            P = IKH @ P_pred @ IKH.T + R * np.outer(K, K)
+            
+            # State update
+            x = x_pred + K * y
+            
+            # Enforce stationarity: b must be in (0, 1)
+            x[1] = np.clip(x[1], 0.001, 0.999)
+            
+            # Store filtered results
+            x_hist[idx] = x
+            P_hist[idx] = P
+            
+            # === ADAPTIVE Q (Mehra 1970) ===
+            if self.adaptive_q and idx >= adaptive_window:
+                # Estimate actual innovation covariance from recent data
+                recent_inn = innovations[idx - adaptive_window + 1:idx + 1]
+                C_hat = np.mean(recent_inn ** 2)
+                
+                # Expected innovation variance if Q were zero: H·P_base·Hᵀ + R
+                # Excess variance indicates parameter drift → increase Q
+                expected_S = R  # Minimum expected innovation variance
+                excess = max(0, C_hat - expected_S)
+                
+                # Scale Q proportionally to excess innovation variance
+                # More excess → parameters are drifting faster → increase Q
+                q_adapt = self.q_scale + excess * 0.01
+                q_adapt = min(q_adapt, 0.01)  # Cap to prevent instability
+                Q = np.eye(2) * q_adapt
+                q_history[idx] = q_adapt
+            else:
+                q_history[idx] = self.q_scale
+            
+            # === ADAPTIVE R (observation noise) ===
+            # Update R using exponential moving average of squared innovations
+            if idx >= 10:
+                alpha_R = 0.02  # Slow adaptation
+                R = (1 - alpha_R) * R + alpha_R * y ** 2
+                R = max(R, 1e-20)
+        
+        # ── RTS SMOOTHER (backward pass) ──
+        if self.smoother and n > self.min_warmup + 10:
+            x_smooth = np.zeros_like(x_hist)
+            P_smooth = np.zeros_like(P_hist)
+            
+            # Initialize smoother from last filtered estimate
+            x_smooth[-1] = x_hist[-1]
+            P_smooth[-1] = P_hist[-1]
+            
+            for t in range(n - 3, -1, -1):
+                # Smoother gain: L = P_t · Fᵀ · P_{t+1|t}⁻¹
+                # Since F = I: L = P_t · P_{t+1|t}⁻¹
+                try:
+                    P_pred_inv = np.linalg.inv(P_pred_hist[t + 1])
+                    L = P_hist[t] @ P_pred_inv
+                except np.linalg.LinAlgError:
+                    L = np.eye(2) * 0.5
+                
+                # Smoothed estimates
+                x_smooth[t] = x_hist[t] + L @ (x_smooth[t + 1] - x_pred_hist[t + 1])
+                P_smooth[t] = P_hist[t] + L @ (P_smooth[t + 1] - P_pred_hist[t + 1]) @ L.T
+                
+                # Enforce stationarity on smoothed estimates too
+                x_smooth[t, 1] = np.clip(x_smooth[t, 1], 0.001, 0.999)
+            
+            # Use smoothed estimates for history (but filtered for current)
+            x_final_hist = x_smooth
+            P_final_hist = P_smooth
+        else:
+            x_final_hist = x_hist
+            P_final_hist = P_hist
+        
+        # ── EXTRACT OU PARAMETERS ──
+        # Use last filtered estimate for current parameters
+        a_final = x[0]
+        b_final = x[1]
+        
+        if b_final <= 0 or b_final >= 1:
+            return KalmanOUResult(
+                theta=0, mu=0, sigma=0, eq_std=0,
+                half_life_days=np.inf, ar1_coef=float(b_final),
+                valid=False, reason='explosive_or_unit_root'
+            )
+        
+        theta = -np.log(b_final) / dt
+        mu = a_final / (1 - b_final)
+        
+        # Estimate sigma from innovation sequence (last 100 points)
+        recent_n = min(100, len(innovations))
+        residual_std = np.std(innovations[-recent_n:])
+        sigma = residual_std * np.sqrt(2 * theta / (1 - b_final ** 2))
+        eq_std = sigma / np.sqrt(2 * theta) if theta > 0 else 0
+        half_life = np.log(2) / theta * 252 if theta > 0 else np.inf
+        
+        # ── CONFIDENCE INTERVALS via Delta Method ──
+        # Var(theta) ≈ (∂theta/∂b)² · Var(b), where ∂theta/∂b = -1/(b·dt)
+        var_b = P[1, 1]
+        var_a = P[0, 0]
+        cov_ab = P[0, 1]
+        
+        dtheta_db = 1.0 / (b_final * dt) if b_final > 0 else 0
+        theta_std = abs(dtheta_db) * np.sqrt(var_b)
+        
+        # Var(mu) ≈ (∂mu/∂a)²·Var(a) + (∂mu/∂b)²·Var(b) + 2·(∂mu/∂a)(∂mu/∂b)·Cov(a,b)
+        dmu_da = 1.0 / (1 - b_final)
+        dmu_db = a_final / (1 - b_final) ** 2
+        mu_var = (dmu_da ** 2 * var_a + dmu_db ** 2 * var_b + 
+                  2 * dmu_da * dmu_db * cov_ab)
+        mu_std = np.sqrt(max(0, mu_var))
+        
+        # ── PARAMETER HISTORY (convert a,b to theta,mu,sigma) ──
+        b_hist = x_final_hist[:, 1]
+        a_hist = x_final_hist[:, 0]
+        
+        # Clamp for numerical safety
+        b_hist_safe = np.clip(b_hist, 0.001, 0.999)
+        
+        theta_hist = -np.log(b_hist_safe) / dt
+        mu_hist = a_hist / (1 - b_hist_safe)
+        
+        # Rolling sigma from innovations
+        sigma_hist = np.full(len(x_final_hist), np.nan)
+        roll_win = min(30, len(innovations) // 3)
+        if roll_win >= 5:
+            for i in range(roll_win, len(innovations)):
+                local_std = np.std(innovations[i - roll_win:i])
+                local_b = b_hist_safe[i]
+                local_theta = theta_hist[i]
+                if local_theta > 0 and (1 - local_b ** 2) > 0:
+                    sigma_hist[i] = local_std * np.sqrt(2 * local_theta / (1 - local_b ** 2))
+        
+        # ── TIME-VARYING Z-SCORES ──
+        # Use expanding window z-scores: at each time t, z = (S_t - mean_t) / std_t
+        # where mean_t and std_t are computed from ALL spread data up to t.
+        # This matches how practitioners actually think about z-scores:
+        # "how extreme is the spread right now relative to its history so far?"
+        #
+        # Warmup: require at least 60 observations before producing z-scores.
+        # This avoids the numerical instability of tiny denominators.
+        
+        zscore_warmup = max(60, self.min_warmup * 2)
+        eq_std_hist = np.full(len(x_final_hist), np.nan)
+        zscore_hist = np.full(len(x_final_hist), np.nan)
+        
+        spread_vals = S[1:]  # S[1:] aligns with x_hist indices
+        
+        for i in range(zscore_warmup, len(x_final_hist)):
+            # Use Kalman mu_t as the center, but compute dispersion from
+            # historical spread residuals around the evolving mu
+            local_mu = mu_hist[i]
+            
+            # Expanding window std: all data up to point i, centered on local mu
+            historical = spread_vals[:i + 1]
+            local_std = np.std(historical - local_mu)
+            
+            if local_std > 1e-10:
+                eq_std_hist[i] = local_std
+                z = (spread_vals[i] - local_mu) / local_std
+                # Clamp to ±3: anything beyond is not actionable
+                zscore_hist[i] = np.clip(z, -3, 3)
+        
+        # Confidence intervals on theta and mu
+        P_b_hist = P_final_hist[:, 1, 1]
+        P_a_hist = P_final_hist[:, 0, 0]
+        P_ab_hist = P_final_hist[:, 0, 1]
+        
+        theta_std_hist = np.abs(1.0 / (b_hist_safe * dt)) * np.sqrt(np.maximum(P_b_hist, 0))
+        theta_upper = theta_hist + 1.96 * theta_std_hist
+        theta_lower = np.maximum(0, theta_hist - 1.96 * theta_std_hist)
+        
+        dmu_da_hist = 1.0 / (1 - b_hist_safe)
+        dmu_db_hist = a_hist / (1 - b_hist_safe) ** 2
+        mu_var_hist = (dmu_da_hist ** 2 * P_a_hist + 
+                       dmu_db_hist ** 2 * P_b_hist + 
+                       2 * dmu_da_hist * dmu_db_hist * P_ab_hist)
+        mu_std_hist = np.sqrt(np.maximum(0, mu_var_hist))
+        mu_upper = mu_hist + 1.96 * mu_std_hist
+        mu_lower = mu_hist - 1.96 * mu_std_hist
+        
+        # ── STABILITY METRICS ──
+        # Parameter stability: coefficient of variation of theta over last 60 obs
+        stability_window = min(60, len(theta_hist))
+        recent_theta = theta_hist[-stability_window:]
+        if np.mean(recent_theta) > 0:
+            theta_cv = np.std(recent_theta) / np.mean(recent_theta)
+            param_stability = max(0, 1 - theta_cv)  # 1 = perfectly stable
+        else:
+            param_stability = 0.0
+        
+        # ── REGIME CHANGE DETECTION (CUSUM on normalized innovations) ──
+        if len(norm_innovations) > self.min_warmup:
+            # Two-sided CUSUM on squared normalized innovations
+            # Under H0 (no change): E[v²] = 1
+            v2 = norm_innovations[self.min_warmup:] ** 2
+            cusum_plus = 0.0
+            cusum_minus = 0.0
+            max_cusum = 0.0
+            k = 0.5  # Allowance parameter (slack)
+            
+            for vi in v2:
+                cusum_plus = max(0, cusum_plus + vi - 1 - k)
+                cusum_minus = max(0, cusum_minus - vi + 1 - k)
+                max_cusum = max(max_cusum, cusum_plus, cusum_minus)
+            
+            regime_change_score = max_cusum
+        else:
+            regime_change_score = 0.0
+        
+        # ── INNOVATION DIAGNOSTICS ──
+        recent_norm = norm_innovations[-min(100, len(norm_innovations)):]
+        innovation_ratio = np.mean(recent_norm ** 2) if len(recent_norm) > 0 else 0
+        
+        # Effective sample size (based on autocorrelation of innovations)
+        if len(innovations) > 20:
+            rho1 = np.corrcoef(innovations[:-1], innovations[1:])[0, 1]
+            rho1 = np.clip(rho1, -0.99, 0.99)
+            ess = len(innovations) * (1 - rho1) / (1 + rho1)
+            ess = max(1, min(ess, len(innovations)))
+        else:
+            ess = float(len(innovations))
+        
+        return KalmanOUResult(
+            theta=float(theta),
+            mu=float(mu),
+            sigma=float(sigma),
+            eq_std=float(eq_std),
+            half_life_days=float(half_life),
+            ar1_coef=float(b_final),
+            valid=True,
+            theta_std=float(theta_std),
+            mu_std=float(mu_std),
+            param_stability=float(param_stability),
+            regime_change_score=float(regime_change_score),
+            innovation_ratio=float(innovation_ratio),
+            effective_sample_size=float(ess),
+            theta_history=theta_hist,
+            mu_history=mu_hist,
+            sigma_history=sigma_hist,
+            eq_std_history=eq_std_hist,
+            zscore_history=zscore_hist,
+            theta_upper=theta_upper,
+            theta_lower=theta_lower,
+            mu_upper=mu_upper,
+            mu_lower=mu_lower,
+        )
+    
+    def fit_to_ou_parameters(self, spread: pd.Series, dt: float = 1/252) -> OUParameters:
+        """
+        Convenience method: run Kalman filter and return result as standard
+        OUParameters dataclass for drop-in compatibility with existing code.
+        """
+        result = self.fit(spread, dt)
+        
+        return OUParameters(
+            theta=result.theta,
+            mu=result.mu,
+            sigma=result.sigma,
+            eq_std=result.eq_std,
+            half_life_days=result.half_life_days,
+            ar1_coef=result.ar1_coef,
+            valid=result.valid,
+            reason=result.reason
+        )
+
+
+# ============================================================================
 # AR(2) PROCESS CLASS - Extended Mean Reversion Dynamics
 # ============================================================================
 
@@ -776,7 +1234,7 @@ class PairsTradingEngine:
         """Set default configuration values."""
         defaults = {
             'lookback_period': '2y',
-            'min_half_life': 5,
+            'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
             'entry_zscore': 2.0,
@@ -850,7 +1308,7 @@ class PairsTradingEngine:
                     interval='1d', 
                     auto_adjust=True, 
                     progress=False,
-                    threads=True,
+                    threads=10,
                     group_by='ticker',
                     ignore_tz=True
                 )
@@ -1704,9 +2162,15 @@ class PairsTradingEngine:
     # LAYER 6: ANALYSIS & REPORTING
     # ------------------------------------------------------------------------
     
-    def get_pair_ou_params(self, pair: str, use_raw_data: bool = True) -> Tuple[OUProcess, pd.Series, float]:
+    def get_pair_ou_params(self, pair: str, use_raw_data: bool = True, 
+                           method: str = 'kalman') -> Tuple[OUProcess, pd.Series, float]:
         """
         Get OU parameters for a specific pair using Engle-Granger spread.
+        
+        Supports multiple estimation methods:
+        - 'kalman': Kalman filter with adaptive Q and RTS smoother (default, most sophisticated)
+        - 'adaptive_window': Two-pass half-life-based window selection
+        - 'ols': Simple AR(1) OLS on full data (fastest, least adaptive)
         
         IMPORTANT: This uses the EG spread (Y - β*X - α) with the hedge ratio
         from screening, NOT the simple log spread. This ensures consistency
@@ -1715,6 +2179,7 @@ class PairsTradingEngine:
         Args:
             pair: Pair string like "TICKER1/TICKER2"
             use_raw_data: If True, use raw_price_data (before global alignment)
+            method: Estimation method ('kalman', 'adaptive_window', 'ols')
         
         Returns:
             Tuple of (OUProcess, eg_spread_series, current_zscore)
@@ -1762,18 +2227,79 @@ class PairsTradingEngine:
         # Calculate Engle-Granger spread: Y - β*X - α
         eg_spread = y - hedge_ratio * x - intercept
         
-        # Fit OU parameters on the EG spread
-        ou_params = self.fit_ou_parameters(eg_spread)
+        # ===== OU PARAMETER ESTIMATION =====
+        ou_params = None
+        kalman_result = None
         
-        if not ou_params.valid:
-            raise ValueError(f"Could not fit valid OU model for {pair}")
+        if method == 'kalman':
+            # PRIMARY: Kalman filter with adaptive Q and RTS smoother
+            try:
+                kalman = KalmanOUEstimator(
+                    q_scale=1e-5,
+                    adaptive_q=True,
+                    smoother=True,
+                    min_warmup=30
+                )
+                kalman_result = kalman.fit(eg_spread)
+                
+                if kalman_result.valid:
+                    ou_params = OUParameters(
+                        theta=kalman_result.theta,
+                        mu=kalman_result.mu,
+                        sigma=kalman_result.sigma,
+                        eq_std=kalman_result.eq_std,
+                        half_life_days=kalman_result.half_life_days,
+                        ar1_coef=kalman_result.ar1_coef,
+                        valid=True
+                    )
+                    
+                    # Store Kalman diagnostics on the OUParameters for access upstream
+                    ou_params._kalman = kalman_result
+                    
+            except Exception as e:
+                print(f"Kalman filter failed for {pair}: {e}, falling back to adaptive window")
+                method = 'adaptive_window'
+        
+        if method == 'adaptive_window' or (method == 'kalman' and ou_params is None):
+            # FALLBACK: Two-pass adaptive window estimation
+            full_ou = self.fit_ou_parameters(eg_spread)
+            
+            if full_ou.valid and 2 < full_ou.half_life_days < 120:
+                optimal_window = int(4 * full_ou.half_life_days)
+                optimal_window = max(30, min(optimal_window, len(eg_spread)))
+                windowed_spread = eg_spread.iloc[-optimal_window:]
+                ou_params = self.fit_ou_parameters(windowed_spread)
+                
+                if not ou_params.valid:
+                    ou_params = full_ou
+            else:
+                ou_params = full_ou
+        
+        if method == 'ols' and ou_params is None:
+            # SIMPLEST: Standard OLS on full data
+            ou_params = self.fit_ou_parameters(eg_spread)
+        
+        if ou_params is None or not ou_params.valid:
+            raise ValueError(f"Could not fit valid OU model for {pair} (method={method})")
         
         # Create OUProcess
         ou = OUProcess(ou_params.theta, ou_params.mu, ou_params.sigma)
         
+        # Store Kalman result on OUProcess for dashboard access
+        if kalman_result is not None:
+            ou._kalman = kalman_result
+        
         # Calculate current Z-score
-        current_spread = eg_spread.iloc[-1]
-        current_z = ou.zscore(current_spread)
+        # Prefer Kalman time-varying z-score (consistent with what's plotted)
+        # Fall back to static z-score if Kalman history not available
+        if (kalman_result is not None 
+            and kalman_result.zscore_history is not None 
+            and len(kalman_result.zscore_history) > 0
+            and not np.isnan(kalman_result.zscore_history[-1])):
+            current_z = float(kalman_result.zscore_history[-1])
+        else:
+            current_spread = eg_spread.iloc[-1]
+            current_z = ou.zscore(current_spread)
         
         return ou, eg_spread, current_z
     
@@ -1828,13 +2354,248 @@ class PairsTradingEngine:
         
         return df
     
-    def get_rolling_statistics(self, pair: str, window: int = 60) -> pd.DataFrame:
-        """Calculate rolling statistics for parameter stability monitoring."""
+    def estimate_optimal_window(self, spread: pd.Series, 
+                                min_window: int = 20,
+                                max_window: int = 252,
+                                method: str = 'half_life') -> Dict:
+        """
+        Estimate optimal rolling window size for a spread using quantitative methods.
+        
+        Methods:
+        - 'half_life': Use 3-5x the estimated half-life (most common for OU)
+        - 'variance_ratio': Find window where variance ratio stabilizes
+        - 'cross_validation': Use predictive accuracy to select window
+        - 'aic': Use Akaike Information Criterion
+        
+        Args:
+            spread: The spread series to analyze
+            min_window: Minimum window to consider (default: 20 days)
+            max_window: Maximum window to consider (default: 252 days = 1 year)
+            method: Selection method ('half_life', 'variance_ratio', 'cross_validation', 'aic')
+            
+        Returns:
+            Dict with optimal_window, method_used, confidence, diagnostics
+        """
+        spread = spread.dropna()
+        n = len(spread)
+        
+        if n < min_window * 2:
+            return {
+                'optimal_window': min_window,
+                'method_used': 'minimum_default',
+                'confidence': 'low',
+                'reason': 'insufficient_data',
+                'diagnostics': {}
+            }
+        
+        max_window = min(max_window, n // 2)  # Can't use more than half the data
+        
+        if method == 'half_life':
+            # Method 1: Base window on estimated half-life
+            # Rule of thumb: Use 3-5 half-lives for stable parameter estimation
+            ou = self.fit_ou_parameters(spread)
+            
+            if ou.valid and ou.half_life_days > 0 and ou.half_life_days < np.inf:
+                half_life = ou.half_life_days
+                
+                # Optimal window = 4 * half_life (captures ~94% of mean reversion)
+                # But also consider statistical stability
+                optimal = int(4 * half_life)
+                
+                # Ensure minimum statistical power (at least 20 obs)
+                # and maximum relevance (not too old data)
+                optimal = max(min_window, min(optimal, max_window))
+                
+                # Confidence based on half-life estimation quality
+                if 5 <= half_life <= 60:
+                    confidence = 'high'
+                elif 3 <= half_life <= 90:
+                    confidence = 'medium'
+                else:
+                    confidence = 'low'
+                
+                return {
+                    'optimal_window': optimal,
+                    'method_used': 'half_life',
+                    'confidence': confidence,
+                    'estimated_half_life': half_life,
+                    'half_lives_in_window': optimal / half_life,
+                    'diagnostics': {
+                        'theta': ou.theta,
+                        'ar1_coef': ou.ar1_coef,
+                        'eq_std': ou.eq_std
+                    }
+                }
+            else:
+                # Fall back to variance ratio if OU fit fails
+                method = 'variance_ratio'
+        
+        if method == 'variance_ratio':
+            # Method 2: Find window where variance ratio test is most significant
+            # Variance ratio = Var(k-period returns) / (k * Var(1-period returns))
+            # For mean-reverting series, VR < 1
+            
+            window_candidates = np.linspace(min_window, max_window, 20).astype(int)
+            vr_scores = []
+            
+            returns = spread.diff().dropna()
+            var_1 = returns.var()
+            
+            for w in window_candidates:
+                if w >= len(spread):
+                    continue
+                k_returns = spread.diff(w).dropna()
+                var_k = k_returns.var()
+                vr = var_k / (w * var_1) if var_1 > 0 else 1
+                # Score: how much VR deviates from 1 (lower = more mean-reverting)
+                vr_scores.append((w, vr, abs(1 - vr)))
+            
+            if vr_scores:
+                # Find window with strongest mean reversion signal
+                best = max(vr_scores, key=lambda x: x[2])
+                optimal = best[0]
+                vr_value = best[1]
+                
+                confidence = 'high' if vr_value < 0.5 else ('medium' if vr_value < 0.8 else 'low')
+                
+                return {
+                    'optimal_window': optimal,
+                    'method_used': 'variance_ratio',
+                    'confidence': confidence,
+                    'variance_ratio': vr_value,
+                    'diagnostics': {
+                        'all_vr_scores': vr_scores
+                    }
+                }
+        
+        if method == 'cross_validation':
+            # Method 3: Use walk-forward cross-validation
+            # Select window that minimizes out-of-sample prediction error
+            
+            window_candidates = np.linspace(min_window, max_window, 10).astype(int)
+            cv_scores = []
+            
+            test_size = max(20, n // 10)  # Use last 10% or 20 obs for testing
+            
+            for w in window_candidates:
+                if w + test_size >= n:
+                    continue
+                    
+                errors = []
+                for t in range(n - test_size, n):
+                    if t - w < 0:
+                        continue
+                    train_spread = spread.iloc[t-w:t]
+                    ou = self.fit_ou_parameters(train_spread)
+                    
+                    if ou.valid:
+                        # Predict next value
+                        current = spread.iloc[t-1]
+                        predicted = ou.expected_value(current, 1/252)
+                        actual = spread.iloc[t]
+                        errors.append((predicted - actual) ** 2)
+                
+                if errors:
+                    mse = np.mean(errors)
+                    cv_scores.append((w, mse))
+            
+            if cv_scores:
+                best = min(cv_scores, key=lambda x: x[1])
+                optimal = best[0]
+                mse = best[1]
+                
+                return {
+                    'optimal_window': optimal,
+                    'method_used': 'cross_validation',
+                    'confidence': 'high',
+                    'mse': mse,
+                    'diagnostics': {
+                        'all_cv_scores': cv_scores
+                    }
+                }
+        
+        if method == 'aic':
+            # Method 4: Use AIC to balance fit and complexity
+            # Penalize both underfitting (small window) and overfitting (large window)
+            
+            window_candidates = np.linspace(min_window, max_window, 15).astype(int)
+            aic_scores = []
+            
+            for w in window_candidates:
+                chunk = spread.iloc[-w:]
+                ou = self.fit_ou_parameters(chunk)
+                
+                if ou.valid:
+                    # Simplified AIC: -2*log(L) + 2*k
+                    # For OU, k=3 (theta, mu, sigma)
+                    residuals = []
+                    for i in range(1, len(chunk)):
+                        pred = ou.expected_value(chunk.iloc[i-1], 1/252)
+                        residuals.append(chunk.iloc[i] - pred)
+                    
+                    if residuals:
+                        rss = sum(r**2 for r in residuals)
+                        # AIC approximation
+                        aic = w * np.log(rss / w) + 2 * 3
+                        aic_scores.append((w, aic))
+            
+            if aic_scores:
+                best = min(aic_scores, key=lambda x: x[1])
+                optimal = best[0]
+                
+                return {
+                    'optimal_window': optimal,
+                    'method_used': 'aic',
+                    'confidence': 'medium',
+                    'aic': best[1],
+                    'diagnostics': {
+                        'all_aic_scores': aic_scores
+                    }
+                }
+        
+        # Default fallback
+        return {
+            'optimal_window': 60,
+            'method_used': 'default',
+            'confidence': 'low',
+            'reason': 'no_method_succeeded',
+            'diagnostics': {}
+        }
+    
+    def get_rolling_statistics(self, pair: str, window: int = None, 
+                               adaptive: bool = True) -> pd.DataFrame:
+        """
+        Calculate rolling statistics for parameter stability monitoring.
+        
+        Args:
+            pair: Pair string (e.g., 'AAPL/MSFT')
+            window: Rolling window size. If None and adaptive=True, optimal window is estimated
+            adaptive: If True and window is None, estimate optimal window from data
+            
+        Returns:
+            DataFrame with rolling_mean, rolling_std, rolling_half_life, and metadata
+        """
         t1, t2 = pair.split('/')
         pair_data = self.price_data[[t1, t2]].dropna()
+        
+        if len(pair_data) < 30:
+            return pd.DataFrame()
+        
+        log_spread = np.log(pair_data[t1] / pair_data[t2])
+        
+        # Determine window size
+        if window is None and adaptive:
+            window_info = self.estimate_optimal_window(log_spread, method='half_life')
+            window = window_info['optimal_window']
+            window_method = window_info['method_used']
+            window_confidence = window_info['confidence']
+        else:
+            window = window or 60  # Default fallback
+            window_method = 'user_specified' if window else 'default'
+            window_confidence = 'n/a'
+        
         if len(pair_data) < window:
             return pd.DataFrame()
-        log_spread = np.log(pair_data[t1] / pair_data[t2])
         
         rolling_mean = log_spread.rolling(window).mean()
         rolling_std = log_spread.rolling(window).std()
@@ -1848,11 +2609,18 @@ class PairsTradingEngine:
         
         half_life_series = pd.Series([np.nan] * window + half_lives, index=log_spread.index)
         
-        return pd.DataFrame({
+        result = pd.DataFrame({
             'rolling_mean': rolling_mean,
             'rolling_std': rolling_std,
             'rolling_half_life': half_life_series
         })
+        
+        # Store metadata as attributes
+        result.attrs['window'] = window
+        result.attrs['window_method'] = window_method
+        result.attrs['window_confidence'] = window_confidence
+        
+        return result
     
     def summary_report(self) -> Dict:
         """Generate summary report of screening results."""

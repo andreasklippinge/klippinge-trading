@@ -1,547 +1,531 @@
 """
-Klippinge Trading Terminal - Auto-Updater
-==========================================
+Auto-Updater med Skip Version Logik
+====================================
+Ersätt din nuvarande auto_updater.py med denna version.
 
-Checks GitHub Releases for new versions and handles the update flow.
-
-Features:
-    - Startup check with dialog
-    - Background periodic checks (every 2 hours)
-    - One-click download and install
-    - Supports .exe, .msi, and .zip releases
-
-Usage:
-    from auto_updater import setup_auto_updater
-    updater = setup_auto_updater(main_window)  # checks at startup + every 2h
+Förändringar:
+- Sparar vilken version användaren valt att hoppa över
+- Visar inte popup igen förrän en NY version släpps
+- Konfigurationsfil: skipped_version.json i user data directory
 """
 
 import os
 import sys
 import json
-import tempfile
 import subprocess
-import zipfile
-from pathlib import Path
+from datetime import datetime
 from typing import Optional, Tuple
-from dataclasses import dataclass
 
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QTextEdit, QMessageBox, QWidget
+    QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+    QPushButton, QCheckBox, QProgressBar, QApplication
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QUrl, QTimer
-from PyQt5.QtGui import QFont, QDesktopServices
+from PyQt5.QtCore import QTimer, QThread, QObject, pyqtSignal as Signal, Qt
+from PyQt5.QtGui import QFont
 
+# Försök importera requests för GitHub API
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+    print("Warning: requests not available for auto-updater")
+
+# Import app config för version och paths
+try:
+    from app_config import APP_VERSION, get_user_data_dir
+except ImportError:
+    APP_VERSION = "0.0.0"
+    def get_user_data_dir():
+        return os.path.expanduser("~/.klippinge_terminal")
 
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# Check interval: 2 hours in milliseconds
-CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000
-
-
-@dataclass
-class UpdateInfo:
-    """Information about an available update."""
-    version: str
-    download_url: str
-    changelog: str
-    published_at: str
-    file_size: int = 0
-    file_name: str = ""
+GITHUB_REPO = "your-username/your-repo"  # Ändra till din repo
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000  # 2 timmar i millisekunder
+SKIPPED_VERSION_FILE = "skipped_version.json"
 
 
-class UpdateChecker(QThread):
-    """Background thread that checks GitHub for updates."""
+# ============================================================================
+# SKIPPED VERSION MANAGEMENT
+# ============================================================================
 
-    update_available = Signal(object)   # UpdateInfo
+def get_skipped_version_path() -> str:
+    """Get path to skipped version config file."""
+    user_dir = get_user_data_dir()
+    return os.path.join(user_dir, SKIPPED_VERSION_FILE)
+
+
+def load_skipped_version() -> Optional[str]:
+    """Load the version that user chose to skip."""
+    try:
+        path = get_skipped_version_path()
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('skipped_version')
+    except Exception as e:
+        print(f"[AutoUpdater] Error loading skipped version: {e}")
+    return None
+
+
+def save_skipped_version(version: str):
+    """Save the version that user chose to skip."""
+    try:
+        path = get_skipped_version_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'skipped_version': version,
+                'skipped_at': datetime.now().isoformat()
+            }, f, indent=2)
+        print(f"[AutoUpdater] Saved skipped version: {version}")
+    except Exception as e:
+        print(f"[AutoUpdater] Error saving skipped version: {e}")
+
+
+def clear_skipped_version():
+    """Clear the skipped version (called when user updates)."""
+    try:
+        path = get_skipped_version_path()
+        if os.path.exists(path):
+            os.remove(path)
+            print("[AutoUpdater] Cleared skipped version")
+    except Exception as e:
+        print(f"[AutoUpdater] Error clearing skipped version: {e}")
+
+
+# ============================================================================
+# VERSION COMPARISON
+# ============================================================================
+
+def parse_version(version_str: str) -> Tuple[int, ...]:
+    """Parse version string to tuple for comparison.
+    
+    Handles formats like: "1.0.0", "v1.0.0", "1.0.0-beta"
+    """
+    # Remove 'v' prefix if present
+    version_str = version_str.lstrip('v').strip()
+    
+    # Remove any suffix like -beta, -rc1, etc.
+    if '-' in version_str:
+        version_str = version_str.split('-')[0]
+    
+    # Split and convert to integers
+    try:
+        parts = version_str.split('.')
+        return tuple(int(p) for p in parts)
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def is_newer_version(remote: str, local: str) -> bool:
+    """Check if remote version is newer than local."""
+    remote_tuple = parse_version(remote)
+    local_tuple = parse_version(local)
+    return remote_tuple > local_tuple
+
+
+# ============================================================================
+# UPDATE CHECKER WORKER
+# ============================================================================
+
+class UpdateCheckerWorker(QObject):
+    """Background worker for checking updates."""
+    
+    finished = Signal()
+    update_available = Signal(str, str, str)  # (version, download_url, release_notes)
     no_update = Signal()
     error = Signal(str)
-
-    def __init__(self, github_repo: str, current_version: str):
+    
+    def __init__(self, current_version: str, skipped_version: Optional[str] = None):
         super().__init__()
-        self.github_repo = github_repo
         self.current_version = current_version
-
+        self.skipped_version = skipped_version
+    
     def run(self):
-        try:
-            info = self._check_github()
-            if info:
-                self.update_available.emit(info)
-            else:
-                self.no_update.emit()
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def _check_github(self) -> Optional[UpdateInfo]:
-        """Check GitHub API for latest release."""
+        """Check for updates from GitHub releases."""
         if not REQUESTS_AVAILABLE:
-            return None
-
-        url = f"https://api.github.com/repos/{self.github_repo}/releases/latest"
-
+            self.error.emit("requests library not available")
+            self.finished.emit()
+            return
+        
         try:
-            resp = requests.get(url, timeout=10, headers={
-                "Accept": "application/vnd.github.v3+json"
-            })
-        except requests.RequestException:
-            return None
-
-        if resp.status_code == 404:
-            return None  # No releases yet
-
-        resp.raise_for_status()
-        data = resp.json()
-
-        latest_version = data.get("tag_name", "").lstrip("v")
-
-        if not self._is_newer(latest_version, self.current_version):
-            return None
-
-        # Find a downloadable asset (prefer .exe/.msi, fallback to .zip)
-        download_url = ""
-        file_size = 0
-        file_name = ""
-
-        for asset in data.get("assets", []):
-            name = asset["name"].lower()
-            # Prefer installers
-            if name.endswith(".exe") or name.endswith(".msi"):
-                download_url = asset["browser_download_url"]
-                file_size = asset.get("size", 0)
-                file_name = asset["name"]
-                break
-            # Accept .zip as fallback
-            elif name.endswith(".zip") and not download_url:
-                download_url = asset["browser_download_url"]
-                file_size = asset.get("size", 0)
-                file_name = asset["name"]
-
-        if not download_url:
-            # Fallback: link to the release page
-            download_url = data.get("html_url", "")
-
-        return UpdateInfo(
-            version=latest_version,
-            download_url=download_url,
-            changelog=data.get("body", "No changelog available."),
-            published_at=data.get("published_at", ""),
-            file_size=file_size,
-            file_name=file_name,
-        )
-
-    @staticmethod
-    def _is_newer(latest: str, current: str) -> bool:
-        """Compare semantic version strings (e.g. '1.2.3' > '1.2.0')."""
-        try:
-            def parse(v):
-                return tuple(int(x) for x in v.split("."))
-            return parse(latest) > parse(current)
-        except (ValueError, AttributeError):
-            return False
-
-
-class DownloadThread(QThread):
-    """Background thread to download the update installer."""
-
-    progress = Signal(int, int)  # (bytes_downloaded, total_bytes)
-    finished = Signal(str)       # path to downloaded file
-    error = Signal(str)
-
-    def __init__(self, url: str, dest_path: str):
-        super().__init__()
-        self.url = url
-        self.dest_path = dest_path
-
-    def run(self):
-        try:
-            resp = requests.get(self.url, stream=True, timeout=300)
-            resp.raise_for_status()
-
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-
-            with open(self.dest_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    self.progress.emit(downloaded, total)
-
-            self.finished.emit(self.dest_path)
-
+            print(f"[AutoUpdater] Checking for updates... (current: {self.current_version})")
+            
+            response = requests.get(
+                GITHUB_API_URL,
+                headers={'Accept': 'application/vnd.github.v3+json'},
+                timeout=10
+            )
+            
+            if response.status_code == 404:
+                print("[AutoUpdater] No releases found")
+                self.no_update.emit()
+                self.finished.emit()
+                return
+            
+            response.raise_for_status()
+            release = response.json()
+            
+            remote_version = release.get('tag_name', '').lstrip('v')
+            download_url = ""
+            release_notes = release.get('body', 'No release notes available.')
+            
+            # Hitta Windows installer/exe i assets
+            for asset in release.get('assets', []):
+                name = asset.get('name', '').lower()
+                if name.endswith('.exe') or 'setup' in name or 'installer' in name:
+                    download_url = asset.get('browser_download_url', '')
+                    break
+            
+            # Fallback till release page om ingen asset hittades
+            if not download_url:
+                download_url = release.get('html_url', '')
+            
+            print(f"[AutoUpdater] Remote version: {remote_version}")
+            
+            # Kontrollera om detta är en ny version
+            if is_newer_version(remote_version, self.current_version):
+                # Kontrollera om användaren redan hoppat över denna version
+                if self.skipped_version and remote_version == self.skipped_version:
+                    print(f"[AutoUpdater] Version {remote_version} was skipped by user")
+                    self.no_update.emit()
+                else:
+                    print(f"[AutoUpdater] New version available: {remote_version}")
+                    self.update_available.emit(remote_version, download_url, release_notes)
+            else:
+                print("[AutoUpdater] No new version available")
+                self.no_update.emit()
+            
+        except requests.exceptions.Timeout:
+            self.error.emit("Update check timed out")
+        except requests.exceptions.RequestException as e:
+            self.error.emit(f"Network error: {e}")
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(f"Update check failed: {e}")
+        finally:
+            self.finished.emit()
 
 
-# ── Update Dialog ────────────────────────────────────────────────────────────
+# ============================================================================
+# UPDATE DIALOG
+# ============================================================================
 
 class UpdateDialog(QDialog):
-    """Professional update dialog with changelog and download progress."""
-
-    # Bloomberg-style dark theme for the dialog
-    DIALOG_STYLE = """
-        QDialog {
-            background-color: #1a1a2e;
-            color: #e0e0e0;
-        }
-        QLabel {
-            color: #e0e0e0;
-        }
-        QLabel#title {
-            font-size: 16px;
-            font-weight: bold;
-            color: #ffb300;
-        }
-        QLabel#version {
-            font-size: 13px;
-            color: #aaa;
-        }
-        QTextEdit {
-            background-color: #0d1117;
-            color: #c9d1d9;
-            border: 1px solid #333;
-            border-radius: 4px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 12px;
-            padding: 8px;
-        }
-        QPushButton {
-            background-color: #ffb300;
-            color: #1a1a2e;
-            border: none;
-            border-radius: 4px;
-            padding: 8px 24px;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QPushButton:hover {
-            background-color: #ffc107;
-        }
-        QPushButton#skip {
-            background-color: transparent;
-            color: #888;
-            border: 1px solid #444;
-        }
-        QPushButton#skip:hover {
-            border-color: #666;
-            color: #aaa;
-        }
-        QProgressBar {
-            border: 1px solid #333;
-            border-radius: 4px;
-            background-color: #0d1117;
-            text-align: center;
-            color: #e0e0e0;
-            height: 24px;
-        }
-        QProgressBar::chunk {
-            background-color: #ffb300;
-            border-radius: 3px;
-        }
-    """
-
-    def __init__(self, update_info: UpdateInfo, parent: Optional[QWidget] = None):
+    """Dialog for showing update information with Skip option."""
+    
+    def __init__(self, version: str, download_url: str, release_notes: str, parent=None):
         super().__init__(parent)
-        self.update_info = update_info
-        self.download_thread = None
-        self._setup_ui()
-
-    def _setup_ui(self):
+        self.version = version
+        self.download_url = download_url
+        self.release_notes = release_notes
+        self.result_action = None  # 'update', 'skip', 'later'
+        
         self.setWindowTitle("Update Available")
-        self.setMinimumSize(520, 420)
-        self.setStyleSheet(self.DIALOG_STYLE)
-
+        self.setMinimumWidth(450)
+        self.setModal(True)
+        self.setup_ui()
+    
+    def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        # Title
-        title = QLabel("🚀  A New Version is Available!")
-        title.setObjectName("title")
-        layout.addWidget(title)
-
-        # Version info
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Header
+        header = QLabel(f"🚀 Version {self.version} is available!")
+        header.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        header.setStyleSheet("color: #d4a574;")
+        layout.addWidget(header)
+        
+        # Current version info
         from app_config import APP_VERSION
-        ver_label = QLabel(
-            f"Current: v{APP_VERSION}  →  New: v{self.update_info.version}"
-        )
-        ver_label.setObjectName("version")
-        layout.addWidget(ver_label)
-
-        # Changelog
-        changelog_label = QLabel("What's New:")
-        changelog_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
-        layout.addWidget(changelog_label)
-
-        self.changelog_text = QTextEdit()
-        self.changelog_text.setPlainText(self.update_info.changelog)
-        self.changelog_text.setReadOnly(True)
-        self.changelog_text.setMaximumHeight(200)
-        layout.addWidget(self.changelog_text)
-
-        # Progress bar (hidden until download starts)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        self.status_label = QLabel("")
-        self.status_label.setVisible(False)
-        layout.addWidget(self.status_label)
-
+        current_label = QLabel(f"Your current version: {APP_VERSION}")
+        current_label.setStyleSheet("color: #888888; font-size: 12px;")
+        layout.addWidget(current_label)
+        
+        # Release notes (truncated)
+        notes_preview = self.release_notes[:500] + "..." if len(self.release_notes) > 500 else self.release_notes
+        notes_label = QLabel(f"What's new:\n{notes_preview}")
+        notes_label.setWordWrap(True)
+        notes_label.setStyleSheet("""
+            background-color: #1a1a1a;
+            border: 1px solid #333333;
+            border-radius: 4px;
+            padding: 10px;
+            color: #cccccc;
+            font-size: 11px;
+        """)
+        notes_label.setMaximumHeight(150)
+        layout.addWidget(notes_label)
+        
         # Buttons
         btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
+        btn_layout.setSpacing(10)
+        
+        # Skip this version button
         self.skip_btn = QPushButton("Skip This Version")
-        self.skip_btn.setObjectName("skip")
-        self.skip_btn.clicked.connect(self.reject)
+        self.skip_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #555555;
+                color: #888888;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                border-color: #777777;
+                color: #aaaaaa;
+            }
+        """)
+        self.skip_btn.clicked.connect(self.on_skip)
         btn_layout.addWidget(self.skip_btn)
-
-        self.update_btn = QPushButton("Download & Install")
-        self.update_btn.clicked.connect(self._start_download)
-        btn_layout.addWidget(self.update_btn)
-
+        
+        btn_layout.addStretch()
+        
+        # Remind me later button
+        self.later_btn = QPushButton("Later")
+        self.later_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a;
+                border: 1px solid #444444;
+                color: #cccccc;
+                padding: 8px 20px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+            }
+        """)
+        self.later_btn.clicked.connect(self.on_later)
+        btn_layout.addWidget(self.later_btn)
+        
+        # Download button
+        self.download_btn = QPushButton("Download Update")
+        self.download_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d4a574;
+                border: none;
+                color: #0a0a0a;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #e0b585;
+            }
+        """)
+        self.download_btn.clicked.connect(self.on_download)
+        btn_layout.addWidget(self.download_btn)
+        
         layout.addLayout(btn_layout)
-
-    def _start_download(self):
-        """Start downloading the update."""
-        url = self.update_info.download_url
-
-        # If no direct download (just a release page URL), open in browser
-        if not any(url.endswith(ext) for ext in [".exe", ".msi", ".zip"]) and "/download/" not in url:
-            QDesktopServices.openUrl(QUrl(url))
-            self.accept()
-            return
-
-        self.update_btn.setEnabled(False)
-        self.update_btn.setText("Downloading...")
-        self.skip_btn.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.status_label.setVisible(True)
-
-        # Download to temp directory
-        temp_dir = tempfile.gettempdir()
-        filename = self.update_info.file_name or "KlippingeTrading_Update.zip"
-        dest = os.path.join(temp_dir, filename)
-
-        self.download_thread = DownloadThread(url, dest)
-        self.download_thread.progress.connect(self._on_progress)
-        self.download_thread.finished.connect(self._on_download_complete)
-        self.download_thread.error.connect(self._on_download_error)
-        self.download_thread.start()
-
-    def _on_progress(self, downloaded: int, total: int):
-        if total > 0:
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(downloaded)
-            mb_down = downloaded / (1024 * 1024)
-            mb_total = total / (1024 * 1024)
-            self.status_label.setText(f"Downloading: {mb_down:.1f} / {mb_total:.1f} MB")
-        else:
-            self.progress_bar.setMaximum(0)  # Indeterminate
-            mb_down = downloaded / (1024 * 1024)
-            self.status_label.setText(f"Downloading: {mb_down:.1f} MB")
-
-    def _on_download_complete(self, filepath: str):
-        """Handle completed download - install based on file type."""
-        filename = os.path.basename(filepath).lower()
+    
+    def on_skip(self):
+        """User chose to skip this version."""
+        self.result_action = 'skip'
+        save_skipped_version(self.version)
+        self.accept()
+    
+    def on_later(self):
+        """User chose to be reminded later."""
+        self.result_action = 'later'
+        self.reject()
+    
+    def on_download(self):
+        """User chose to download the update."""
+        self.result_action = 'update'
+        clear_skipped_version()  # Clear any skipped version when updating
         
-        if filename.endswith(".zip"):
-            self._install_from_zip(filepath)
-        elif filename.endswith(".exe") or filename.endswith(".msi"):
-            self._install_from_installer(filepath)
-        else:
-            # Unknown format - just open the folder
-            self.status_label.setText("Download complete!")
-            folder = os.path.dirname(filepath)
-            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-            self.accept()
-
-    def _install_from_installer(self, filepath: str):
-        """Launch .exe or .msi installer."""
-        self.status_label.setText("Download complete! Launching installer...")
-        try:
-            subprocess.Popen([filepath], shell=True)
-            from PyQt5.QtWidgets import QApplication
-            QApplication.instance().quit()
-        except Exception as e:
-            QMessageBox.warning(self, "Error",
-                f"Could not launch installer:\n{e}\n\n"
-                f"The file was saved to:\n{filepath}")
-            self.accept()
-
-    def _install_from_zip(self, filepath: str):
-        """Extract .zip and replace current installation."""
-        self.status_label.setText("Extracting update...")
-        self.progress_bar.setMaximum(0)  # Indeterminate
+        # Öppna nedladdningslänken i webbläsaren
+        from PyQt5.QtGui import QDesktopServices
+        from PyQt5.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(self.download_url))
         
-        try:
-            # Determine installation directory
-            if getattr(sys, 'frozen', False):
-                # Running as compiled exe
-                install_dir = os.path.dirname(sys.executable)
-            else:
-                # Running as script - extract next to it
-                install_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            # Extract to a temp location first
-            temp_extract = os.path.join(tempfile.gettempdir(), "KlippingeUpdate_extract")
-            if os.path.exists(temp_extract):
-                import shutil
-                shutil.rmtree(temp_extract)
-            
-            with zipfile.ZipFile(filepath, 'r') as zf:
-                zf.extractall(temp_extract)
-            
-            # Create a batch script to replace files after we exit
-            batch_path = os.path.join(tempfile.gettempdir(), "update_klippinge.bat")
-            exe_name = os.path.basename(sys.executable) if getattr(sys, 'frozen', False) else "KlippingeTrading.exe"
-            
-            with open(batch_path, 'w') as f:
-                f.write(f'''@echo off
-echo Waiting for application to close...
-timeout /t 2 /nobreak >nul
-echo Installing update...
-xcopy /s /y /q "{temp_extract}\\*" "{install_dir}\\"
-echo Starting updated application...
-start "" "{os.path.join(install_dir, exe_name)}"
-del "%~f0"
-''')
-            
-            self.status_label.setText("Installing update and restarting...")
-            
-            # Launch the batch script and exit
-            subprocess.Popen(['cmd', '/c', batch_path], 
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-            
-            from PyQt5.QtWidgets import QApplication
-            QApplication.instance().quit()
-            
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            self.status_label.setStyleSheet("color: #ff5252;")
-            self.update_btn.setEnabled(True)
-            self.update_btn.setText("Retry")
-            self.skip_btn.setEnabled(True)
-            
-            # Offer to open the zip manually
-            reply = QMessageBox.question(self, "Installation Error",
-                f"Automatic installation failed:\n{e}\n\n"
-                f"Would you like to open the download folder?",
-                QMessageBox.Yes | QMessageBox.No)
-            
-            if reply == QMessageBox.Yes:
-                folder = os.path.dirname(filepath)
-                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-
-    def _on_download_error(self, error_msg: str):
-        self.update_btn.setEnabled(True)
-        self.update_btn.setText("Retry Download")
-        self.skip_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Error: {error_msg}")
-        self.status_label.setStyleSheet("color: #ff5252;")
+        self.accept()
 
 
-# ── Main Updater Class ───────────────────────────────────────────────────────
+# ============================================================================
+# AUTO UPDATER CLASS
+# ============================================================================
 
-class AutoUpdater:
-    """
-    Main updater interface. Use from your main window:
-
-        self.updater = AutoUpdater(self)
-        self.updater.check_for_updates()  # background check on startup
-    """
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        self.parent = parent
-        self._checker = None
-        self._timer = None
-        self._update_pending = None  # Store update info if found during background check
-
-        from app_config import APP_VERSION, GITHUB_REPO
-        self.current_version = APP_VERSION
-        self.github_repo = GITHUB_REPO
-
+class AutoUpdater(QObject):
+    """Auto-updater that checks for new versions periodically."""
+    
+    update_available = Signal(str, str, str)  # version, url, notes
+    
+    def __init__(self, parent_window, check_interval_ms: int = CHECK_INTERVAL_MS):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.check_interval_ms = check_interval_ms
+        
+        self._check_thread = None
+        self._check_worker = None
+        self._checking = False
+        
+        # Timer för periodiska kontroller
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check_for_updates)
+        
+        # Anslut signal
+        self.update_available.connect(self._show_update_dialog)
+    
     def start(self):
-        """Start the auto-updater: check now and schedule periodic checks."""
-        # Initial check (silent)
-        self.check_for_updates(silent=True)
+        """Start the auto-updater (check now + start timer)."""
+        print(f"[AutoUpdater] Starting with {self.check_interval_ms/1000/60:.0f} minute interval")
         
-        # Schedule periodic checks every 2 hours
-        self._timer = QTimer()
-        self._timer.timeout.connect(lambda: self.check_for_updates(silent=True))
-        self._timer.start(CHECK_INTERVAL_MS)
-        print(f"[AutoUpdater] Started - checking every {CHECK_INTERVAL_MS // 3600000}h")
-
+        # Kör en första kontroll efter kort delay (låt GUI ladda först)
+        QTimer.singleShot(5000, self.check_for_updates)
+        
+        # Starta periodisk timer
+        self.timer.start(self.check_interval_ms)
+    
     def stop(self):
-        """Stop periodic update checks."""
-        if self._timer:
-            self._timer.stop()
-            self._timer = None
-
-    def check_for_updates(self, silent: bool = True):
-        """
-        Check for updates in background.
-
-        Args:
-            silent: If True, only show dialog when update is available.
-                    If False, also show "you're up to date" message.
-        """
-        if not REQUESTS_AVAILABLE:
-            print("[AutoUpdater] requests library not available")
+        """Stop the auto-updater."""
+        self.timer.stop()
+        print("[AutoUpdater] Stopped")
+    
+    def check_for_updates(self):
+        """Check for updates in background thread."""
+        if self._checking:
+            print("[AutoUpdater] Already checking, skipping")
             return
-
-        self._silent = silent
-        self._checker = UpdateChecker(self.github_repo, self.current_version)
-        self._checker.update_available.connect(self._on_update_available)
-
-        if not silent:
-            self._checker.no_update.connect(self._on_no_update)
-            self._checker.error.connect(self._on_error)
-
-        self._checker.start()
-
-    def _on_update_available(self, info: UpdateInfo):
-        print(f"[AutoUpdater] Update available: v{info.version}")
-        dialog = UpdateDialog(info, self.parent)
+        
+        self._checking = True
+        
+        # Ladda skipped version
+        skipped = load_skipped_version()
+        
+        # Skapa worker och tråd
+        self._check_thread = QThread()
+        self._check_worker = UpdateCheckerWorker(APP_VERSION, skipped)
+        self._check_worker.moveToThread(self._check_thread)
+        
+        # Koppla signaler
+        self._check_thread.started.connect(self._check_worker.run)
+        self._check_worker.finished.connect(self._on_check_finished)
+        self._check_worker.update_available.connect(self._on_update_found)
+        self._check_worker.no_update.connect(self._on_no_update)
+        self._check_worker.error.connect(self._on_check_error)
+        
+        self._check_thread.start()
+    
+    def _on_check_finished(self):
+        """Clean up after check completes."""
+        self._checking = False
+        
+        if self._check_worker:
+            self._check_worker.deleteLater()
+        if self._check_thread:
+            self._check_thread.quit()
+            self._check_thread.wait()
+            self._check_thread.deleteLater()
+        
+        self._check_worker = None
+        self._check_thread = None
+    
+    def _on_update_found(self, version: str, url: str, notes: str):
+        """Handle update found."""
+        print(f"[AutoUpdater] Update found: {version}")
+        self.update_available.emit(version, url, notes)
+    
+    def _on_no_update(self):
+        """Handle no update available."""
+        print("[AutoUpdater] No update available")
+    
+    def _on_check_error(self, error: str):
+        """Handle check error."""
+        print(f"[AutoUpdater] Error: {error}")
+    
+    def _show_update_dialog(self, version: str, url: str, notes: str):
+        """Show the update dialog."""
+        dialog = UpdateDialog(version, url, notes, self.parent_window)
         dialog.exec_()
 
-    def _on_no_update(self):
-        if self.parent:
-            QMessageBox.information(
-                self.parent, "Up to Date",
-                f"You're running the latest version (v{self.current_version})."
-            )
 
-    def _on_error(self, msg: str):
-        print(f"[AutoUpdater] Error: {msg}")
-        if self.parent and not self._silent:
-            QMessageBox.warning(
-                self.parent, "Update Check Failed",
-                f"Could not check for updates:\n{msg}"
-            )
+# ============================================================================
+# SETUP FUNCTION
+# ============================================================================
 
-
-# ── Convenience Function ─────────────────────────────────────────────────────
-
-def setup_auto_updater(main_window: QWidget) -> AutoUpdater:
-    """
-    Set up auto-updater for the main window.
-    Call this after the main window is created and shown.
+def setup_auto_updater(parent_window, check_interval_ms: int = CHECK_INTERVAL_MS) -> AutoUpdater:
+    """Setup and start the auto-updater.
     
-    Usage:
-        updater = setup_auto_updater(self)
-        # updater.stop() when closing app
+    Args:
+        parent_window: The main application window
+        check_interval_ms: Interval between checks in milliseconds (default 2 hours)
     
     Returns:
-        AutoUpdater instance (keep reference to prevent garbage collection)
+        AutoUpdater instance
     """
-    updater = AutoUpdater(main_window)
+    updater = AutoUpdater(parent_window, check_interval_ms)
     updater.start()
     return updater
+
+
+# ============================================================================
+# MANUAL CHECK FUNCTION
+# ============================================================================
+
+def check_for_updates_now(parent_window):
+    """Manually trigger an update check (e.g., from menu).
+    
+    This bypasses the skipped version check.
+    """
+    if not REQUESTS_AVAILABLE:
+        QMessageBox.warning(
+            parent_window,
+            "Update Check Failed",
+            "Cannot check for updates: requests library not installed."
+        )
+        return
+    
+    try:
+        response = requests.get(
+            GITHUB_API_URL,
+            headers={'Accept': 'application/vnd.github.v3+json'},
+            timeout=10
+        )
+        
+        if response.status_code == 404:
+            QMessageBox.information(
+                parent_window,
+                "No Updates",
+                f"You are running the latest version ({APP_VERSION})."
+            )
+            return
+        
+        response.raise_for_status()
+        release = response.json()
+        
+        remote_version = release.get('tag_name', '').lstrip('v')
+        
+        if is_newer_version(remote_version, APP_VERSION):
+            download_url = ""
+            for asset in release.get('assets', []):
+                name = asset.get('name', '').lower()
+                if name.endswith('.exe') or 'setup' in name:
+                    download_url = asset.get('browser_download_url', '')
+                    break
+            if not download_url:
+                download_url = release.get('html_url', '')
+            
+            release_notes = release.get('body', 'No release notes available.')
+            
+            dialog = UpdateDialog(remote_version, download_url, release_notes, parent_window)
+            dialog.exec_()
+        else:
+            QMessageBox.information(
+                parent_window,
+                "No Updates",
+                f"You are running the latest version ({APP_VERSION})."
+            )
+    
+    except Exception as e:
+        QMessageBox.warning(
+            parent_window,
+            "Update Check Failed",
+            f"Could not check for updates:\n{e}"
+        )
