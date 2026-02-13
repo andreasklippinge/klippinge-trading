@@ -44,7 +44,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-GITHUB_REPO = "your-username/your-repo"  # Ändra till din repo
+GITHUB_REPO = "andreasklippinge/klippinge-trading"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000  # 2 timmar i millisekunder
 SKIPPED_VERSION_FILE = "skipped_version.json"

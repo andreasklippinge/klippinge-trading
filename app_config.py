@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ── Version ──────────────────────────────────────────────────────────────────
 APP_NAME = "Klippinge Investment Trading Terminal"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "Klippinge Investment"
 GITHUB_REPO = "andreasklippinge/klippinge-trading"  # ← Ändra detta!
 
