@@ -20,7 +20,7 @@ ASYNC FIX (2025-01-19):
     - send_discord_notification() - Now runs in background thread
     - refresh_mf_prices() - Now runs in background thread  
     - _take_daily_portfolio_snapshot() - No longer blocks on price fetch
-    - check_hmm_schedule() - Better async coordination
+    - check_scheduled_scan() - Better async coordination
     - send_scan_results_to_discord() - Now uses LIVE portfolio data (not stale snapshots)
     
     New methods:
@@ -43,8 +43,10 @@ Run with:
 import sys
 import os
 import re
+import math
 import socket
 import time
+import tempfile
 from datetime import datetime
 from typing import Optional, Dict, List
 import json
@@ -52,15 +54,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
     QGroupBox, QLineEdit, QTextEdit, QSplitter, QTabWidget,
     QHeaderView, QAbstractItemView, QSpinBox, QDoubleSpinBox,
     QProgressBar, QStatusBar, QMenuBar, QMenu,
     QFrame, QScrollArea, QGridLayout, QSizePolicy, QMessageBox,
-    QFileDialog, QCheckBox, QAction, QStackedWidget
+    QFileDialog, QCheckBox, QAction, QStackedWidget, QCompleter
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal as Signal, QThread, QObject, pyqtSlot as Slot, QSize, QUrl, QPointF
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal as Signal, QThread, QObject, pyqtSlot as Slot, QSize, QUrl, QPointF, QRectF
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QBrush, QPen, QPolygonF, QDesktopServices
 
 import numpy as np
@@ -91,13 +93,17 @@ except ImportError:
     PORTFOLIO_HISTORY_AVAILABLE = False
     print("Warning: portfolio_history.py not found.")
 
+# Markov chain analysis
+try:
+    from markov_chain import MarkovChainAnalyzer, MarkovResult, MARKOV_STATES, N_MARKOV_STATES
+    MARKOV_AVAILABLE = True
+except ImportError:
+    MARKOV_AVAILABLE = False
+    print("Warning: markov_chain.py not found.")
+
 # Import trading engine
 from pairs_engine import PairsTradingEngine, OUProcess, load_tickers_from_csv
-from regime_hmm import (
-    RegimeDetector, AdvancedRegimeDetector, REGIMES, PYMC_AVAILABLE,
-    SimpleGaussianHMM, HiddenSemiMarkovModel, ParticleFilterHMM,
-    TimeVaryingTransitionHMM, UncertaintyQuantifier, BayesianHMM
-)
+
 
 # ── Application configuration (portable paths for distribution) ──
 from app_config import (
@@ -135,7 +141,7 @@ WEBENGINE_AVAILABLE = False
 QWebEngineView = None
 if ENABLE_WEBENGINE_MAP:
     try:
-        from PyQt5.QtWebEngineWidgets import QWebEngineView
+        from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineSettings
         WEBENGINE_AVAILABLE = True
         print("QWebEngineView loaded successfully")
     except ImportError as e:
@@ -267,7 +273,22 @@ def get_crosshair_manager_class():
             self.label.hide()
             
             self.proxy = _pg.SignalProxy(plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved)
-        
+
+            # Hide crosshair when mouse leaves the plot widget entirely
+            self._event_filter = self._LeaveEventFilter(self)
+            plot_widget.installEventFilter(self._event_filter)
+
+        class _LeaveEventFilter(QObject):
+            """Hides crosshair when mouse leaves the plot widget."""
+            def __init__(self, manager):
+                super().__init__()
+                self._manager = manager
+
+            def eventFilter(self, obj, event):
+                if event.type() == event.Type.Leave:
+                    self._manager.hide_crosshair()
+                return False
+
         def add_synced_manager(self, manager):
             """Add another CrosshairManager to sync with."""
             if manager not in self.synced_managers:
@@ -412,6 +433,7 @@ def get_crosshair_manager_class():
         def cleanup(self):
             """Remove items from plot."""
             try:
+                self.plot.removeEventFilter(self._event_filter)
                 self.plot.removeItem(self.vLine)
                 self.plot.removeItem(self.hLine)
                 self.plot.removeItem(self.label)
@@ -1380,24 +1402,11 @@ def fetch_ms_page(session, page: int) -> list:
         for tr in trs[1:]:
             tds = []
             for td in tr.find_all("td"):
-                link = td.find("a")
-                if link:
-                    if link.has_attr("href"):
-                        tds.append(link["href"])
-                    elif link.has_attr("onclick"):
-                        m = re.search(r"'(.*?)'", link["onclick"])
-                        if m:
-                            tds.append("https://etp.morganstanley.com" + m.group(1))
-                        else:
-                            tds.append(link.get_text(strip=True))
-                    else:
-                        tds.append(link.get_text(strip=True))
-                else:
-                    tds.append(td.get_text(strip=True))
-            
+                tds.append(td.get_text(strip=True))
+
             if len(tds) == len(headers):
                 rows.append(dict(zip(headers, tds)))
-        
+
         return rows
     except Exception as e:
         return []
@@ -1452,29 +1461,16 @@ def fetch_minifutures_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
         for tr in trs[1:]:
             tds = []
             for td in tr.find_all("td"):
-                link = td.find("a")
-                if link:
-                    if link.has_attr("href"):
-                        tds.append(link["href"])
-                    elif link.has_attr("onclick"):
-                        m = re.search(r"'(.*?)'", link["onclick"])
-                        if m:
-                            tds.append("https://etp.morganstanley.com" + m.group(1))
-                        else:
-                            tds.append(link.get_text(strip=True))
-                    else:
-                        tds.append(link.get_text(strip=True))
-                else:
-                    tds.append(td.get_text(strip=True))
-            
+                tds.append(td.get_text(strip=True))
+
             if len(tds) == len(headers):
                 rows.append(dict(zip(headers, tds)))
-        
+
         if not rows:
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(rows)
-        
+
         # Parse financing level
         def parse_number(x):
             if not isinstance(x, str):
@@ -1485,10 +1481,10 @@ def fetch_minifutures_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
                 return float(clean)
             except ValueError:
                 return None
-        
+
         if 'Finansieringsnivå' in df.columns:
             df['FinansieringsnivåNum'] = df['Finansieringsnivå'].apply(parse_number)
-        
+
         return df
         
     except Exception as e:
@@ -1545,27 +1541,14 @@ def fetch_certificates_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
         for tr in trs[1:]:
             tds = []
             for td in tr.find_all("td"):
-                link = td.find("a")
-                if link:
-                    if link.has_attr("href"):
-                        tds.append(link["href"])
-                    elif link.has_attr("onclick"):
-                        m = re.search(r"'(.*?)'", link["onclick"])
-                        if m:
-                            tds.append("https://etp.morganstanley.com" + m.group(1))
-                        else:
-                            tds.append(link.get_text(strip=True))
-                    else:
-                        tds.append(link.get_text(strip=True))
-                else:
-                    tds.append(td.get_text(strip=True))
-            
+                tds.append(td.get_text(strip=True))
+
             if len(tds) == len(headers):
                 rows.append(dict(zip(headers, tds)))
-        
+
         if not rows:
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(rows)
         
         # Parse daily leverage ("Daglig hävstång")
@@ -1677,7 +1660,7 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     # Morgan Stanley kan returnera "populära produkter" om tillgången inte finns.
     if 'Underliggande tillgång' in df_certs.columns:
         # Filtrera på underliggande som matchar ms_name (case-insensitive)
-        mask = df_certs['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False)
+        mask = df_certs['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
         df_certs = df_certs[mask]
         
         if df_certs.empty:
@@ -1937,7 +1920,7 @@ def find_best_minifuture(ticker: str, direction: str, ticker_to_ms: dict,
             
             if underlying_col:
                 # Filtrera på underliggande som matchar ms_name
-                underlying_mask = df_asset[underlying_col].str.lower().str.contains(ms_name.lower(), na=False)
+                underlying_mask = df_asset[underlying_col].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
                 df_asset = df_asset[underlying_mask]
                 
                 if df_asset.empty:
@@ -1969,7 +1952,7 @@ def find_best_minifuture(ticker: str, direction: str, ticker_to_ms: dict,
             
             if underlying_col and riktning_col:
                 mask = (
-                    minifutures_df[underlying_col].str.contains(ms_name, case=False, na=False) &
+                    minifutures_df[underlying_col].str.contains(ms_name, case=False, na=False, regex=False) &
                     minifutures_df[riktning_col].str.contains(direction, case=False, na=False)
                 )
                 df_filtered = minifutures_df[mask].copy()
@@ -2163,6 +2146,85 @@ def calculate_minifuture_position(notional: float, hedge_ratio: float, mf_y: dic
     }
 
 
+def calculate_minifuture_minimum_units(hedge_ratio: float, mf_y: dict, mf_x: dict,
+                                       dir_y: str, dir_x: str) -> Optional[dict]:
+    """
+    Calculate the minimum number of instrument units per leg so that each leg
+    has at least 1000 SEK capital invested, while respecting the hedge ratio.
+
+    Returns dict with units_y, units_x, instrument prices, capital per leg,
+    and the total minimum capital required.  Returns None if data is missing.
+    """
+    MIN_CAPITAL_PER_LEG = 1000  # SEK
+
+    def _instrument_price(mf_data: dict, direction: str) -> float:
+        """Calculate instrument price for a mini future / certificate."""
+        product_type = mf_data.get('product_type', 'Mini Future')
+        spot_price = mf_data.get('spot_price', 0)
+        leverage = mf_data.get('leverage', 1)
+        fin_level = mf_data.get('financing_level')
+        price = mf_data.get('instrument_price')
+
+        if price is None:
+            if product_type == 'Mini Future' and fin_level is not None:
+                if direction == 'Long':
+                    price = spot_price - fin_level
+                else:
+                    price = fin_level - spot_price
+            elif product_type == 'Certificate':
+                multiplier = mf_data.get('multiplier')
+                if fin_level is not None and multiplier is not None:
+                    if direction == 'Long':
+                        price = multiplier * (spot_price - fin_level)
+                    else:
+                        price = multiplier * (fin_level - spot_price)
+                else:
+                    price = spot_price / leverage if leverage > 0 else 100
+            else:
+                price = spot_price / leverage if leverage > 0 else 100
+
+        return max(0.01, abs(price))
+
+    if not mf_y or not mf_x:
+        return None
+
+    price_y = _instrument_price(mf_y, dir_y)
+    price_x = _instrument_price(mf_x, dir_x)
+    beta = abs(hedge_ratio)
+
+    # Step 1: minimum units for Y leg (at least 1000 SEK)
+    units_y = math.ceil(MIN_CAPITAL_PER_LEG / price_y)
+
+    # Step 2: derive X units from hedge ratio
+    units_x = math.ceil(units_y * beta)
+
+    # Step 3: check X leg meets minimum
+    if units_x * price_x < MIN_CAPITAL_PER_LEG:
+        units_x = math.ceil(MIN_CAPITAL_PER_LEG / price_x)
+        # Recalculate Y from X to maintain ratio
+        if beta > 0:
+            units_y = math.ceil(units_x / beta)
+
+    # Step 4: verify Y still meets minimum after possible recalc
+    if units_y * price_y < MIN_CAPITAL_PER_LEG:
+        units_y = math.ceil(MIN_CAPITAL_PER_LEG / price_y)
+        units_x = math.ceil(units_y * beta)
+
+    capital_y = units_y * price_y
+    capital_x = units_x * price_x
+    total_capital = capital_y + capital_x
+
+    return {
+        'units_y': units_y,
+        'units_x': units_x,
+        'price_y': price_y,
+        'price_x': price_x,
+        'capital_y': capital_y,
+        'capital_x': capital_x,
+        'total_capital': total_capital,
+    }
+
+
 def calculate_optimal_stop_loss(ou, entry_z_abs: float, current_z: float) -> dict:
     """
     Calculate optimal stop-loss level.
@@ -2271,15 +2333,13 @@ class StartupWorker(QObject):
     finished = Signal()
     portfolio_loaded = Signal(list)
     engine_loaded = Signal(dict)
-    hmm_loaded = Signal(object)
     status_message = Signal(str)
-    
-    def __init__(self, portfolio_file: str, engine_cache_file: str, hmm_cache_path: str):
+
+    def __init__(self, portfolio_file: str, engine_cache_file: str):
         super().__init__()
         self.portfolio_file = portfolio_file
         self.engine_cache_file = engine_cache_file
-        self.hmm_cache_path = hmm_cache_path
-    
+
     @Slot()
     def run(self):
         try:
@@ -2289,18 +2349,8 @@ class StartupWorker(QObject):
                 positions = load_portfolio(self.portfolio_file)
                 if positions:
                     self.portfolio_loaded.emit(positions)
-            
-            # 2. Load HMM cache (medium - pickle)
-            self.status_message.emit("Loading regime model...")
-            if os.path.exists(self.hmm_cache_path):
-                try:
-                    detector = RegimeDetector(model_type='hsmm', lookback_years=30)
-                    if detector.load_model(self.hmm_cache_path):
-                        self.hmm_loaded.emit(detector)
-                except Exception as e:
-                    pass
-            
-            # 3. Load engine cache (slowest - large pickle with price data)
+
+            # 2. Load engine cache (slowest - large pickle with price data)
             self.status_message.emit("Loading market data cache...")
             if os.path.exists(self.engine_cache_file):
                 cache_data = load_engine_cache(self.engine_cache_file)
@@ -2355,79 +2405,6 @@ class AnalysisWorker(QObject):
         finally:
             self.finished.emit()
 
-
-class HMMWorker(QObject):
-    """Worker thread for fitting Advanced HMM model."""
-    finished = Signal()
-    progress = Signal(int, str)
-    error = Signal(str)
-    result = Signal(object)
-    
-    # Retry configuration
-    MAX_RETRIES = 3
-    RETRY_DELAYS = [5, 15, 30]  # Exponential backoff in seconds
-    
-    @Slot()
-    def run(self):
-        import time
-        last_error = None
-        
-        # Try fitting with retries
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                if attempt > 0:
-                    delay = self.RETRY_DELAYS[min(attempt - 1, len(self.RETRY_DELAYS) - 1)]
-                    self.progress.emit(5, f"Retry {attempt}/{self.MAX_RETRIES} after {delay}s wait...")
-                    time.sleep(delay)
-                
-                self.progress.emit(5, "Initializing HSMM regime detector...")
-                
-                # Create detector with HSMM and all enhancements
-                detector = RegimeDetector(
-                    model_type='hsmm',            # Hidden Semi-Markov Model
-                    lookback_years=30,
-                    use_particle_filter=True,     # Online updates
-                    use_tv_transitions=True       # Time-varying transitions
-                )
-                
-                def progress_callback(pct, msg):
-                    self.progress.emit(pct, msg)
-                
-                # Fit the model (handles all components internally)
-                detector.fit(progress_callback=progress_callback)
-                
-                # Model auto-saves to cache, but we also save explicitly
-                self.progress.emit(95, "Saving model cache...")
-                detector.save_model()
-                
-                self.result.emit(detector)
-                return  # Success - exit early
-                
-            except Exception as e:
-                import traceback
-                last_error = f"{str(e)}\n{traceback.format_exc()}"
-                
-                # Check if it's a data fetch error (worth retrying)
-                if "Only got 0 tickers" in str(e) or "Need at least" in str(e):
-                    continue  # Retry on data fetch failures
-                else:
-                    break  # Don't retry on other errors
-        
-        # All retries failed - try loading cached model as fallback
-        self.progress.emit(90, "Data fetch failed, loading cached model...")
-        
-        try:
-            detector = RegimeDetector(model_type='hsmm', lookback_years=30)
-            if detector.load_model():
-                self.progress.emit(95, "Using cached model (data fetch failed)")
-                self.result.emit(detector)
-                return
-        except Exception as cache_error:
-            pass
-        
-        # Both fit and cache failed - emit error
-        self.error.emit(f"Data fetch failed after {self.MAX_RETRIES} retries, no cached model available.\n{last_error}")
-        self.finished.emit()
 
 
 class DiscordWorker(QObject):
@@ -2486,139 +2463,355 @@ class PriceFetchWorker(QObject):
 
 
 class MarketWatchWorker(QObject):
-    """Worker thread for fetching market watch data (async yfinance to prevent GUI freeze).
-    
-    OPTIMERING: Flyttar tung yfinance.download från main thread till bakgrund.
+    """Worker thread for fetching market data via yf.download().
+
+    Downloads 5 days of daily data for all instruments, computes daily
+    change percentage from the last two trading days' close prices,
+    and emits a list of dicts for the treemap heatmap.
     """
     finished = Signal()
-    result = Signal(object, dict)  # (DataFrame, all_instruments dict)
+    result = Signal(list)  # List[dict] with {market, symbol, name, price, change, change_pct}
     error = Signal(str)
     status_message = Signal(str)
-    
-    def __init__(self, all_instruments: dict):
+
+    def __init__(self, instruments: dict):
         super().__init__()
-        # VIKTIGT: Kopiera dict för thread safety
-        self.all_instruments = dict(all_instruments)
-        self.tickers = list(self.all_instruments.keys())
-    
+        self.instruments = dict(instruments)
+        self.tickers = list(instruments.keys())
+
     @Slot()
     def run(self):
-        """Fetch market data in batches for reliability.
-        
-        VIKTIGT: Undviker ThreadPoolExecutor inuti worker för att förhindra
-        sipBadCatcherResult-fel. Använder istället direkt batch-hämtning
-        med socket timeout för att förhindra hängning.
-        """
-        import socket
-        
-        # Spara original timeout och sätt en aggressiv timeout
-        original_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(15)  # 15 sekunder max per operation
-        
+        """Fetch market data using yf.download and compute change %."""
         try:
             import yfinance as yf
-            
-            # Dela upp i mindre batches för stabilitet (10 tickers per batch)
-            batch_size = 10
-            all_data = []
-            total_batches = (len(self.tickers) + batch_size - 1) // batch_size
-            
-            self.status_message.emit(f"Fetching market data ({total_batches} batches)...")
-            print(f"[MarketWatch] Starting fetch of {len(self.tickers)} tickers in {total_batches} batches...")
-            
-            for i in range(0, len(self.tickers), batch_size):
-                batch = self.tickers[i:i+batch_size]
-                batch_num = i // batch_size + 1
-                
-                # Uppdatera status för varje batch
-                self.status_message.emit(f"Market data: batch {batch_num}/{total_batches}...")
-                print(f"[MarketWatch] Fetching batch {batch_num}/{total_batches}: {batch[:3]}...")
-                
-                try:
-                    batch_data = yf.download(
-                        batch, 
-                        period='5d', 
-                        interval="30m", 
-                        progress=False, 
-                        threads=False,
-                        ignore_tz=True
-                    )['Close']
-                    
-                    if batch_data is not None and not batch_data.empty:
-                        all_data.append(batch_data)
-                        print(f"[MarketWatch] Batch {batch_num} OK: {len(batch_data)} rows")
-                    else:
-                        print(f"[MarketWatch] Batch {batch_num} returned empty data")
-                        
-                except socket.timeout:
-                    print(f"[MarketWatch] Batch {batch_num} timed out - skipping")
-                    continue
-                except Exception as e:
-                    print(f"[MarketWatch] Batch {batch_num} failed: {e}")
-                    continue
-            
-            # Kombinera all data
-            if all_data:
-                try:
+
+            self.status_message.emit(f"Fetching market data for {len(self.tickers)} instruments...")
+            print(f"[MarketWatch] Starting yf.download for {len(self.tickers)} instruments...")
+
+            try:
+                data = yf.download(self.tickers, period='5d', interval="15m", progress=False, threads=False, ignore_tz=True)
+            except (TypeError, RuntimeError) as e:
+                print(f"[MarketWatch] First attempt failed ({e}), retrying in batches...")
+                all_data = []
+                batch_size = 50
+                for i in range(0, len(self.tickers), batch_size):
+                    batch = self.tickers[i:i+batch_size]
+                    try:
+                        batch_data = yf.download(batch, period='5d', interval="15m", progress=False, threads=False, ignore_tz=True)
+                        if not batch_data.empty:
+                            all_data.append(batch_data)
+                    except Exception as batch_e:
+                        print(f"[MarketWatch] Batch {i//batch_size + 1} failed: {batch_e}")
+                        continue
+                if all_data:
                     data = pd.concat(all_data, axis=1)
-                    
-                    # Ta bort duplicerade kolumner (kan hända vid concat)
-                    data = data.loc[:, ~data.columns.duplicated()]
-                    print(f"[MarketWatch] Combined data: {len(data)} rows, {len(data.columns)} columns")
-                except Exception as e:
-                    print(f"[MarketWatch] Error concatenating data: {e}")
-                    data = all_data[0] if len(all_data) == 1 else pd.DataFrame()
-            else:
-                data = pd.DataFrame()
-            
+                else:
+                    data = pd.DataFrame()
+
             if data.empty:
                 self.error.emit("No market data returned")
                 return
-            
-            # Handle both single and multi-column results
-            if 'Close' in data.columns:
+
+            # Extract OHLC prices
+            is_multi = isinstance(data.columns, pd.MultiIndex)
+            if is_multi:
                 close = data['Close']
-            elif isinstance(data.columns, pd.MultiIndex):
-                close = data['Close']
+                open_p = data['Open'] if 'Open' in data.columns.get_level_values(0) else None
+                high_p = data['High'] if 'High' in data.columns.get_level_values(0) else None
+                low_p = data['Low'] if 'Low' in data.columns.get_level_values(0) else None
+            elif 'Close' in data.columns:
+                close = data[['Close']]
+                close.columns = [self.tickers[0]] if len(self.tickers) == 1 else close.columns
+                open_p = high_p = low_p = None
             else:
                 close = data
-            
-            print(f"[MarketWatch] Emitting result with {len(close.columns) if hasattr(close, 'columns') else 1} instruments")
-            
-            # Kopiera dict för säker signalering
-            self.result.emit(close, dict(self.all_instruments))
-            
+                open_p = high_p = low_p = None
+
+            # Build items list using pct_change() for daily change
+            all_items = []
+            for ticker, (name, region) in self.instruments.items():
+                try:
+                    if ticker not in close.columns:
+                        continue
+                    col = close[ticker].dropna()
+                    if len(col) < 1:
+                        continue
+
+                    last_price = float(col.iloc[-1])
+                    if len(col) >= 2:
+                        pct = col.pct_change().iloc[-1]
+                        pct_val = float(pct * 100) if pd.notna(pct) else 0.0
+                        # Guard against inf values from zero-division
+                        change_pct = round(pct_val, 2) if math.isfinite(pct_val) else 0.0
+                        change = round(last_price - float(col.iloc[-2]), 4)
+                    else:
+                        change = 0.0
+                        change_pct = 0.0
+
+                    # Build close-only history (keep datetime for sparklines)
+                    history = []
+                    for dt_idx, val in col.items():
+                        history.append((dt_idx.strftime('%m/%d %H:%M'), float(val)))
+
+                    # Build OHLC history for candlestick charts (15m intervals)
+                    ohlc_history = []
+                    if open_p is not None and ticker in open_p.columns:
+                        try:
+                            ohlc_df = pd.DataFrame({
+                                'O': open_p[ticker], 'H': high_p[ticker],
+                                'L': low_p[ticker], 'C': close[ticker]
+                            }).dropna()
+                            # Resample to 1h candles to reduce data size
+                            ohlc_1h = ohlc_df.resample('1h').agg(
+                                {'O': 'first', 'H': 'max', 'L': 'min', 'C': 'last'}
+                            ).dropna()
+                            for dt_idx, row in ohlc_1h.iterrows():
+                                ohlc_history.append([
+                                    dt_idx.strftime('%m/%d %H:%M'),
+                                    round(float(row['O']), 2),
+                                    round(float(row['H']), 2),
+                                    round(float(row['L']), 2),
+                                    round(float(row['C']), 2),
+                                ])
+                        except Exception:
+                            pass
+
+                    all_items.append({
+                        'market': region,
+                        'symbol': ticker,
+                        'name': name,
+                        'price': last_price,
+                        'change': change,
+                        'change_pct': change_pct,
+                        'history': history,
+                        'ohlc_history': ohlc_history,
+                    })
+                except Exception as e:
+                    print(f"[MarketWatch] Error processing {ticker}: {e}")
+                    continue
+
+            if not all_items:
+                self.error.emit("No market data could be processed")
+                return
+
+            print(f"[MarketWatch] Processed {len(all_items)} instruments successfully")
+            self.result.emit(all_items)
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
-            # Återställ original timeout
-            socket.setdefaulttimeout(original_timeout)
             self.finished.emit()
+
+
+class IntradayOHLCWorker(QObject):
+    """Background worker: fetch today's intraday 5-min OHLC for all instruments.
+
+    Seeds the overlay candlestick chart with data from market open (or
+    yesterday's session for closed markets).  Runs once at startup.
+    """
+    finished = Signal()
+    result = Signal(dict)   # {symbol: {'ohlc': [[ts,O,H,L,C], ...], 'info': {day_high,day_low,...}}}
+    error = Signal(str)
+
+    def __init__(self, tickers: list, instruments: dict):
+        super().__init__()
+        self.tickers = list(tickers)
+        self.instruments = dict(instruments)
+
+    @Slot()
+    def run(self):
+        try:
+            import yfinance as yf
+            print(f"[Intraday] Fetching 1d/5m OHLC for {len(self.tickers)} tickers...")
+
+            data = yf.download(
+                self.tickers, period='1d', interval='5m',
+                progress=False, threads=True, ignore_tz=True,
+            )
+            if data.empty:
+                self.error.emit("No intraday data returned")
+                return
+
+            is_multi = isinstance(data.columns, pd.MultiIndex)
+
+            # Extract metric DataFrames (same pattern as MarketWatchWorker)
+            if is_multi:
+                close_df = data['Close']
+                open_df = data['Open'] if 'Open' in data.columns.get_level_values(0) else None
+                high_df = data['High'] if 'High' in data.columns.get_level_values(0) else None
+                low_df = data['Low'] if 'Low' in data.columns.get_level_values(0) else None
+                vol_df = data['Volume'] if 'Volume' in data.columns.get_level_values(0) else None
+            else:
+                close_df = open_df = high_df = low_df = vol_df = None
+
+            out = {}
+            for ticker in self.tickers:
+                try:
+                    if is_multi:
+                        if ticker not in close_df.columns:
+                            continue
+                        col_c = close_df[ticker].dropna()
+                        if col_c.empty:
+                            continue
+                        odf = pd.DataFrame({'C': col_c})
+                        if open_df is not None and ticker in open_df.columns:
+                            odf['O'] = open_df[ticker]
+                        if high_df is not None and ticker in high_df.columns:
+                            odf['H'] = high_df[ticker]
+                        if low_df is not None and ticker in low_df.columns:
+                            odf['L'] = low_df[ticker]
+                        if vol_df is not None and ticker in vol_df.columns:
+                            odf['V'] = vol_df[ticker]
+                        odf = odf.dropna(subset=['C'])
+                    else:
+                        # Single ticker
+                        odf = pd.DataFrame({
+                            'C': data['Close'], 'O': data['Open'],
+                            'H': data['High'], 'L': data['Low'],
+                        })
+                        if 'Volume' in data.columns:
+                            odf['V'] = data['Volume']
+                        odf = odf.dropna(subset=['C'])
+
+                    if odf.empty:
+                        continue
+
+                    # Build OHLC bar list (5-min candles)
+                    bars = []
+                    for dt_idx, row in odf.iterrows():
+                        bars.append([
+                            float(dt_idx.timestamp()),
+                            round(float(row.get('O', row['C'])), 4),
+                            round(float(row.get('H', row['C'])), 4),
+                            round(float(row.get('L', row['C'])), 4),
+                            round(float(row['C']), 4),
+                        ])
+
+                    # Extract day-level stats
+                    info = {
+                        'open_price': round(float(odf['O'].iloc[0]), 4) if 'O' in odf.columns else 0,
+                        'day_high': round(float(odf['H'].max()), 4) if 'H' in odf.columns else 0,
+                        'day_low': round(float(odf['L'].min()), 4) if 'L' in odf.columns else 0,
+                        'day_volume': int(odf['V'].sum()) if 'V' in odf.columns else 0,
+                    }
+                    out[ticker] = {'ohlc': bars, 'info': info}
+
+                except Exception:
+                    continue
+
+            print(f"[Intraday] Got OHLC for {len(out)} / {len(self.tickers)} tickers")
+            self.result.emit(out)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class MarketWatchWebSocket(QObject):
+    """Persistent WebSocket thread for live market price updates via yfinance.
+
+    Auto-reconnects when Yahoo closes the connection (typically every ~60s).
+    """
+    price_update = Signal(dict)  # {symbol, price, change, change_pct}
+    status_message = Signal(str)
+    error = Signal(str)
+    connected = Signal()
+
+    def __init__(self, tickers: list):
+        super().__init__()
+        self.tickers = tickers
+        self._ws = None  # WebSocket instance ref for stop()
+        self._stopped = False
+
+    @Slot()
+    def run(self):
+        try:
+            from yfinance import WebSocket
+        except ImportError:
+            self.error.emit("yfinance WebSocket not available (upgrade yfinance)")
+            return
+
+        def on_message(msg):
+            symbol = msg.get('id', '')
+            price = msg.get('price', 0)
+            change = msg.get('change', 0)
+            change_pct = msg.get('change_percent', 0)
+            if symbol and price:
+                self.price_update.emit({
+                    'symbol': symbol,
+                    'price': float(price),
+                    'change': float(change),
+                    'change_pct': round(float(change_pct), 2),
+                    'day_high': float(msg.get('day_high', 0)),
+                    'day_low': float(msg.get('day_low', 0)),
+                    'day_volume': int(msg.get('day_volume', 0)),
+                    'previous_close': float(msg.get('previous_close', 0)),
+                    'open_price': float(msg.get('open_price', 0)),
+                    'short_name': msg.get('short_name', ''),
+                    'market_hours': msg.get('market_hours', 0),
+                    'timestamp': time.time(),
+                })
+
+        # Auto-reconnect loop — Yahoo stänger WS efter ~60s
+        while not self._stopped:
+            try:
+                self._ws = WebSocket()
+                self._ws.subscribe(self.tickers)
+                self.connected.emit()
+                self.status_message.emit(f"WebSocket connected: {len(self.tickers)} tickers")
+                print(f"[WS] Connected, subscribed to {len(self.tickers)} tickers")
+                self._ws.listen(on_message)  # Blocks until closed
+            except Exception as e:
+                if self._stopped:
+                    break
+                print(f"[WS] Disconnected: {e}")
+
+            if self._stopped:
+                break
+            # Vänta kort innan reconnect
+            print("[WS] Reconnecting in 2s...")
+            time.sleep(2)
+
+        print("[WS] Stopped")
+
+    def stop(self):
+        """Close the WebSocket connection and exit reconnect loop."""
+        self._stopped = True
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
 
 
 class VolatilityDataWorker(QObject):
     """Worker thread for fetching volatility/market data (async yfinance to prevent GUI freeze).
-    
+
     OPTIMERING: Flyttar tung yfinance.download från main thread till bakgrund.
+    First load uses period='max'; subsequent refreshes use period='1y'.
     """
     finished = Signal()
     result = Signal(object)  # DataFrame with close prices
     error = Signal(str)
     status_message = Signal(str)
-    
-    def __init__(self, tickers: list):
+
+    def __init__(self, tickers: list, period: str = 'max'):
         super().__init__()
         self.tickers = list(tickers)  # Kopiera för säkerhet
-    
+        self.period = period
+
     @Slot()
     def run(self):
         try:
             import yfinance as yf
-            self.status_message.emit(f"Fetching volatility data for {len(self.tickers)} tickers...")
-            
-            data = yf.download(self.tickers, period='max', interval="1d", progress=False, threads=False, ignore_tz=True)['Close']
+            self.status_message.emit(f"Fetching volatility data for {len(self.tickers)} tickers (period={self.period})...")
+
+            data = yf.download(self.tickers, period=self.period, interval="1d", progress=False, threads=False, ignore_tz=True)['Close']
             
             if data.empty:
                 self.error.emit("No volatility data returned")
@@ -2642,9 +2835,34 @@ class VolatilityDataWorker(QObject):
             self.finished.emit()
 
 
+class MarkovChainWorker(QObject):
+    """Worker thread for Markov chain analysis (async yfinance to prevent GUI freeze)."""
+    finished = Signal()
+    result = Signal(object)   # MarkovResult
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, ticker: str):
+        super().__init__()
+        self.ticker = ticker
+
+    @Slot()
+    def run(self):
+        try:
+            analyzer = MarkovChainAnalyzer()
+            res = analyzer.analyze(self.ticker, progress_callback=self.progress.emit)
+            self.result.emit(res)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
 class PortfolioRefreshWorker(QObject):
     """Worker thread for refreshing portfolio Z-scores and MF prices asynchronously.
-    
+
     OPTIMERING: Flyttar synkrona HTTP-anrop från main thread till bakgrund.
     """
     finished = Signal()
@@ -3493,11 +3711,11 @@ class VolatilityCard(QFrame):
         # Update sparkline if history provided
         if history is not None and len(history) > 1:
             self._history_data = history
-            # Determine color based on trend (last value vs first value)
-            if history[-1] > history[0]:
-                spark_color = COLORS['negative']  # Rising = more fear
+            # Determine color based on price direction (up = green, down = red)
+            if history[-1] >= history[0]:
+                spark_color = COLORS['positive']
             else:
-                spark_color = COLORS['positive']  # Falling = less fear
+                spark_color = COLORS['negative']
             self.sparkline.set_data(history, spark_color, median)
     
     def scale_to(self, scale: float):
@@ -3525,81 +3743,6 @@ class VolatilityCard(QFrame):
         
         # Scale sparkline
         self.sparkline.scale_to(scale)
-
-class SparklineWidget(QWidget):
-    """Mini sparkline chart widget for market watch - dynamically scalable."""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.prices = []
-        self.color = QColor(COLORS['positive'])
-        self._base_width = 50
-        self._base_height = 18
-        self.setMinimumSize(40, 14)
-    
-    def scale_to(self, scale: float):
-        """Scale the sparkline based on window size."""
-        width = max(40, int(self._base_width * scale))
-        height = max(14, int(self._base_height * scale))
-        self.setFixedSize(width, height)
-    
-    def set_data(self, prices: list, color: str = None):
-        """Set price data and color for sparkline."""
-        if color is None:
-            color = COLORS['positive']
-        self.prices = prices if prices else []
-        self.color = QColor(color)
-        self.update()
-    
-    def paintEvent(self, event):
-        """Draw the sparkline."""
-        if len(self.prices) < 2:
-            return
-        
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        # Calculate bounds
-        min_p = min(self.prices)
-        max_p = max(self.prices)
-        price_range = max_p - min_p if max_p != min_p else 1
-        
-        w = self.width()
-        h = self.height()
-        padding = 2
-        
-        # Create points
-        points = []
-        for i, price in enumerate(self.prices):
-            x = padding + (i / (len(self.prices) - 1)) * (w - 2 * padding)
-            y = h - padding - ((price - min_p) / price_range) * (h - 2 * padding)
-            points.append((x, y))
-        
-        # Draw filled area (gradient)
-        fill_color = QColor(self.color)
-        fill_color.setAlpha(50)
-        painter.setBrush(QBrush(fill_color))
-        painter.setPen(Qt.NoPen)
-        
-        polygon = QPolygonF()
-        polygon.append(QPointF(points[0][0], h))
-        for x, y in points:
-            polygon.append(QPointF(x, y))
-        polygon.append(QPointF(points[-1][0], h))
-        painter.drawPolygon(polygon)
-        
-        # Draw line
-        pen = QPen(self.color, 1.2)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        painter.setPen(pen)
-        
-        for i in range(len(points) - 1):
-            painter.drawLine(
-                QPointF(points[i][0], points[i][1]),
-                QPointF(points[i+1][0], points[i+1][1])
-            )
-
 
 class SectionHeader(QLabel):
     """Section header label with amber accent - dynamically scalable."""
@@ -3632,98 +3775,154 @@ class SectionHeader(QLabel):
         """)
 
 
-class CompactHMMCard(QFrame):
-    """Compact HMM Regime card matching VolatilityCard style."""
-    
-    def __init__(self, parent=None):
+
+
+class MarketDetailDialog(QDialog):
+    """Popup showing 5-day chart and stats for a market instrument."""
+
+    def __init__(self, data: dict, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(125)
-        self.setMinimumWidth(180)
+        name = data.get('name', '')
+        symbol = data.get('symbol', '')
+        self.setWindowTitle(f"{name} ({symbol})")
+        self.setMinimumSize(520, 420)
         self.setStyleSheet(f"""
-            QFrame {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(212, 165, 116, 0.06), 
-                    stop:1 {COLORS['bg_card']});
-                border: 1px solid {COLORS['border_subtle']};
-                border-left: 2px solid {COLORS['accent']};
-                border-radius: 4px;
+            QDialog {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_primary']};
             }}
-            QFrame:hover {{
-                border-color: {COLORS['accent_dark']};
-                border-left-color: {COLORS['accent_bright']};
+            QLabel {{
+                color: {COLORS['text_primary']};
+                background: transparent;
+                border: none;
             }}
         """)
-        
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(4)
-        
-        # Row 1: Header
-        header = QLabel("HIDDEN MARKOV MODEL REGIME")
-        header.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px; font-weight: 600; background: transparent; border: none;")
-        layout.addWidget(header)
-        
-        # Row 2: Regime name with icon
-        regime_row = QHBoxLayout()
-        regime_row.setSpacing(6)
-        self.regime_icon = QLabel("◉")
-        self.regime_icon.setStyleSheet(f"color: {COLORS['warning']}; font-size: 18px; background: transparent; border: none;")
-        regime_row.addWidget(self.regime_icon)
-        
-        self.regime_name = QLabel("NEUTRAL")
-        self.regime_name.setStyleSheet(f"color: {COLORS['warning']}; font-size: 16px; font-weight: 700; background: transparent; border: none;")
-        regime_row.addWidget(self.regime_name)
-        regime_row.addStretch()
-        layout.addLayout(regime_row)
-        
-        # Row 3: Confidence
-        self.confidence_label = QLabel("Confidence: --")
-        self.confidence_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
-        layout.addWidget(self.confidence_label)
-        
-        # Row 4: Duration
-        self.duration_label = QLabel("Duration: --")
-        self.duration_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
-        layout.addWidget(self.duration_label)
-        
-        # Row 5: Next regime forecast
-        self.forecast_label = QLabel("Next: --")
-        self.forecast_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
-        layout.addWidget(self.forecast_label)
-        
-        layout.addStretch()
-    
-    def update_regime(self, regime_name: str, confidence: float, duration: str, 
-                      next_regime: str, regime_color: str):
-        """Update the regime display."""
-        self.regime_icon.setStyleSheet(f"color: {regime_color}; font-size: 18px; background: transparent; border: none;")
-        self.regime_name.setText(regime_name)
-        self.regime_name.setStyleSheet(f"color: {regime_color}; font-size: 16px; font-weight: 700; background: transparent; border: none;")
-        self.confidence_label.setText(f"Confidence: {confidence:.0f}%")
-        self.duration_label.setText(f"Duration: {duration}")
-        
-        # Next regime with color
-        next_color = COLORS['positive'] if 'RISK-ON' in next_regime else (
-            COLORS['negative'] if 'RISK-OFF' in next_regime else COLORS['warning'])
-        self.forecast_label.setText(f"Next: ")
-        self.forecast_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
-        # Update to show colored next regime
-        self.forecast_label.setText(f"Next: {next_regime}")
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Title
+        title = QLabel(f"{name}  ({symbol})")
+        title.setStyleSheet(
+            f"color: {COLORS['accent']}; font-size: 18px; font-weight: 700;")
+        layout.addWidget(title)
+
+        # Chart (pyqtgraph)
+        history = data.get('history', [])
+        pg_mod = get_pyqtgraph()
+        if pg_mod and len(history) >= 2:
+            plot_widget = pg_mod.PlotWidget()
+            plot_widget.setBackground(COLORS['bg_card'])
+            plot_widget.setMinimumHeight(220)
+            plot_widget.showGrid(x=False, y=True, alpha=0.2)
+
+            closes = [h[1] for h in history]
+            xs = list(range(len(closes)))
+
+            color = COLORS['positive'] if closes[-1] >= closes[0] else COLORS['negative']
+            pen = pg_mod.mkPen(color=color, width=2)
+            plot_widget.plot(xs, closes, pen=pen)
+
+            # Date labels on x-axis
+            ax = plot_widget.getAxis('bottom')
+            step = max(1, len(history) // 5)
+            ticks = [(i, history[i][0]) for i in range(0, len(history), step)]
+            ax.setTicks([ticks])
+
+            layout.addWidget(plot_widget)
+        else:
+            no_chart = QLabel("No chart data available")
+            no_chart.setAlignment(Qt.AlignCenter)
+            no_chart.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 13px;")
+            layout.addWidget(no_chart)
+
+        # Stats grid
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet(
+            f"background: {COLORS['bg_elevated']}; "
+            f"border: 1px solid {COLORS['border_default']}; border-radius: 4px;")
+        stats_grid = QGridLayout(stats_frame)
+        stats_grid.setContentsMargins(12, 10, 12, 10)
+        stats_grid.setSpacing(8)
+
+        price = data.get('price', 0)
+        change_pct = data.get('change_pct', 0)
+        market = data.get('market', '')
+
+        if history and len(history) >= 2:
+            closes = [h[1] for h in history]
+            high_5d = max(closes)
+            low_5d = min(closes)
+            ret_5d = ((closes[-1] / closes[0]) - 1) * 100
+        else:
+            high_5d = low_5d = ret_5d = 0
+
+        price_fmt = f"{price:,.2f}" if price >= 100 else f"{price:.4f}"
+        stats = [
+            ("Region", market),
+            ("Current Price", price_fmt),
+            ("Daily Change", f"{'+' if change_pct >= 0 else ''}{change_pct:.2f}%"),
+            ("5-Day High", f"{high_5d:,.2f}" if high_5d >= 100 else f"{high_5d:.4f}"),
+            ("5-Day Low", f"{low_5d:,.2f}" if low_5d >= 100 else f"{low_5d:.4f}"),
+            ("5-Day Return", f"{'+' if ret_5d >= 0 else ''}{ret_5d:.2f}%"),
+        ]
+
+        for i, (label_text, value_text) in enumerate(stats):
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+            val = QLabel(str(value_text))
+
+            if 'Change' in label_text or 'Return' in label_text:
+                try:
+                    num = float(value_text.replace('%', '').replace('+', ''))
+                    c = COLORS['positive'] if num >= 0 else COLORS['negative']
+                except ValueError:
+                    c = COLORS['text_primary']
+                val.setStyleSheet(
+                    f"color: {c}; font-size: 14px; font-weight: 600; "
+                    f"font-family: 'JetBrains Mono', monospace;")
+            else:
+                val.setStyleSheet(
+                    f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: 600; "
+                    f"font-family: 'JetBrains Mono', monospace;")
+
+            stats_grid.addWidget(lbl, i, 0)
+            stats_grid.addWidget(val, i, 1)
+
+        layout.addWidget(stats_frame)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_elevated']};
+                border: 1px solid {COLORS['border_default']};
+                padding: 8px 24px;
+                color: {COLORS['text_secondary']};
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['bg_hover']};
+                color: {COLORS['accent']};
+            }}
+        """)
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
 
 
 class NewsItem(QFrame):
-    """Compact news item widget - shows only title, ticker and time - dynamically scalable."""
-    
+    """Compact single-row news item - [title] [TICKER badge] [time] on one line."""
+
     clicked = Signal(str)  # Emits URL when clicked
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.url = ""
-        self._base_ticker_size = (50, 25)
-        self._base_time_size = (50, 25)
         self._base_font_size = 13
-        
+
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(36)
         self.setStyleSheet(f"""
             QFrame {{
                 background: {COLORS['bg_card']};
@@ -3733,83 +3932,77 @@ class NewsItem(QFrame):
                 border-radius: 2px;
             }}
         """)
-       
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(8)
-        
-        # Title (takes most space)
+
+        # Title (single line, elided — full text in tooltip)
         self.title_label = QLabel("")
         self.title_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; background: transparent; border: none;")
-        self.title_label.setWordWrap(True)
+        self.title_label.setWordWrap(False)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(self.title_label, stretch=1)
-        
-        # Ticker (small badge)
+
+        # Ticker badge — guaranteed minimum width so it's always visible
         self.ticker_label = QLabel("")
         self.ticker_label.setStyleSheet(f"""
             QLabel {{
                 color: {COLORS['accent']};
                 border: 1px solid {COLORS['accent']};
                 font-size: 11px;
-                font-weight: 600;
-                padding: 2px 5px;
+                font-weight: 700;
+                padding: 2px 6px;
                 border-radius: 3px;
             }}
         """)
         self.ticker_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.ticker_label.setMinimumSize(40, 20)
-        
+        self.ticker_label.setMinimumWidth(50)
+        self.ticker_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         layout.addWidget(self.ticker_label)
-                
-        # Time (right side)
+
+        # Time label — fixed width so it's always visible
         self.time_label = QLabel("")
-        self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; background: transparent; border: none; text-align: center;")
-        self.time_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.time_label.setMinimumSize(40, 20)
+        self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; background: transparent; border: none;")
+        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_label.setMinimumWidth(40)
+        self.time_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         layout.addWidget(self.time_label)
-    
+
     def scale_to(self, scale: float):
         """Scale the news item based on window size."""
-        # Scale ticker badge
-        tw = max(40, int(self._base_ticker_size[0] * scale))
-        th = max(20, int(self._base_ticker_size[1] * scale))
-        self.ticker_label.setFixedSize(tw, th)
-        
-        # Scale time label
-        self.time_label.setFixedSize(tw, th)
-        
-        # Scale fonts
-        title_font = max(11, int(self._base_font_size * scale))
-        badge_font = max(9, int(11 * scale))
-        
+        title_font = max(12, int(self._base_font_size * scale))
+        badge_font = max(10, int(11 * scale))
+        h = max(32, int(36 * scale))
+        self.setFixedHeight(h)
+
         self.title_label.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: {title_font}px; background: transparent; border: none;")
         self.ticker_label.setStyleSheet(f"""
             QLabel {{
                 color: {COLORS['accent']};
                 border: 1px solid {COLORS['accent']};
                 font-size: {badge_font}px;
-                font-weight: 600;
-                padding: 2px 5px;
+                font-weight: 700;
+                padding: 2px 6px;
                 border-radius: 3px;
             }}
         """)
-        self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {badge_font}px; background: transparent; border: none; text-align: center;")
-    
+        self.time_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {max(9, int(11 * scale))}px; background: transparent; border: none;")
+
     def set_news(self, title: str, time_str: str, url: str, ticker: str):
         """Set the news item data."""
-    
         self.title_label.setText(title)
+        self.title_label.setToolTip(title)
         self.time_label.setText(time_str)
-    
+
         self.url = url
         self.ticker = ticker or ""
-    
-        # Tooltip shows full ticker
+
+        # Show ticker up to 8 chars in badge, full in tooltip
+        self.ticker_label.setText(self.ticker[:8])
         self.ticker_label.setToolTip(self.ticker)
-    
-        # Show max 5 chars in badge
-        self.ticker_label.setText(self.ticker[:5])
-    
+
     def mousePressEvent(self, event):
         """Handle click to open URL."""
         if self.url:
@@ -4018,9 +4211,10 @@ class NewsFeedWorker(QObject):
                     except Exception as e:
                         pass  # Skip failed tickers
             
-            # Sort by timestamp (newest first)
+            # Sort by timestamp (newest first) and cap at 500 items
             all_news.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
-            
+            all_news = all_news[:500]
+
             # Save to cache
             save_news_cache(all_news)
             
@@ -4080,8 +4274,8 @@ class NewsFeedWidget(QWidget):
         
         # Refresh button with visible icon
         self.refresh_btn = QPushButton("↻")
-        self._base_btn_size = 25
-        self.refresh_btn.setMinimumSize(22, 22)
+        self._base_btn_size = 30
+        self.refresh_btn.setFixedSize(30, 30)
         
         self.refresh_btn.setStyleSheet(f"""
             QPushButton {{
@@ -4089,10 +4283,10 @@ class NewsFeedWidget(QWidget):
                 border: 1px solid {COLORS['border_default']};
                 border-radius: 4px;
                 color: {COLORS['text_secondary']};
-                font-size: 10px;
+                font-size: 14px;
                 font-weight: bold;
             }}
-        
+
             QPushButton:hover {{
                 background: {COLORS['bg_hover']};
                 border-color: {COLORS['accent']};
@@ -4146,7 +4340,7 @@ class NewsFeedWidget(QWidget):
     def scale_to(self, scale: float):
         """Scale the news feed widget based on window size."""
         # Scale refresh button
-        btn_size = max(22, int(self._base_btn_size * scale))
+        btn_size = max(28, int(self._base_btn_size * scale))
         self.refresh_btn.setFixedSize(btn_size, btn_size)
         
         # Scale all news items
@@ -4243,7 +4437,89 @@ class NewsFeedWidget(QWidget):
 
 class PairsTradingTerminal(QMainWindow):
     """Main application window matching Streamlit layout."""
-    
+
+    # All 72 market instruments for treemap (used by WS startup + treemap rendering)
+    MARKET_INSTRUMENTS = {
+        # America
+        '^GSPC': ('S&P 500', 'AMERICA'),
+        '^NDX': ('NASDAQ 100', 'AMERICA'),
+        '^DJI': ('Dow Jones', 'AMERICA'),
+        '^RUT': ('Russell 2000', 'AMERICA'),
+        '^GSPTSE': ('Toronto', 'AMERICA'),
+        '^MXX': ('Mexico City', 'AMERICA'),
+        '^BVSP': ('São Paulo', 'AMERICA'),
+        '^MERV': ('Buenos Aires', 'AMERICA'),
+        '^IPSA': ('Santiago', 'AMERICA'),
+        '^COLO-IV': ('Bogotá', 'AMERICA'),
+        # Europe
+        '^FTSE': ('London', 'EUROPE'),
+        '^FCHI': ('Paris', 'EUROPE'),
+        '^STOXX': ('Europe 600', 'EUROPE'),
+        '^AEX': ('Amsterdam', 'EUROPE'),
+        '^GDAXI': ('Frankfurt', 'EUROPE'),
+        '^SSMI': ('Zürich', 'EUROPE'),
+        '^ATX': ('Vienna', 'EUROPE'),
+        '^IBEX': ('Madrid', 'EUROPE'),
+        'FTSEMIB.MI': ('Milano', 'EUROPE'),
+        'PSI20.LS': ('Lisbon', 'EUROPE'),
+        '^BFX': ('Brussels', 'EUROPE'),
+        '^ISEQ': ('Dublin', 'EUROPE'),
+        'XU100.IS': ('Istanbul', 'EUROPE'),
+        '^OMX': ('Stockholm', 'EUROPE'),
+        'OBX.OL': ('Oslo', 'EUROPE'),
+        '^OMXC25': ('Copenhagen', 'EUROPE'),
+        '^OMXH25': ('Helsinki', 'EUROPE'),
+        'WIG20.WA': ('Warsaw', 'EUROPE'),
+        # Middle East
+        '^TA125.TA': ('Tel Aviv', 'MIDDLE EAST'),
+        '^TASI.SR': ('Riyadh', 'MIDDLE EAST'),
+        'DFMGI.AE': ('Dubai', 'MIDDLE EAST'),
+        'FADGI.FGI': ('Abu Dhabi', 'MIDDLE EAST'),
+        '^GNRI.QA': ('Qatar', 'MIDDLE EAST'),
+        # Africa
+        '^JN0U.JO': ('Johannesburg', 'AFRICA'),
+        '^CASE30': ('Cairo', 'AFRICA'),
+        # Asia
+        '^N225': ('Tokyo', 'ASIA'),
+        '^HSI': ('Hong Kong', 'ASIA'),
+        '000001.SS': ('Shanghai', 'ASIA'),
+        '^KS11': ('Seoul', 'ASIA'),
+        '^TWII': ('Taipei', 'ASIA'),
+        '^NSEI': ('Nifty 50', 'ASIA'),
+        '^BSESN': ('Mumbai', 'ASIA'),
+        '^STI': ('Singapore', 'ASIA'),
+        '^JKSE': ('Jakarta', 'ASIA'),
+        '^KLSE': ('Kuala Lumpur', 'ASIA'),
+        '^SET50.BK': ('Bangkok', 'ASIA'),
+        '^VNINDEX.VN': ('Ho Chi Minh City', 'ASIA'),
+        'PSEI.PS': ('Manila', 'ASIA'),
+        '000300.SS': ('Shanghai', 'ASIA'),
+        '399106.SZ': ('Shenzen', 'ASIA'),
+        # Oceania
+        '^AXJO': ('Sydney', 'OCEANIA'),
+        '^NZ50': ('Wellington', 'OCEANIA'),
+        # Currencies
+        'EURUSD=X': ('EUR/USD', 'CURRENCIES'),
+        'EURSEK=X': ('EUR/SEK', 'CURRENCIES'),
+        'GBPUSD=X': ('GBP/USD', 'CURRENCIES'),
+        'USDJPY=X': ('USD/JPY', 'CURRENCIES'),
+        'USDCHF=X': ('USD/CHF', 'CURRENCIES'),
+        'AUDUSD=X': ('AUD/USD', 'CURRENCIES'),
+        'USDCAD=X': ('USD/CAD', 'CURRENCIES'),
+        'USDSEK=X': ('USD/SEK', 'CURRENCIES'),
+        # Commodities
+        'GC=F': ('Gold', 'COMMODITIES'),
+        'SI=F': ('Silver', 'COMMODITIES'),
+        'CL=F': ('Crude Oil', 'COMMODITIES'),
+        'NG=F': ('Natural Gas', 'COMMODITIES'),
+        'HG=F': ('Copper', 'COMMODITIES'),
+        # Yields
+        '^TNX': ('10Y Yield', 'YIELDS'),
+        '^FVX': ('5Y Yield', 'YIELDS'),
+        '^TYX': ('30Y Yield', 'YIELDS'),
+        '^IRX': ('3M Yield', 'YIELDS'),
+    }
+
     def __init__(self):
         super().__init__()
         
@@ -4257,7 +4533,6 @@ class PairsTradingTerminal(QMainWindow):
         
         # State
         self.engine: Optional[PairsTradingEngine] = None
-        self.detector: Optional[RegimeDetector] = None
         self.selected_pair: Optional[str] = None  # For analytics tab
         self.signal_selected_pair: Optional[str] = None  # For signals tab (separate to avoid conflicts)
         self.portfolio: List[Dict] = []
@@ -4290,19 +4565,34 @@ class PairsTradingTerminal(QMainWindow):
         self._market_watch_worker: Optional[MarketWatchWorker] = None
         self._market_watch_thread: Optional[QThread] = None
         self._market_watch_running = False  # Säker flagga istället för isRunning()
+        self._market_data_cache = {}  # Cache for treemap click detail popups
         self._startup_complete = False  # Förhindra market watch innan startup är klar
-        
-        # OPTIMERING: Cache för marknadsdata (visa stängda marknader med senaste data)
-        self._market_data_cache: Optional[pd.DataFrame] = None  # Cached close prices
-        self._all_instruments_full: Dict = {}  # Full instrument dict (alla marknader)
-        
+
+        # WebSocket live streaming
+        self._ws_worker: Optional[MarketWatchWebSocket] = None
+        self._ws_thread: Optional[QThread] = None
+        self._ws_cache_dirty = False
+        self._ws_changed_symbols = set()
+        self._ws_tick_history = {}          # symbol → [(timestamp, price), ...]
+        self._ws_treemap_rendered = False   # True after first treemap render from WS
+        self._ws_extra_info = {}            # symbol → {day_high, day_low, volume, prev_close, open}
+        self._intraday_ohlc_seed = {}       # symbol → [[ts, O, H, L, C], ...] from yf.download
+        self._intraday_worker = None
+        self._intraday_thread = None
+
         self._volatility_worker: Optional[VolatilityDataWorker] = None
         self._volatility_thread: Optional[QThread] = None
         self._volatility_running = False  # Säker flagga
         self._portfolio_refresh_worker: Optional[PortfolioRefreshWorker] = None
         self._portfolio_refresh_thread: Optional[QThread] = None
         self._portfolio_refresh_running = False  # Säker flagga
-        
+
+        # Markov chain analysis state
+        self._markov_thread: Optional[QThread] = None
+        self._markov_worker = None
+        self._markov_running = False
+        self._markov_result = None
+
         # OPTIMERING: Metrics initieras som None (skapas i lazy-loaded tabs)
         self.tickers_metric: Optional[QFrame] = None
         self.pairs_metric: Optional[QFrame] = None
@@ -4321,26 +4611,27 @@ class PairsTradingTerminal(QMainWindow):
         
         # =====================================================================
         # INDEPENDENT REFRESH TIMERS
-        # Market watch + volatility: chained (both use yf.download), 5 min
+        # Treemap: WebSocket live (no periodic yf.download)
+        # Portfolio: periodic refresh every 60 min
         # News: fully independent (uses Ticker.news endpoint), 15 min
         # Watchdog: force-resets stuck thread flags, 30s check interval
         # =====================================================================
-        
-        # Market watch + volatility: every 5 minutes
+
+        # Portfolio refresh: every 60 minutes (treemap handled by WS)
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_data)
-        self.auto_refresh_timer.start(300000)  # 5 minutes
+        self.auto_refresh_timer.start(3600000)  # 60 minutes
         
         # Portfolio & engine cache sync timer (90 seconds) - for Google Drive sync
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self.sync_from_drive)
         self.sync_timer.start(90000)  # 90 seconds
-        
-        # Check for scheduled HMM update every minute
-        self.hmm_schedule_timer = QTimer(self)
-        self.hmm_schedule_timer.timeout.connect(self.check_hmm_schedule)
-        self.hmm_schedule_timer.start(60000)  # 1 minute
-        
+
+        # Check for scheduled scan every minute (22:00 weekdays)
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.timeout.connect(self.check_scheduled_scan)
+        self.schedule_timer.start(60000)  # 1 minute
+
         # News feed: every 15 minutes (defers if yfinance busy)
         self.news_refresh_timer = QTimer(self)
         self.news_refresh_timer.timeout.connect(self._refresh_news_feed_safe)
@@ -4350,10 +4641,12 @@ class PairsTradingTerminal(QMainWindow):
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.timeout.connect(self._watchdog_check)
         self._watchdog_timer.start(30000)  # 30 seconds
-        
-        # Track last HMM update date
-        self.last_hmm_update_date = None
-        
+
+        # WebSocket: batch-render treemap updates every 5 seconds
+        self._ws_render_timer = QTimer(self)
+        self._ws_render_timer.timeout.connect(self._render_ws_updates)
+        self._ws_render_timer.start(5000)
+
         # Apply initial dynamic layout after window is shown
         QTimer.singleShot(200, self._apply_dynamic_layout)
     
@@ -4379,7 +4672,15 @@ class PairsTradingTerminal(QMainWindow):
                 QTimer.singleShot(0, self._force_activate_window)
         
         super().changeEvent(event)
-    
+
+    def closeEvent(self, event):
+        """Clean up WebSocket and threads on app close."""
+        self._stop_market_websocket()
+        if self._intraday_thread is not None and self._intraday_thread.isRunning():
+            self._intraday_thread.quit()
+            self._intraday_thread.wait(2000)
+        super().closeEvent(event)
+
     def _force_activate_window(self):
         """Force window activation on Windows.
         
@@ -4559,10 +4860,7 @@ class PairsTradingTerminal(QMainWindow):
             
             # ─── NEWS ITEMS ───
             self._apply_news_item_scaling(scale)
-            
-            # ─── MARKET WATCH SPARKLINES ───
-            self._apply_market_sparkline_scaling(scale)
-            
+
             # ─── OU ANALYTICS METRIC CARDS ───
             self._apply_ou_metric_scaling(scale)
             
@@ -4694,16 +4992,6 @@ class PairsTradingTerminal(QMainWindow):
         except Exception as e:
             pass  # Silently ignore news item scaling errors
     
-    def _apply_market_sparkline_scaling(self, scale: float):
-        """Apply scaling to market watch sparklines."""
-        try:
-            # Find all SparklineWidget instances
-            for child in self.findChildren(QWidget):
-                if child.__class__.__name__ == 'SparklineWidget' and hasattr(child, 'scale_to'):
-                    child.scale_to(scale)
-        except Exception as e:
-            pass  # Silently ignore market sparkline scaling errors
-    
     def _apply_ou_metric_scaling(self, scale: float):
         """Apply scaling to OU analytics metric cards."""
         try:
@@ -4725,49 +5013,23 @@ class PairsTradingTerminal(QMainWindow):
             pass  # Silently ignore OU metric scaling errors
     
     def auto_refresh_data(self):
-        """Auto-refresh market watch + portfolio (every 5 minutes).
-        
-        Market watch fetches all indices/macro via yf.download.
-        When it completes, volatility refresh chains automatically.
-        News runs on its own independent 15-minute timer.
+        """Auto-refresh portfolio (every 60 min). Treemap uses WebSocket live data.
+        Volatility percentiles refreshed independently at startup.
         """
         if not self._startup_complete:
             return
-        
+
         try:
-            self.refresh_market_watch(force_full=True)
             self._auto_refresh_portfolio()
             self.last_updated_label.setText(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         except Exception as e:
             print(f"[AutoRefresh] Error: {e}")
     
     def _watchdog_check(self):
-        """Watchdog: reset stuck flags so the next timer cycle isn't blocked.
-        
-        CRITICAL SAFETY RULES:
-        1. NEVER call thread.terminate() — it kills the Python interpreter
-        2. NEVER set thread/worker to None — let the finish handler do cleanup
-           (otherwise old thread continues running and we start a new one = parallel chaos)
-        3. Only reset the _running flag — the isRunning() guard in refresh methods
-           prevents starting new threads while the old one is still alive
-        """
+        """Watchdog: reset stuck flags so the next timer cycle isn't blocked."""
         now = time.time()
-        
-        # Market watch: if flag stuck but thread already finished, just reset flag
-        if self._market_watch_running:
-            elapsed = now - getattr(self, '_market_watch_last_start', now)
-            # Only reset if thread is actually dead (not just slow)
-            thread = self._market_watch_thread
-            if thread is not None and not thread.isRunning():
-                print(f"[Watchdog] Market watch flag stuck (thread dead, {elapsed:.0f}s) — resetting")
-                self._market_watch_running = False
-            elif elapsed > 300:
-                # Thread still alive after 5 min — flag reset allows next cycle
-                # but isRunning() guard prevents starting parallel thread
-                print(f"[Watchdog] Market watch flag reset ({elapsed:.0f}s) — thread still alive, will skip next start")
-                self._market_watch_running = False
-        
-        # Volatility: same logic
+
+        # Volatility: reset flag if thread died
         if self._volatility_running:
             elapsed = now - getattr(self, '_volatility_last_start', now)
             thread = self._volatility_thread
@@ -4859,7 +5121,7 @@ class PairsTradingTerminal(QMainWindow):
         """Handle portfolio refresh error."""
         pass
     
-    def check_hmm_schedule(self):
+    def check_scheduled_scan(self):
         """Check if it's time to run scheduled scan (22:00 weekdays)."""
         now = datetime.now()
         
@@ -4937,7 +5199,7 @@ class PairsTradingTerminal(QMainWindow):
             print(f"Snapshot error: {e}")
 
     def run_scheduled_scan(self):
-        """Run the full scheduled scan: load CSV, analyze pairs, fit HMM, send to Discord."""
+        """Run the full scheduled scan: load CSV, analyze pairs, send to Discord."""
         try:
             print(f"[SCHEDULED SCAN] === Starting scheduled scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
             
@@ -5077,7 +5339,7 @@ class PairsTradingTerminal(QMainWindow):
         self._discord_thread.start()
     
     def send_scan_results_to_discord(self):
-        """Send pair scan and HMM results to Discord."""
+        """Send pair scan results to Discord."""
         if self.engine is None:
             return
         
@@ -5087,44 +5349,11 @@ class PairsTradingTerminal(QMainWindow):
             n_pairs = len(self.engine.pairs_stats) if self.engine.pairs_stats is not None else 0
             n_viable = len(self.engine.viable_pairs) if self.engine.viable_pairs is not None else 0
             
-            # Get regime info (supports both old and advanced detector)
-            regime_text = "Not fitted"
-            regime_color = 0x888888
-            change_forecast_text = ""
-            
-            if self.detector is not None:
-                try:
-                    # Try advanced detector first
-                    regime_data = self.detector.get_current_regime()
-                    primary = regime_data['primary']
-                    current_state = primary['state_id']
-                    regime_info = REGIMES[current_state]
-                    prob = primary['probability']
-                    regime_text = f"{regime_info['name']} ({prob:.0%})"
-                    regime_color = int(regime_info['color'].replace('#', ''), 16)
-                    
-                    # Add change forecast
-                    forecast = regime_data.get('change_forecast', {})
-                    if forecast:
-                        change_forecast_text = (
-                            f"Most likely next: {forecast.get('most_likely_next', 'N/A')}"
-                        )
-                except Exception as e:
-                    # Fallback to old detector format
-                    if hasattr(self.detector, 'states') and self.detector.states is not None and len(self.detector.states) > 0:
-                        current_state = self.detector.states.iloc[-1]
-                        regime_info = REGIMES[current_state]
-                        prob = self.detector.regime_probs[-1, current_state]
-                        regime_text = f"**{regime_info['name']}** ~{prob:.0%} Confidence"
-                        regime_color = int(regime_info['color'].replace('#', ''), 16)
-            
             # Build fields for embed
             fields = [
                 {"name": "Tickers Analyzed", "value": str(n_tickers), "inline": True},
                 {"name": "Pairs Tested", "value": str(n_pairs), "inline": True},
                 {"name": "Viable Pairs", "value": str(n_viable), "inline": True},
-                {"name": "📊 Current Market Regime", "value": regime_text, "inline": False},
-                {"name": "🔮 Regime Change Forecast", "value": change_forecast_text, "inline": False},
             ]
             
             # === LIVE Portfolio status (calculated from current self.portfolio) ===
@@ -5180,7 +5409,7 @@ class PairsTradingTerminal(QMainWindow):
             self.send_discord_notification(
                 title="📈 Daily Scan Complete",
                 description=f"Analyzed {n_tickers} tickers → {n_viable} viable pairs found",
-                color=regime_color,
+                color=0x3b82f6,
                 fields=fields,
                 footer="Klippinge Investment Trading Terminal"
             )
@@ -5432,17 +5661,7 @@ class PairsTradingTerminal(QMainWindow):
         analysis_menu.addAction(run_analysis_action)
         
         analysis_menu.addSeparator()
-        
-        fit_hmm_action = QAction("Fit HMM Model", self)
-        fit_hmm_action.triggered.connect(self.fit_hmm_model)
-        analysis_menu.addAction(fit_hmm_action)
-        
-        load_hmm_action = QAction("Reload HMM Model", self)
-        load_hmm_action.triggered.connect(self.load_cached_hmm)
-        analysis_menu.addAction(load_hmm_action)
-        
-        analysis_menu.addSeparator()
-        
+
         scheduled_scan_action = QAction("Run Scheduled Scan Now", self)
         scheduled_scan_action.triggered.connect(self.run_scheduled_scan)
         analysis_menu.addAction(scheduled_scan_action)
@@ -5464,7 +5683,7 @@ class PairsTradingTerminal(QMainWindow):
         
         refresh_market_action = QAction("Refresh Market Watch", self)
         refresh_market_action.setShortcut("F5")
-        refresh_market_action.triggered.connect(lambda: self.refresh_market_watch(force_full=True))
+        refresh_market_action.triggered.connect(self.refresh_market_watch)
         data_menu.addAction(refresh_market_action)
         
         refresh_vol_action = QAction("Refresh Volatility Data", self)
@@ -5501,6 +5720,7 @@ class PairsTradingTerminal(QMainWindow):
             2: False,  # OU Analytics
             3: False,  # Pair Signals (tung - MS scraping)
             4: False,  # Portfolio
+            5: False,  # Markov Chains
         }
         
         # Spara container-widgets för lazy loading
@@ -5521,7 +5741,10 @@ class PairsTradingTerminal(QMainWindow):
         
         self._tab_containers[4] = self._create_lazy_container("PORTFOLIO")
         self.tabs.addTab(self._tab_containers[4], "|≡| PORTFOLIO")
-        
+
+        self._tab_containers[5] = self._create_lazy_container("MARKOV CHAINS")
+        self.tabs.addTab(self._tab_containers[5], "|⛓| MARKOV CHAINS")
+
         # Koppla signal för lazy loading
         self.tabs.currentChanged.connect(self._on_tab_changed)
         
@@ -5595,6 +5818,7 @@ class PairsTradingTerminal(QMainWindow):
             2: self.create_ou_analytics_tab,
             3: self.create_signals_tab,
             4: self.create_portfolio_tab,
+            5: self.create_markov_chains_tab,
         }
         
         if index in tab_creators:
@@ -5645,193 +5869,106 @@ class PairsTradingTerminal(QMainWindow):
     # ========================================================================
     
     def create_market_overview_tab(self) -> QWidget:
-        """Create Market Overview tab with new layout."""
+        """Create Market Overview tab with treemap heatmap + vol cards + news feed."""
         tab = QWidget()
         main_layout = QHBoxLayout(tab)
         main_layout.setSpacing(18)
         main_layout.setContentsMargins(15, 15, 15, 15)
-        
-        # LEFT: Market Watch (scrollable list)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        
-        left_layout.addWidget(SectionHeader("GLOBAL MARKETS"),
-                              alignment=Qt.AlignCenter)
-        
-        self.market_scroll = QScrollArea()
-        self.market_scroll.setWidgetResizable(True)
-        self.market_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.market_scroll.setStyleSheet("QScrollArea { border: none; }")
-        
-        self.market_list = QWidget()
-        self.market_list_layout = QVBoxLayout(self.market_list)
-        self.market_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.market_list_layout.setSpacing(4)  # Ökat från 2 för mer luft
-        
-        self.market_items = {}
-        
-        self.market_scroll.setWidget(self.market_list)
-        left_layout.addWidget(self.market_scroll)
-        
-        left_panel.setMinimumWidth(300)
-        left_panel.setMaximumWidth(380)
-        main_layout.addWidget(left_panel, stretch=2)
-        
-        # CENTER: Map + Volatility cards below
+
+        # CENTER: Treemap heatmap + Volatility cards below
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(10)
-        
-        # Map container
+
+        # Treemap container
         map_container = QFrame()
         map_container.setStyleSheet("background-color: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 4px;")
         map_layout = QVBoxLayout(map_container)
         map_layout.setContentsMargins(0, 0, 0, 0)
         map_layout.setSpacing(0)
-        
-        # Try to use QWebEngineView for Plotly map
+
+        # Use QWebEngineView for Plotly treemap
         if WEBENGINE_AVAILABLE and QWebEngineView is not None:
             self.map_widget = QWebEngineView()
+            # Enable local file:// pages to load remote https:// resources (CDN)
+            settings = self.map_widget.settings()
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            # Capture JS console messages and intercept treemap clicks via console.log
+            main_window_ref = self
+
+            class _TreemapPage(QWebEnginePage):
+                def __init__(self, main_win, parent=None):
+                    super().__init__(parent)
+                    self._main_window = main_win
+
+                def javaScriptConsoleMessage(self, level, msg, line, src):
+                    # Intercept click signals sent via console.log
+                    if msg.startswith('TREEMAP_CLICK:'):
+                        ticker = msg[len('TREEMAP_CLICK:'):]
+                        if hasattr(self._main_window, '_on_treemap_click'):
+                            self._main_window._on_treemap_click(ticker)
+                        return
+                    print(f'[Treemap JS] {msg} (line {line})')
+
+            treemap_page = _TreemapPage(main_window_ref, self.map_widget)
+            self.map_widget.setPage(treemap_page)
             self.map_widget.setStyleSheet("background-color: #0a0a0a;")
             self.map_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.update_plotly_map([])
+            self.update_treemap_heatmap([])
             map_layout.addWidget(self.map_widget, stretch=1)
         else:
-            if ensure_pyqtgraph():
-                self.map_widget = pg.PlotWidget()
-                self.map_widget.setBackground('#0d0d0d')
-                self.map_widget.hideAxis('left')
-                self.map_widget.hideAxis('bottom')
-                self.map_widget.setMouseEnabled(x=False, y=False)
-                self.market_scatter = pg.ScatterPlotItem(size=12, pen=pg.mkPen(None))
-                self.map_widget.addItem(self.market_scatter)
-                map_layout.addWidget(self.map_widget, stretch=1)
-            else:
-                map_placeholder = QLabel("🌍 World Map\n(Install PyQtWebEngine)")
-                map_placeholder.setAlignment(Qt.AlignCenter)
-                map_placeholder.setStyleSheet("background-color: #111; color: #444;")
-                map_layout.addWidget(map_placeholder, stretch=1)
-        
+            map_placeholder = QLabel("Treemap Heatmap\n(Install PyQtWebEngine)")
+            map_placeholder.setAlignment(Qt.AlignCenter)
+            map_placeholder.setStyleSheet("background-color: #111; color: #444;")
+            map_layout.addWidget(map_placeholder, stretch=1)
+
         # Last updated label
         self.last_updated_label = QLabel(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         self.last_updated_label.setStyleSheet("color: #444444; font-size: 10px; border: none; background: transparent; padding: 2px 5px;")
         self.last_updated_label.setAlignment(Qt.AlignRight)
         map_layout.addWidget(self.last_updated_label)
-        
+
         center_layout.addWidget(map_container, stretch=1)
-        
-        # Volatility Cards (4 horizontal cards below map)
+
+        # Volatility Cards (4 horizontal cards below treemap)
         vol_section = QWidget()
         vol_section_layout = QVBoxLayout(vol_section)
         vol_section_layout.setContentsMargins(0, 0, 0, 0)
         vol_section_layout.setSpacing(8)
-        
+
         vol_header = QLabel("VOLATILITY & RISK")
         vol_header.setStyleSheet(f"color: {COLORS['accent']}; font-size: 14px; font-weight: 700; letter-spacing: 2px; padding-top: 6px; border-top: 2px solid {COLORS['accent']};")
         vol_section_layout.addWidget(vol_header)
-        
+
         vol_cards_row = QHBoxLayout()
         vol_cards_row.setSpacing(10)
-        
+
         self.vix_card = VolatilityCard("^VIX", "VIX", "Fear Index")
         vol_cards_row.addWidget(self.vix_card)
-        
+
         self.vvix_card = VolatilityCard("^VVIX", "VVIX", "Vol of Vol")
         vol_cards_row.addWidget(self.vvix_card)
-        
+
         self.skew_card = VolatilityCard("^SKEW", "SKEW", "Tail Risk")
         vol_cards_row.addWidget(self.skew_card)
-        
+
         self.move_card = VolatilityCard("^MOVE", "MOVE", "Bond Vol")
         vol_cards_row.addWidget(self.move_card)
-        
-        # Compact HMM Regime card (next to MOVE)
-        self.hmm_compact_card = CompactHMMCard()
-        vol_cards_row.addWidget(self.hmm_compact_card)
-        
+
         vol_section_layout.addLayout(vol_cards_row)
         center_layout.addWidget(vol_section)
-        
-        # Center panel now takes more space since HMM moved
+
         center_panel.setMinimumWidth(600)
-        main_layout.addWidget(center_panel, stretch=6)
-        
-        # RIGHT: News Feed (replaces old HMM panel)
+        main_layout.addWidget(center_panel, stretch=7)
+
+        # RIGHT: News Feed
         self.news_feed = NewsFeedWidget()
         self.news_feed.setMinimumWidth(300)
         self.news_feed.setMaximumWidth(380)
         self.news_feed.refresh_btn.clicked.connect(self._refresh_news_feed)
-        main_layout.addWidget(self.news_feed, stretch=2)
-        
-        # Create hidden regime widgets for compatibility with update methods
-        # These are not displayed but needed for existing update_regime_display() logic
-        self._hidden_regime_container = QWidget()
-        _hidden_layout = QVBoxLayout(self._hidden_regime_container)
-        
-        self.regime_frame = QFrame()
-        self.regime_icon_label = QLabel("◉")
-        self.regime_name_label = QLabel("Loading...")
-        self.regime_prob_label = QLabel("Confidence: --")
-        self.regime_desc_label = QLabel("")
-        
-        # Forecast widgets
-        self.next_regime_label = QLabel("--")
-        self.expected_change_label = QLabel("--")
-        self.expected_remaining_label = QLabel("--")
-        
-        # Stats widgets - MÅSTE matcha namnen i _update_regime_statistics_advanced()
-        self.regime_duration_label = QLabel("--")
-        self.regime_avg_duration_label = QLabel("--")
-        self.regime_transitions_label = QLabel("--")
-        self.regime_stability_label = QLabel("--")
-        self.regime_lookback_label = QLabel("--")
-        self.regime_window_label = QLabel("--")
-        
-        # Distribution widgets dict
-        self.regime_dist_labels = {
-            0: QLabel("--"),  # RISK-ON
-            1: QLabel("--"),  # NEUTRAL
-            2: QLabel("--"),  # RISK-OFF
-        }
-        
-        # Probability bars dict - used by _update_regime_statistics_advanced()
-        self.regime_prob_bars = {
-            0: QProgressBar(),  # RISK-ON
-            1: QProgressBar(),  # NEUTRAL
-            2: QProgressBar(),  # RISK-OFF
-        }
-        
-        # Alternative prob bars/labels used by some code paths
-        self.prob_bars = {
-            "RISK-ON": QProgressBar(),
-            "NEUTRAL": QProgressBar(),
-            "RISK-OFF": QProgressBar(),
-        }
-        self.prob_labels = {
-            "RISK-ON": QLabel("--"),
-            "NEUTRAL": QLabel("--"),
-            "RISK-OFF": QLabel("--"),
-        }
-        
-        # Change probability labels
-        self.change_prob_1d_label = QLabel("--")
-        self.change_prob_5d_label = QLabel("--")
-        self.change_prob_20d_label = QLabel("--")
-        
-        # Transition matrix labels dict (tuple keys)
-        self.trans_matrix_labels = {}
-        for i in range(3):
-            for j in range(3):
-                self.trans_matrix_labels[(i, j)] = QLabel("--")
-        
-        # Also keep old trans_labels for compatibility
-        self.trans_labels = [[QLabel("--") for _ in range(3)] for _ in range(3)]
-        self.expected_duration_legend = QLabel("")
-        
-        # Model status label
-        self.model_fitted_label = QLabel("Model: Not fitted")
+        main_layout.addWidget(self.news_feed, stretch=3)
         
         return tab
     
@@ -5877,49 +6014,6 @@ class PairsTradingTerminal(QMainWindow):
         lbl = QLabel(text)
         lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; font-weight: 600; font-family: 'JetBrains Mono', monospace; background: transparent;")
         return lbl
-    
-    def _normalize_probabilities(self, raw_probs: np.ndarray, min_prob: float = 0.01, max_prob: float = 0.90) -> np.ndarray:
-        """
-        Normalize probabilities with minimum and maximum constraints.
-        
-        Args:
-            raw_probs: Raw probability array
-            min_prob: Minimum probability for any state (default 1%)
-            max_prob: Maximum probability for any state (default 90%)
-        
-        Returns:
-            Normalized probabilities that sum to 1.0
-        """
-        n_states = len(raw_probs)
-        
-        # Step 1: Ensure minimum for all states
-        adjusted = np.maximum(raw_probs, min_prob)
-        
-        # Step 2: Cap maximum
-        adjusted = np.minimum(adjusted, max_prob)
-        
-        # Step 3: Normalize to sum to 1.0
-        total = adjusted.sum()
-        if total > 0:
-            normalized = adjusted / total
-        else:
-            normalized = np.ones(n_states) / n_states
-        
-        # Step 4: Iterative adjustment if max exceeded after normalization
-        for _ in range(10):  # Max iterations
-            if normalized.max() <= max_prob + 0.001:
-                break
-            excess = normalized.max() - max_prob
-            max_idx = normalized.argmax()
-            normalized[max_idx] = max_prob
-            # Redistribute excess proportionally to others
-            other_mask = np.arange(n_states) != max_idx
-            other_sum = normalized[other_mask].sum()
-            if other_sum > 0:
-                normalized[other_mask] += excess * (normalized[other_mask] / other_sum)
-            normalized = normalized / normalized.sum()
-        
-        return normalized
     
     # ========================================================================
     # TAB 2: ARBITRAGE SCANNER
@@ -6074,10 +6168,15 @@ class PairsTradingTerminal(QMainWindow):
         
         criteria_items = [
             "• Half-life: 5-60 days",
-            "• Engle-Granger p-value: ≤ 0.05",
-            "• Johansen trace ≥ 15.4943",
-            "• Hurst exponent: ≤ 0.50",
-            "• Correlation: ≥ 0.70"
+            "• Engle-Granger p-value: \u2264 0.05",
+            "• Johansen trace \u2265 15.4943",
+            "• Hurst exponent: \u2264 0.50",
+            "• Correlation: \u2265 0.70",
+            "\u2500\u2500 Kalman Validation \u2500\u2500",
+            "• Param stability: > 0.50",
+            "• Innovation ratio: [0.5, 2.0]",
+            "• Regime score: < 4.0",
+            "• \u03b8 significant at 95% CI",
         ]
         for item in criteria_items:
             lbl = QLabel(item)
@@ -6108,18 +6207,24 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.verticalHeader().setVisible(False)
         self.viable_table.verticalHeader().setDefaultSectionSize(44)  # Öka radhöjd ytterligare
 
-        self.viable_table.setColumnCount(6)
+        self.viable_table.setColumnCount(10)
         self.viable_table.setHorizontalHeaderLabels([
-            "Pair", "Half-life (days)", "Engle-Granger p-value", "Johansen trace", "Hurst exponent", "Correlation"
+            "Pair", "Half-life (days)", "EG p-value", "Johansen trace",
+            "Hurst", "Correlation",
+            "Kalman Stab.", "Innov. Ratio", "Regime Score", "\u03b8 Sig."
         ])
         # Tooltips for scanner columns
         _scanner_tips = [
-            "Stock pair Y/X. Spread = Y - β·X - α",
-            "Days for spread to move halfway to equilibrium.\nln(2)/θ × 252. Ideal: 5-60 days.",
+            "Stock pair Y/X. Spread = Y - \u03b2\u00b7X - \u03b1",
+            "Days for spread to move halfway to equilibrium.\nln(2)/\u03b8 \u00d7 252. Ideal: 5-60 days.",
             "Engle-Granger cointegration p-value.\np < 0.05 = significant mean reversion.",
             "Johansen trace statistic.\nHigher = stronger cointegration evidence.",
-            "Hurst exponent. H < 0.5 = mean-reverting (good).\nH ≈ 0.5 = random walk. H > 0.5 = trending.",
+            "Hurst exponent. H < 0.5 = mean-reverting (good).\nH \u2248 0.5 = random walk. H > 0.5 = trending.",
             "Pearson correlation between Y and X.\nHigher = more stable hedge. > 0.8 desirable.",
+            "Kalman parameter stability [0-1].\n1 = perfectly stable \u03b8. > 0.5 required.",
+            "Normalized innovation ratio.\nShould be \u22481.0 (valid range [0.5, 2.0]).",
+            "CUSUM regime change score.\n< 4.0 = no structural break detected.",
+            "Is \u03b8 (mean-reversion speed)\nstatistically significant at 95% CI?",
         ]
         for col, tip in enumerate(_scanner_tips):
             item = self.viable_table.horizontalHeaderItem(col)
@@ -6249,7 +6354,12 @@ class PairsTradingTerminal(QMainWindow):
         
         self.ou_pair_combo = QComboBox()
         self.ou_pair_combo.setMinimumWidth(200)
+        self.ou_pair_combo.setEditable(True)
+        self.ou_pair_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.ou_pair_combo.completer().setFilterMode(Qt.MatchContains)
+        self.ou_pair_combo.completer().setCompletionMode(QCompleter.PopupCompletion)
         self.ou_pair_combo.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333; padding: 6px;")
+        self.ou_pair_combo.lineEdit().setPlaceholderText("Search pair...")
         self.ou_pair_combo.currentTextChanged.connect(self.on_ou_pair_changed)
         selector_layout.addWidget(self.ou_pair_combo)
         
@@ -6282,7 +6392,7 @@ class PairsTradingTerminal(QMainWindow):
         # =========================
         # OU Parameters
         # =========================
-        left_layout.addWidget(SectionHeader("ORNSTEIN-UHLENBECK DETAILS"))
+        left_layout.addWidget(SectionHeader("OU DETAILS"))
         
         self.ou_theta_card = MetricCard("MEAN REVERSION", "-",
             tooltip="θ — Speed of mean reversion (annualized).\nHigher = faster reversion. Typical: 5-100.")
@@ -6403,17 +6513,14 @@ class PairsTradingTerminal(QMainWindow):
             bottom_hlayout.setSpacing(10)
             bottom_hlayout.setContentsMargins(0, 0, 0, 0)
             
-            # Z-score plot (wider — stretch 2 in row)
+            # Spread plot (wider — stretch 2 in row)
             zscore_col = QVBoxLayout()
-            zscore_col.addWidget(SectionHeader("SPREAD Z-SCORE"))
+            zscore_col.addWidget(SectionHeader("SPREAD (Y − β·X − α)"))
             
             self.ou_zscore_date_axis = DateAxisItem(orientation='bottom')
             self.ou_zscore_plot = pg.PlotWidget(axisItems={'bottom': self.ou_zscore_date_axis})
-            self.ou_zscore_plot.setLabel('left', 'Z')
+            self.ou_zscore_plot.setLabel('left', 'Spread')
             self.ou_zscore_plot.showGrid(x=False, y=False, alpha=0.3)
-            self.ou_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.ou_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.ou_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
             self.ou_zscore_plot.setMinimumHeight(100)
             self.ou_zscore_plot.setMouseEnabled(x=True, y=True)
             self.ou_zscore_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
@@ -6968,19 +7075,16 @@ class PairsTradingTerminal(QMainWindow):
             self.signal_price_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
             right_layout.addWidget(self.signal_price_plot, stretch=2)
             
-            # Z-score plot
-            zscore_header = QLabel("SPREAD Z-SCORE")
+            # Spread plot
+            zscore_header = QLabel("SPREAD (Y − β·X − α)")
             zscore_header.setStyleSheet(f"color: {COLORS['accent']}; font-size: 12px; font-weight: 700; letter-spacing: 1px;")
             right_layout.addWidget(zscore_header)
             
-            # Create date axis for zscore plot
+            # Create date axis for spread plot
             self.signal_zscore_date_axis = DateAxisItem(orientation='bottom')
             self.signal_zscore_plot = pg.PlotWidget(axisItems={'bottom': self.signal_zscore_date_axis})
-            self.signal_zscore_plot.setLabel('left', 'Z')
+            self.signal_zscore_plot.setLabel('left', 'Spread')
             self.signal_zscore_plot.showGrid(x=False, y=False, alpha=0.3)
-            self.signal_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.signal_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.signal_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
             self.signal_zscore_plot.setMinimumHeight(120)
             self.signal_zscore_plot.setMouseEnabled(x=True, y=True)
             self.signal_zscore_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
@@ -7413,32 +7517,10 @@ class PairsTradingTerminal(QMainWindow):
         
         header_layout.addStretch()
         
-        # Benchmark selector
-        bench_label = QLabel("Benchmark:")
+        # Benchmark label (always S&P 500)
+        bench_label = QLabel("Benchmark: S&P 500")
         bench_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
         header_layout.addWidget(bench_label)
-        
-        self.benchmark_combo = QComboBox()
-        self.benchmark_combo.addItems([
-            "SPY (S&P 500)", 
-            "QQQ (Nasdaq 100)", 
-            "IWM (Russell 2000)", 
-            "^OMX (OMX Stockholm)",
-            "^OMXS30 (OMXS30)"
-        ])
-        self.benchmark_combo.setStyleSheet(f"""
-            QComboBox {{
-                background: {COLORS['bg_hover']};
-                color: {COLORS['text_primary']};
-                border: 1px solid {COLORS['border_subtle']};
-                border-radius: 4px;
-                padding: 4px 8px;
-                min-width: 150px;
-                font-size: 11px;
-            }}
-        """)
-        self.benchmark_combo.currentIndexChanged.connect(self._on_benchmark_changed)
-        header_layout.addWidget(self.benchmark_combo)
         
         # Refresh button
         refresh_bench_btn = QPushButton("⟳ Update Analysis")
@@ -7511,24 +7593,43 @@ class PairsTradingTerminal(QMainWindow):
             }}
         """)
         
-        # Set column widths (10 columns)
+        # Dynamic column widths
         header = self.benchmark_stats_table.horizontalHeader()
-        self.benchmark_stats_table.setColumnWidth(0, 165)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         for i in range(1, 10):
-            self.benchmark_stats_table.setColumnWidth(i, 100)
-        header.setStretchLastSection(True)
+            header.setSectionResizeMode(i, QHeaderView.Stretch)
         
         self.benchmark_stats_table.verticalHeader().setVisible(False)
         self.benchmark_stats_table.setAlternatingRowColors(True)
         self.benchmark_stats_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         
+        # Tooltips for each metric
+        metric_tooltips = [
+            "Total return of your portfolio over the period",
+            "Total return of S&P 500 (SPY) over the same period",
+            "Excess return vs benchmark (Portfolio Return - Benchmark Return)",
+            "Pearson correlation between daily portfolio and benchmark returns",
+            "Portfolio sensitivity to benchmark moves (covariance / variance)",
+            "Risk-adjusted return of portfolio (excess return / std dev, annualized)",
+            "Risk-adjusted return of benchmark (excess return / std dev, annualized)",
+            "Std dev of return difference between portfolio and benchmark (annualized)",
+            "Risk-adjusted excess return vs benchmark (alpha / tracking error)",
+            "Largest peak-to-trough decline in portfolio value",
+            "Largest peak-to-trough decline in benchmark value",
+            "Like Sharpe but only penalizes downside volatility",
+            "Percentage of days with positive returns",
+            "Ratio of gross profits to gross losses",
+        ]
+
         # Initialize with metric names
         for i, metric in enumerate(metrics):
             item = QTableWidgetItem(metric)
             item.setForeground(QColor(COLORS['text_primary']))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            if i < len(metric_tooltips):
+                item.setToolTip(metric_tooltips[i])
             self.benchmark_stats_table.setItem(i, 0, item)
-            
+
             # Initialize other columns with "-"
             for j in range(1, 10):
                 dash_item = QTableWidgetItem("-")
@@ -7568,8 +7669,10 @@ class PairsTradingTerminal(QMainWindow):
             self.benchmark_chart.setLabel('bottom', 'Date')
             self.benchmark_chart.addLegend(offset=(10, 10))
             self.benchmark_chart.setMinimumHeight(250)
+            self.benchmark_chart.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             chart_layout.addWidget(self.benchmark_chart)
-            
+
+            chart_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout.addWidget(chart_frame)
         
         # Position summary
@@ -7986,12 +8089,14 @@ class PairsTradingTerminal(QMainWindow):
             'Sen start': (999999, 9)  # All available data
         }
         
+        rf_daily = 0.04 / 252  # 4% annual risk-free rate
+
         for name, (days, col) in periods.items():
             n_use = min(days, n_days)
-            
+
             if n_use < 1:
                 continue
-            
+
             # Portfolio: change in P&L% over the period
             pnl_window = pnl_series.tail(n_use)
             if len(pnl_window) >= 2:
@@ -8035,13 +8140,13 @@ class PairsTradingTerminal(QMainWindow):
                         beta = pc.cov(br) / br.var()
                         self._set_benchmark_cell(4, col, beta, is_ratio=True)
                     
-                    # Sharpe (annualized)
+                    # Sharpe (annualized, with risk-free rate)
                     if pc.std() > 0:
-                        sharpe = (pc.mean() * np.sqrt(252)) / pc.std()
+                        sharpe = ((pc.mean() - rf_daily) * np.sqrt(252)) / pc.std()
                         self._set_benchmark_cell(5, col, sharpe, is_ratio=True)
-                    
+
                     if br.std() > 0:
-                        bench_sharpe = (br.mean() * np.sqrt(252)) / br.std()
+                        bench_sharpe = ((br.mean() - rf_daily) * np.sqrt(252)) / br.std()
                         self._set_benchmark_cell(6, col, bench_sharpe, is_ratio=True)
                     
                     # Tracking Error
@@ -8073,7 +8178,7 @@ class PairsTradingTerminal(QMainWindow):
                     if len(downside) > 0:
                         downside_std = downside.std()
                         if downside_std > 0:
-                            sortino = (pc.mean() * np.sqrt(252)) / downside_std
+                            sortino = ((pc.mean() - rf_daily) * np.sqrt(252)) / downside_std
                             self._set_benchmark_cell(11, col, sortino, is_ratio=True)
                     
                     # Win Rate
@@ -8104,23 +8209,8 @@ class PairsTradingTerminal(QMainWindow):
         self._save_benchmark_cache()
 
 
-    def _on_benchmark_changed(self, index: int):
-        """Handle benchmark selection change."""
-        pass  # Don't auto-update, wait for button click
-    
     def _get_benchmark_ticker(self) -> str:
-        """Get the yfinance ticker for the selected benchmark."""
-        text = self.benchmark_combo.currentText()
-        if "SPY" in text:
-            return "SPY"
-        elif "QQQ" in text:
-            return "QQQ"
-        elif "IWM" in text:
-            return "IWM"
-        elif "OMXS30" in text:
-            return "^OMXS30"
-        elif "OMX" in text:
-            return "^OMX"
+        """Get the yfinance ticker for the benchmark (always S&P 500)."""
         return "SPY"
     
     def _calculate_portfolio_returns_actual(self) -> Optional[pd.DataFrame]:
@@ -8471,7 +8561,7 @@ class PairsTradingTerminal(QMainWindow):
                     downside_std = port_std * np.sqrt(trading_days) if port_std else 0
                 
                 if downside_std > 0:
-                    sortino = (port_ret.mean() * trading_days) / downside_std
+                    sortino = ((port_ret.mean() - rf_daily) * trading_days) / downside_std
                 else:
                     sortino = None
                 
@@ -8898,21 +8988,901 @@ class PairsTradingTerminal(QMainWindow):
             print(f"Error updating benchmark chart: {e}")
     
     # ========================================================================
+    # TAB 6: MARKOV CHAINS
+    # ========================================================================
+
+    def create_markov_chains_tab(self) -> QWidget:
+        """Create Markov Chains tab with ticker selector, transition matrix, forecasts, and charts."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 10, 15, 10)
+
+        # ── Top bar ───────────────────────────────────────────────────────
+        top_bar = QFrame()
+        top_bar.setStyleSheet(f"""
+            QFrame {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {COLORS['bg_elevated']}, stop:1 {COLORS['bg_card']});
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 6px;
+            }}
+        """)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(12, 8, 12, 8)
+        top_layout.setSpacing(10)
+
+        lbl = QLabel("TICKER")
+        lbl.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;text-transform:uppercase;letter-spacing:1px;background:transparent;border:none;")
+        top_layout.addWidget(lbl)
+
+        self.markov_ticker_combo = QComboBox()
+        self.markov_ticker_combo.setEditable(True)
+        self.markov_ticker_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.markov_ticker_combo.setMinimumWidth(280)
+        self.markov_ticker_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_dark']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_default']};
+                border-radius: 4px;
+                padding: 5px 10px;
+                font-family: 'JetBrains Mono', 'Consolas', monospace;
+                font-size: 12px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                selection-background-color: {COLORS['accent_dark']};
+                border: 1px solid {COLORS['border_default']};
+            }}
+        """)
+        self.markov_ticker_combo.setToolTip("Select or type a ticker symbol to analyze")
+        top_layout.addWidget(self.markov_ticker_combo)
+
+        # Populate from CSV
+        self._populate_markov_tickers()
+
+        self.markov_analyze_btn = QPushButton("ANALYZE")
+        self.markov_analyze_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none;
+                border-radius: 4px;
+                padding: 6px 18px;
+                font-weight: 600;
+                font-size: 12px;
+                letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_bright']}; }}
+            QPushButton:pressed {{ background: {COLORS['accent_dark']}; }}
+            QPushButton:disabled {{ background: {COLORS['text_disabled']}; color: {COLORS['text_muted']}; }}
+        """)
+        self.markov_analyze_btn.setToolTip("Run Markov chain analysis on selected ticker")
+        self.markov_analyze_btn.clicked.connect(self.run_markov_analysis)
+        top_layout.addWidget(self.markov_analyze_btn)
+
+        self.markov_status_label = QLabel("")
+        self.markov_status_label.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;background:transparent;border:none;")
+        top_layout.addWidget(self.markov_status_label)
+
+        top_layout.addStretch()
+
+        self.markov_summary_state = CompactMetricCard("CURRENT STATE", "-")
+        self.markov_summary_state.setToolTip("Current Markov state based on last completed week's return")
+        self.markov_summary_expected = CompactMetricCard("E[RETURN]", "-")
+        self.markov_summary_expected.setToolTip("Expected next-week return (probability-weighted average)")
+        self.markov_summary_mixing = CompactMetricCard("MIXING TIME", "-")
+        self.markov_summary_mixing.setToolTip("Weeks for chain to forget initial state. Short = memoryless")
+        self.markov_summary_obs = CompactMetricCard("OBSERVATIONS", "-")
+        self.markov_summary_obs.setToolTip("Number of weekly return observations used")
+        for card in [self.markov_summary_state, self.markov_summary_expected,
+                     self.markov_summary_mixing, self.markov_summary_obs]:
+            card.setFixedWidth(140)
+            top_layout.addWidget(card)
+
+        main_layout.addWidget(top_bar)
+
+        # ── Splitter: left panel + right charts ───────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(3)
+        splitter.setStyleSheet(f"QSplitter::handle {{ background: {COLORS['border_subtle']}; }}")
+
+        # ── LEFT PANEL (scroll area) ─────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{
+                background: {COLORS['bg_dark']};
+                width: 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_default']};
+                border-radius: 4px;
+                min-height: 30px;
+            }}
+        """)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(5, 5, 10, 5)
+        left_layout.setSpacing(8)
+
+        # -- TRANSITION MATRIX --
+        left_layout.addWidget(SectionHeader("TRANSITION MATRIX"))
+        self.markov_matrix_frame = QFrame()
+        self.markov_matrix_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+            }}
+        """)
+        self.markov_matrix_grid = QGridLayout(self.markov_matrix_frame)
+        self.markov_matrix_grid.setSpacing(2)
+        self.markov_matrix_grid.setContentsMargins(6, 6, 6, 6)
+        self.markov_matrix_labels = {}
+        # Create 6×6 grid (header row + header col + 5×5 cells)
+        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        # Corner
+        corner = QLabel("")
+        corner.setStyleSheet(f"background:transparent;border:none;")
+        self.markov_matrix_grid.addWidget(corner, 0, 0)
+        # Column headers
+        for j, s in enumerate(state_shorts):
+            h = QLabel(s)
+            h.setAlignment(Qt.AlignCenter)
+            h.setStyleSheet(f"color:{COLORS['accent']};font-size:11px;font-weight:600;background:transparent;border:none;")
+            self.markov_matrix_grid.addWidget(h, 0, j + 1)
+        # Row headers + cells
+        for i, s in enumerate(state_shorts):
+            rh = QLabel(s)
+            rh.setAlignment(Qt.AlignCenter)
+            rh.setStyleSheet(f"color:{COLORS['accent']};font-size:11px;font-weight:600;background:transparent;border:none;")
+            self.markov_matrix_grid.addWidget(rh, i + 1, 0)
+            for j in range(5):
+                cell = QLabel("-")
+                cell.setAlignment(Qt.AlignCenter)
+                cell.setFixedSize(52, 28)
+                cell.setStyleSheet(f"""
+                    color: {COLORS['text_primary']};
+                    font-size: 11px;
+                    font-family: 'JetBrains Mono', monospace;
+                    background: {COLORS['bg_elevated']};
+                    border-radius: 3px;
+                    border: none;
+                """)
+                cell.setToolTip(f"P({state_shorts[i]} → {state_shorts[j]})")
+                self.markov_matrix_grid.addWidget(cell, i + 1, j + 1)
+                self.markov_matrix_labels[(i, j)] = cell
+        left_layout.addWidget(self.markov_matrix_frame)
+
+        # -- NEXT WEEK FORECAST --
+        left_layout.addWidget(SectionHeader("NEXT WEEK FORECAST"))
+        forecast_row = QHBoxLayout()
+        forecast_row.setSpacing(4)
+        self.markov_forecast_cards = {}
+        if MARKOV_AVAILABLE:
+            for s_id in range(N_MARKOV_STATES):
+                info = MARKOV_STATES[s_id]
+                card = CompactMetricCard(f"P({info['short']})", "-")
+                card.setToolTip(f"Probability of {info['name']} next week, based on transition matrix row for current state")
+                card.setFixedWidth(80)
+                forecast_row.addWidget(card)
+                self.markov_forecast_cards[s_id] = card
+        else:
+            for s_id in range(5):
+                names = ['SD', 'D', 'F', 'U', 'SU']
+                card = CompactMetricCard(f"P({names[s_id]})", "-")
+                card.setFixedWidth(80)
+                forecast_row.addWidget(card)
+                self.markov_forecast_cards[s_id] = card
+        forecast_row.addStretch()
+        left_layout.addLayout(forecast_row)
+
+        # -- INTRAWEEK TRACKING --
+        left_layout.addWidget(SectionHeader("INTRAWEEK TRACKING"))
+        self.markov_tracking_frame = QFrame()
+        self.markov_tracking_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+            }}
+        """)
+        tracking_layout = QVBoxLayout(self.markov_tracking_frame)
+        tracking_layout.setContentsMargins(10, 8, 10, 8)
+        tracking_layout.setSpacing(4)
+        self.markov_track_forecast_lbl = QLabel("Forecast: —")
+        self.markov_track_forecast_lbl.setStyleSheet(f"color:{COLORS['text_secondary']};font-size:12px;background:transparent;border:none;")
+        self.markov_track_actual_lbl = QLabel("Actual so far: —")
+        self.markov_track_actual_lbl.setStyleSheet(f"color:{COLORS['text_secondary']};font-size:12px;background:transparent;border:none;")
+        self.markov_track_status_lbl = QLabel("")
+        self.markov_track_status_lbl.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;background:transparent;border:none;")
+        tracking_layout.addWidget(self.markov_track_forecast_lbl)
+        tracking_layout.addWidget(self.markov_track_actual_lbl)
+        tracking_layout.addWidget(self.markov_track_status_lbl)
+        left_layout.addWidget(self.markov_tracking_frame)
+
+        # -- STATE STATISTICS --
+        left_layout.addWidget(SectionHeader("STATE STATISTICS"))
+        self.markov_stats_frame = QFrame()
+        self.markov_stats_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+            }}
+        """)
+        stats_grid = QGridLayout(self.markov_stats_frame)
+        stats_grid.setContentsMargins(8, 6, 8, 6)
+        stats_grid.setSpacing(3)
+        # Headers
+        for col_idx, hdr in enumerate(["State", "Avg Ret", "Vol", "Freq", "Avg Dur"]):
+            h = QLabel(hdr)
+            h.setAlignment(Qt.AlignCenter)
+            h.setStyleSheet(f"color:{COLORS['text_muted']};font-size:10px;font-weight:600;text-transform:uppercase;background:transparent;border:none;")
+            stats_grid.addWidget(h, 0, col_idx)
+        self.markov_stats_labels = {}
+        state_shorts_full = ['SD', 'D', 'F', 'U', 'SU']
+        for row in range(5):
+            name_lbl = QLabel(state_shorts_full[row])
+            name_lbl.setAlignment(Qt.AlignCenter)
+            clr = MARKOV_STATES[row]['color'] if MARKOV_AVAILABLE else '#888'
+            name_lbl.setStyleSheet(f"color:{clr};font-size:11px;font-weight:600;background:transparent;border:none;")
+            stats_grid.addWidget(name_lbl, row + 1, 0)
+            for col in range(4):
+                v = QLabel("-")
+                v.setAlignment(Qt.AlignCenter)
+                v.setStyleSheet(f"color:{COLORS['text_primary']};font-size:11px;font-family:'JetBrains Mono',monospace;background:transparent;border:none;")
+                stats_grid.addWidget(v, row + 1, col + 1)
+                self.markov_stats_labels[(row, col)] = v
+        left_layout.addWidget(self.markov_stats_frame)
+
+        # -- DIAGNOSTICS --
+        left_layout.addWidget(SectionHeader("DIAGNOSTICS"))
+        diag_row = QHBoxLayout()
+        diag_row.setSpacing(6)
+        self.markov_diag_gap = CompactMetricCard("SPECTRAL GAP", "-")
+        self.markov_diag_gap.setToolTip("1 − |λ₂|. Larger gap = faster mixing, less predictive. Smaller = more persistent")
+        self.markov_diag_mix = CompactMetricCard("MIXING TIME", "-")
+        self.markov_diag_mix.setToolTip("Weeks for chain to forget initial state")
+        self.markov_diag_range = CompactMetricCard("DATA RANGE", "-")
+        self.markov_diag_range.setToolTip("Date range of weekly return observations")
+        self.markov_diag_stat = CompactMetricCard("STATIONARY DIST", "-")
+        self.markov_diag_stat.setToolTip("Long-run equilibrium probability for each state")
+        for d in [self.markov_diag_gap, self.markov_diag_mix, self.markov_diag_range, self.markov_diag_stat]:
+            diag_row.addWidget(d)
+        left_layout.addLayout(diag_row)
+
+        left_layout.addStretch()
+        scroll.setWidget(left_widget)
+        splitter.addWidget(scroll)
+
+        # ── RIGHT PANEL (charts) ─────────────────────────────────────────
+        pg = get_pyqtgraph()
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        if pg is not None:
+            # Chart 1: Weekly returns scatter
+            DateAxisItem = get_date_axis_item_class()
+            self.markov_returns_date_axis = DateAxisItem(orientation='bottom')
+            self.markov_returns_plot = pg.PlotWidget(
+                axisItems={'bottom': self.markov_returns_date_axis},
+                title="WEEKLY RETURNS (STATE CLASSIFIED)"
+            )
+            self.markov_returns_plot.setBackground(COLORS['bg_card'])
+            self.markov_returns_plot.showGrid(x=False, y=False, alpha=0.3)
+            self.markov_returns_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+            self.markov_returns_plot.setMouseEnabled(x=True, y=True)
+            self.markov_returns_plot.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
+            right_layout.addWidget(self.markov_returns_plot, stretch=3)
+
+            # Chart 2: Transition heatmap
+            self.markov_heatmap_plot = pg.PlotWidget(title="TRANSITION HEATMAP")
+            self.markov_heatmap_plot.setBackground(COLORS['bg_card'])
+            self.markov_heatmap_plot.setMouseEnabled(x=False, y=False)
+            self.markov_heatmap_img = pg.ImageItem()
+            self.markov_heatmap_plot.addItem(self.markov_heatmap_img)
+            self.markov_heatmap_texts = []
+            right_layout.addWidget(self.markov_heatmap_plot, stretch=2)
+
+            # Bottom row: forecast bar + forecast vs actual
+            bottom_row = QHBoxLayout()
+            bottom_row.setSpacing(6)
+
+            # Chart 3: Forecast bars
+            self.markov_forecast_plot = pg.PlotWidget(title="NEXT WEEK FORECAST")
+            self.markov_forecast_plot.setBackground(COLORS['bg_card'])
+            self.markov_forecast_plot.setMouseEnabled(x=False, y=False)
+            self.markov_forecast_plot.setLabel('left', 'Probability %')
+            bottom_row.addWidget(self.markov_forecast_plot)
+
+            # Chart 4: Multi-horizon forecast
+            self.markov_horizon_plot = pg.PlotWidget(title="MULTI-HORIZON FORECAST")
+            self.markov_horizon_plot.setBackground(COLORS['bg_card'])
+            self.markov_horizon_plot.setMouseEnabled(x=False, y=False)
+            self.markov_horizon_plot.setLabel('left', 'Probability %')
+            self.markov_horizon_plot.addLegend(offset=(10, 10))
+            bottom_row.addWidget(self.markov_horizon_plot)
+
+            right_layout.addLayout(bottom_row, stretch=2)
+        else:
+            no_pg = QLabel("pyqtgraph not available — charts disabled")
+            no_pg.setAlignment(Qt.AlignCenter)
+            no_pg.setStyleSheet(f"color:{COLORS['text_muted']};font-size:13px;")
+            right_layout.addWidget(no_pg)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([280, 700])
+        main_layout.addWidget(splitter, stretch=1)
+
+        return tab
+
+    def _populate_markov_tickers(self):
+        """Populate the Markov ticker combo from the matched tickers CSV."""
+        try:
+            csv_path = find_matched_tickers_csv()
+            df = pd.read_csv(csv_path, sep=';', encoding='utf-8-sig')
+            items = []
+            if 'Ticker' in df.columns and 'Underliggande tillgång' in df.columns:
+                for _, row in df.iterrows():
+                    ticker = str(row['Ticker']).strip()
+                    name = str(row['Underliggande tillgång']).strip()
+                    if ticker and ticker.lower() != 'ticker':
+                        items.append(f"{ticker} — {name}")
+            elif 'Ticker' in df.columns:
+                for t in df['Ticker'].dropna().astype(str).str.strip():
+                    if t and t.lower() != 'ticker':
+                        items.append(t)
+            if items:
+                self.markov_ticker_combo.addItems(sorted(items))
+        except Exception as e:
+            print(f"[Markov] Error loading tickers: {e}")
+
+    # ── Analysis runner ───────────────────────────────────────────────────
+
+    def run_markov_analysis(self):
+        """Start Markov chain analysis for the selected ticker."""
+        if not MARKOV_AVAILABLE:
+            self.markov_status_label.setText("markov_chain.py not found")
+            return
+        if self._markov_running:
+            self.markov_status_label.setText("Analysis already running...")
+            return
+
+        raw = self.markov_ticker_combo.currentText().strip()
+        if not raw:
+            self.markov_status_label.setText("Select a ticker first")
+            return
+        ticker = raw.split(" — ")[0].strip()
+
+        self._markov_running = True
+        self.markov_analyze_btn.setEnabled(False)
+        self.markov_status_label.setText(f"Analyzing {ticker}...")
+
+        self._markov_thread = QThread()
+        self._markov_worker = MarkovChainWorker(ticker)
+        self._markov_worker.moveToThread(self._markov_thread)
+
+        self._markov_thread.started.connect(self._markov_worker.run)
+        self._markov_worker.progress.connect(self._on_markov_progress)
+        self._markov_worker.result.connect(self._on_markov_result)
+        self._markov_worker.error.connect(self._on_markov_error)
+        self._markov_worker.finished.connect(self._on_markov_finished)
+        self._markov_worker.finished.connect(self._markov_thread.quit)
+
+        self._markov_thread.start()
+
+    def _on_markov_progress(self, pct: int, msg: str):
+        self.markov_status_label.setText(f"[{pct}%] {msg}")
+
+    def _on_markov_error(self, msg: str):
+        self.markov_status_label.setText(f"Error: {msg}")
+        self.markov_status_label.setStyleSheet(f"color:{COLORS['negative']};font-size:11px;background:transparent;border:none;")
+
+    def _on_markov_finished(self):
+        self._markov_running = False
+        self.markov_analyze_btn.setEnabled(True)
+
+    def _on_markov_result(self, result):
+        """Handle completed Markov analysis — update all UI elements."""
+        self._markov_result = result
+        self.markov_status_label.setText(f"Analysis complete — {result.ticker}")
+        self.markov_status_label.setStyleSheet(f"color:{COLORS['positive']};font-size:11px;background:transparent;border:none;")
+        self._update_markov_summary(result)
+        self._update_markov_matrix(result)
+        self._update_markov_forecast(result)
+        self._update_markov_tracking(result)
+        self._update_markov_state_stats(result)
+        self._update_markov_diagnostics(result)
+        self._update_markov_charts(result)
+
+    # ── UI updaters ───────────────────────────────────────────────────────
+
+    def _update_markov_summary(self, r):
+        """Update top bar summary cards."""
+        if MARKOV_AVAILABLE:
+            state_info = MARKOV_STATES[r.current_state]
+            self.markov_summary_state.set_value(state_info['short'], state_info['color'])
+        else:
+            self.markov_summary_state.set_value(str(r.current_state))
+
+        er_color = COLORS['positive'] if r.expected_return >= 0 else COLORS['negative']
+        self.markov_summary_expected.set_value(f"{r.expected_return * 100:+.2f}%", er_color)
+        self.markov_summary_mixing.set_value(f"{r.mixing_time:.1f}w")
+        self.markov_summary_obs.set_value(str(r.n_observations))
+
+    def _update_markov_matrix(self, r):
+        """Update transition matrix grid cells with intensity coloring."""
+        T = r.transition_matrix
+        for i in range(5):
+            for j in range(5):
+                val = T[i, j]
+                cell = self.markov_matrix_labels.get((i, j))
+                if cell is None:
+                    continue
+                cell.setText(f"{val:.0%}")
+                # Intensity: 0→bg_elevated, high→amber
+                intensity = min(val * 2.5, 1.0)
+                bg_r = int(13 + intensity * (212 - 13))
+                bg_g = int(13 + intensity * (165 - 13))
+                bg_b = int(13 + intensity * (116 - 13))
+                text_color = COLORS['text_primary'] if intensity < 0.6 else COLORS['bg_darkest']
+                cell.setStyleSheet(f"""
+                    color: {text_color};
+                    font-size: 11px;
+                    font-family: 'JetBrains Mono', monospace;
+                    background: rgb({bg_r},{bg_g},{bg_b});
+                    border-radius: 3px;
+                    border: none;
+                """)
+
+    def _update_markov_forecast(self, r):
+        """Update forecast probability cards."""
+        for s_id in range(5):
+            card = self.markov_forecast_cards.get(s_id)
+            if card is None:
+                continue
+            prob = r.forecast_probs[s_id]
+            clr = MARKOV_STATES[s_id]['color'] if MARKOV_AVAILABLE else COLORS['text_primary']
+            card.set_value(f"{prob:.0%}", clr)
+
+    def _update_markov_tracking(self, r):
+        """Update intraweek tracking labels."""
+        # Forecast from current state
+        if MARKOV_AVAILABLE:
+            most_likely = int(np.argmax(r.forecast_probs))
+            ml_info = MARKOV_STATES[most_likely]
+            self.markov_track_forecast_lbl.setText(
+                f"Forecast: Most likely → {ml_info['name']} ({r.forecast_probs[most_likely]:.0%})"
+            )
+        else:
+            self.markov_track_forecast_lbl.setText("Forecast: —")
+
+        # Actual intraweek
+        iwr = r.current_intraweek_return
+        iw_color = COLORS['positive'] if iwr >= 0 else COLORS['negative']
+        if MARKOV_AVAILABLE:
+            iw_state_info = MARKOV_STATES[r.current_intraweek_state]
+            self.markov_track_actual_lbl.setText(
+                f"Actual so far: {iwr * 100:+.2f}% ({iw_state_info['short']})"
+            )
+            self.markov_track_actual_lbl.setStyleSheet(
+                f"color:{iw_color};font-size:12px;font-weight:600;background:transparent;border:none;"
+            )
+            # Tracking indicator
+            if r.current_intraweek_state == int(np.argmax(r.forecast_probs)):
+                self.markov_track_status_lbl.setText("● Tracking forecast")
+                self.markov_track_status_lbl.setStyleSheet(f"color:{COLORS['positive']};font-size:11px;background:transparent;border:none;")
+            else:
+                self.markov_track_status_lbl.setText("○ Diverging from forecast")
+                self.markov_track_status_lbl.setStyleSheet(f"color:{COLORS['warning']};font-size:11px;background:transparent;border:none;")
+        else:
+            self.markov_track_actual_lbl.setText(f"Actual so far: {iwr * 100:+.2f}%")
+
+    def _update_markov_state_stats(self, r):
+        """Update state statistics table."""
+        for s_id in range(5):
+            st = r.state_stats.get(s_id, {})
+            avg_ret = st.get('avg_return', 0)
+            vol = st.get('volatility', 0)
+            freq = st.get('frequency', 0)
+            avg_dur = st.get('avg_duration', 0)
+
+            vals = [
+                (f"{avg_ret * 100:+.2f}%", COLORS['positive'] if avg_ret >= 0 else COLORS['negative']),
+                (f"{vol * 100:.2f}%", COLORS['text_primary']),
+                (f"{freq:.0%}", COLORS['text_primary']),
+                (f"{avg_dur:.1f}w", COLORS['text_primary']),
+            ]
+            for col, (txt, clr) in enumerate(vals):
+                lbl = self.markov_stats_labels.get((s_id, col))
+                if lbl:
+                    lbl.setText(txt)
+                    lbl.setStyleSheet(f"color:{clr};font-size:11px;font-family:'JetBrains Mono',monospace;background:transparent;border:none;")
+
+    def _update_markov_diagnostics(self, r):
+        """Update diagnostic cards."""
+        self.markov_diag_gap.set_value(f"{r.eigenvalue_gap:.4f}")
+        self.markov_diag_mix.set_value(f"{r.mixing_time:.1f} weeks")
+        self.markov_diag_range.set_value(f"{r.data_start}\n{r.data_end}")
+        # Stationary dist compact
+        if MARKOV_AVAILABLE:
+            parts = [f"{MARKOV_STATES[i]['short']}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+        else:
+            parts = [f"S{i}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+        self.markov_diag_stat.set_value(" ".join(parts))
+
+    # ── Chart rendering ───────────────────────────────────────────────────
+
+    def _update_markov_charts(self, r):
+        """Render all 4 Markov chain pyqtgraph charts."""
+        pg = get_pyqtgraph()
+        if pg is None:
+            return
+
+        self._render_markov_returns_chart(r, pg)
+        self._render_markov_heatmap(r, pg)
+        self._render_markov_forecast_bars(r, pg)
+        self._render_markov_horizon_chart(r, pg)
+
+    def _render_markov_returns_chart(self, r, pg):
+        """Chart 1: Weekly returns scatter colored by state."""
+        plot = self.markov_returns_plot
+        plot.clear()
+        plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+
+        dates = r.weekly_dates
+        returns = r.weekly_returns
+        states = r.state_sequence
+        n = len(returns)
+
+        # Add threshold lines
+        for th in r.thresholds:
+            plot.addLine(y=th, pen=pg.mkPen('#444444', width=1, style=Qt.DashLine))
+
+        # Set date axis
+        self.markov_returns_date_axis.set_dates(
+            pd.DatetimeIndex(dates) if not isinstance(dates, pd.DatetimeIndex) else dates
+        )
+
+        # Scatter by state
+        state_colors = {
+            0: '#ef4444', 1: '#f59e0b', 2: '#a0a0a0', 3: '#22c55e', 4: '#3b82f6'
+        }
+        if MARKOV_AVAILABLE:
+            state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
+
+        for s_id in range(5):
+            mask = states == s_id
+            if not mask.any():
+                continue
+            x = np.where(mask)[0].astype(float)
+            y = returns[mask]
+            short = MARKOV_STATES[s_id]['short'] if MARKOV_AVAILABLE else f"S{s_id}"
+            color = state_colors.get(s_id, '#888888')
+            scatter = pg.ScatterPlotItem(
+                x=x, y=y, size=6,
+                pen=pg.mkPen(None),
+                brush=pg.mkBrush(color),
+                name=short
+            )
+            plot.addItem(scatter)
+
+        plot.addLegend(offset=(10, 10))
+
+    def _render_markov_heatmap(self, r, pg):
+        """Chart 2: Transition matrix as heatmap."""
+        plot = self.markov_heatmap_plot
+        plot.clear()
+        self.markov_heatmap_img = pg.ImageItem()
+        plot.addItem(self.markov_heatmap_img)
+
+        T = r.transition_matrix
+
+        # Create amber colormap: dark → amber
+        # Transpose for image orientation (row=y, col=x)
+        img_data = T.copy()
+
+        # Apply colormap manually: map 0→dark, 1→amber
+        # ImageItem expects [x, y] so transpose
+        self.markov_heatmap_img.setImage(img_data.T, levels=[0, np.max(T) + 0.01])
+
+        # Create amber colormap
+        colors = [
+            (10, 10, 10),       # dark (0)
+            (80, 60, 30),       # dark amber (0.25)
+            (170, 130, 70),     # mid amber (0.5)
+            (212, 165, 116),    # accent amber (0.75)
+            (232, 184, 109),    # bright amber (1.0)
+        ]
+        positions = [0.0, 0.25, 0.5, 0.75, 1.0]
+        cmap = pg.ColorMap(positions, colors)
+        lut = cmap.getLookupTable(nPts=256)
+        self.markov_heatmap_img.setLookupTable(lut)
+
+        # Remove old text items
+        for txt in self.markov_heatmap_texts:
+            plot.removeItem(txt)
+        self.markov_heatmap_texts = []
+
+        # Add text annotations
+        for i in range(5):
+            for j in range(5):
+                txt = pg.TextItem(f"{T[i, j]:.0%}", color='#ffffff', anchor=(0.5, 0.5))
+                txt.setPos(j + 0.5, i + 0.5)
+                txt.setFont(QFont('JetBrains Mono', 9))
+                plot.addItem(txt)
+                self.markov_heatmap_texts.append(txt)
+
+        # Axis labels
+        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        x_axis = plot.getAxis('bottom')
+        x_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
+        y_axis = plot.getAxis('left')
+        y_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
+        plot.setXRange(0, 5)
+        plot.setYRange(0, 5)
+
+    def _render_markov_forecast_bars(self, r, pg):
+        """Chart 3: Next week forecast bar chart."""
+        plot = self.markov_forecast_plot
+        plot.clear()
+
+        probs = r.forecast_probs * 100  # percent
+        state_colors = {
+            0: '#ef4444', 1: '#f59e0b', 2: '#a0a0a0', 3: '#22c55e', 4: '#3b82f6'
+        }
+        if MARKOV_AVAILABLE:
+            state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
+
+        for i in range(5):
+            bar = pg.BarGraphItem(
+                x=[i], height=[probs[i]], width=0.6,
+                brush=pg.mkBrush(state_colors.get(i, '#888')),
+                pen=pg.mkPen(None)
+            )
+            plot.addItem(bar)
+            # Label on top
+            txt = pg.TextItem(f"{probs[i]:.1f}%", color='#e8e8e8', anchor=(0.5, 1.0))
+            txt.setPos(i, probs[i])
+            txt.setFont(QFont('JetBrains Mono', 9))
+            plot.addItem(txt)
+
+        # Baseline at 20% (uniform)
+        plot.addLine(y=20, pen=pg.mkPen('#666666', width=1, style=Qt.DashLine))
+
+        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        x_axis = plot.getAxis('bottom')
+        x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
+        plot.setXRange(-0.5, 4.5)
+        plot.setYRange(0, max(probs) * 1.2 + 5)
+
+    def _render_markov_horizon_chart(self, r, pg):
+        """Chart 4: Multi-horizon forecast (1w, 2w, 4w) as grouped bars."""
+        plot = self.markov_horizon_plot
+        plot.clear()
+
+        horizons = [
+            ('1W', r.forecast_probs),
+            ('2W', r.forecast_2w),
+            ('4W', r.forecast_4w),
+        ]
+        bar_width = 0.25
+        offsets = [-bar_width, 0, bar_width]
+        horizon_colors = [COLORS['accent'], COLORS['info'], COLORS['text_muted']]
+
+        for h_idx, (label, probs) in enumerate(horizons):
+            x = np.arange(5) + offsets[h_idx]
+            bar = pg.BarGraphItem(
+                x=x, height=probs * 100, width=bar_width,
+                brush=pg.mkBrush(horizon_colors[h_idx]),
+                pen=pg.mkPen(None),
+                name=label
+            )
+            plot.addItem(bar)
+
+        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        x_axis = plot.getAxis('bottom')
+        x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
+        plot.setXRange(-0.5, 4.5)
+        max_val = max(r.forecast_probs.max(), r.forecast_2w.max(), r.forecast_4w.max()) * 100
+        plot.setYRange(0, max_val * 1.2 + 5)
+        plot.addLegend(offset=(10, 10))
+
+    # ========================================================================
     # WORLD MAP
     # ========================================================================
-    
-    def update_plotly_map(self, market_data: List[Dict]):
-        """Update the Plotly world map with region-based clustering and zoom-aware display."""
-        # Check if we have a QWebEngineView-based map widget
+
+    def update_treemap_heatmap(self, items: list):
+        """Render Finviz-style treemap heatmap using Plotly in QWebEngineView.
+
+        Args:
+            items: List of dicts with {market, symbol, name, price, change, change_pct}
+        """
         if not WEBENGINE_AVAILABLE or not hasattr(self, 'map_widget'):
-            # Fallback for pyqtgraph scatter plot
-            if ensure_pyqtgraph() and hasattr(self, 'market_scatter'):
-                self.update_market_map_spots(market_data)
             return
-        
-        # Build map data JSON
-        map_json = json.dumps(market_data)
-        
+
+        # Market display names
+        MARKET_NAMES = {
+            'AMERICA': 'America',
+            'EUROPE': 'Europe',
+            'MIDDLE EAST': 'Middle East',
+            'AFRICA': 'Africa',
+            'ASIA': 'Asia',
+            'OCEANIA': 'Oceania',
+            'CURRENCIES': 'Currencies',
+            'COMMODITIES': 'Commodities',
+            'YIELDS': 'Yields',
+        }
+
+        # Approximate market cap / importance weights ($T) for tile sizing
+        MARKET_WEIGHTS = {
+            # America
+            '^GSPC': 50, '^NDX': 25, '^DJI': 15, '^RUT': 3,
+            '^GSPTSE': 3, '^MXX': 0.8, '^BVSP': 1, '^MERV': 0.1,
+            '^IPSA': 0.15, '^COLCAP': 0.1,
+            # Europe
+            '^FTSE': 3, '^FCHI': 3.5, '^STOXX': 12, '^AEX': 1.5,
+            '^GDAXI': 2.5, '^SSMI': 2, '^ATX': 0.15, '^IBEX': 1,
+            'FTSEMIB.MI': 0.8, 'PSI20.LS': 0.1, '^BFX': 0.3,
+            '^ISEQ': 0.15, 'XU100.IS': 0.4, '^OMX': 1,
+            'OBX.OL': 0.4, '^OMXC25': 0.6, '^OMXH25': 0.3, 'WIG20.WA': 0.2,
+            # Middle East
+            '^TA125.TA': 0.3, '^TASI.SR': 2.5, 'DFMGI.AE': 0.8,
+            'FADGI.FGI': 0.6, '^GNRI.QA': 0.15,
+            # Africa
+            '^JN0U.JO': 1, '^CASE30': 0.08,
+            # Asia
+            '^N225': 6, '^HSI': 4, '000001.SS': 8, '^KS11': 2,
+            '^TWII': 2, '^NSEI': 4, '^BSESN': 4, '^STI': 0.6,
+            '^JKSE': 0.6, '^KLSE': 0.3, '^SET.BK': 0.5,
+            '^VNINDEX': 0.2, 'PSEI.PS': 0.15,
+            '000300.SS': 5, '399106.SZ': 2,
+            # Oceania
+            '^AXJO': 1.5, '^NZ50': 0.12,
+            # Currencies (daily volume approximation)
+            'EURUSD=X': 2, 'EURSEK=X': 0.5, 'GBPUSD=X': 1,
+            'USDJPY=X': 1, 'USDCHF=X': 0.5, 'AUDUSD=X': 0.5,
+            'USDCAD=X': 0.5, 'USDSEK=X': 0.3,
+            # Commodities
+            'GC=F': 5, 'SI=F': 1, 'CL=F': 4, 'NG=F': 1.5, 'HG=F': 1.5,
+            # Yields
+            '^TNX': 3, '^FVX': 2, '^TYX': 2, '^IRX': 1,
+        }
+
+        # Build treemap arrays with unique IDs (no root node - regions are top-level)
+        ids = []
+        labels = []
+        parents = []
+        values = []
+        text = []
+        colors = []
+        font_sizes = []
+
+        # Extra data for overlay & tooltip
+        histories = {}       # symbol → [[date, close], ...]
+        ohlc_histories = {}  # symbol → [[date, O, H, L, C], ...]
+        region_items = {}    # region_key → [{name, symbol, price_str, change_pct}, ...]
+        item_regions = {}    # symbol → region display name
+
+        # Group items by market
+        markets = {}
+        for item in items:
+            m = item.get('market', 'OTHER')
+            if m not in markets:
+                markets[m] = []
+            markets[m].append(item)
+
+        # Add market categories and instruments
+        for market_key, market_items in markets.items():
+            display_name = MARKET_NAMES.get(market_key, market_key)
+            region_id = f'region:{market_key}'
+            region_items[market_key] = []
+
+            # Placeholder for region - value will be set to sum of children
+            region_idx = len(ids)
+            ids.append(region_id)
+            labels.append(display_name.upper())
+            parents.append('')
+            values.append(0)  # Updated below
+            text.append('')
+            colors.append(0)
+            font_sizes.append(16)
+
+            # Add individual instruments
+            region_total = 0
+            for item in market_items:
+                name = item.get('name', item.get('symbol', ''))
+                symbol = item.get('symbol', '')
+                price = item.get('price', 0)
+                change_pct = item.get('change_pct', 0)
+                weight = MARKET_WEIGHTS.get(symbol, 0.5)
+                region_total += weight
+
+                # Format price with appropriate precision
+                if price >= 100:
+                    price_str = f'{price:,.2f}'
+                elif price > 0:
+                    price_str = f'{price:.4f}'
+                else:
+                    price_str = 'N/A'
+
+                change_sign = '+' if change_pct >= 0 else ''
+                display_ticker = symbol.lstrip('^').replace('=X', '').replace('=F', '')
+                # Compact tile text: just change% (like finviz)
+                tile_text = f'{change_sign}{change_pct:.2f}%'
+
+                ids.append(f'item:{symbol}')
+                labels.append(display_ticker)
+                parents.append(region_id)
+                values.append(weight)
+                text.append(tile_text)
+                colors.append(change_pct)
+                font_sizes.append(11)
+
+                # Collect history for sparklines & candlestick charts
+                hist = item.get('history', [])
+                if hist:
+                    histories[symbol] = hist
+                ohlc = item.get('ohlc_history', [])
+                if ohlc:
+                    ohlc_histories[symbol] = ohlc
+                # Region item data for overlay table
+                region_items[market_key].append({
+                    'name': name, 'symbol': symbol,
+                    'price_str': price_str, 'change_pct': change_pct,
+                })
+                item_regions[symbol] = {'display': display_name.upper(), 'key': market_key}
+
+            # Set region value to exact sum of children (required for branchvalues: 'total')
+            values[region_idx] = region_total
+
+        # If empty, show placeholder
+        if len(ids) == 0:
+            html = '''<!DOCTYPE html><html><body style="background:#0a0a0a;color:#444;display:flex;align-items:center;justify-content:center;height:100%;margin:0;font-family:monospace;font-size:14px;">
+            <div>Loading market data...</div></body></html>'''
+            self.map_widget.setHtml(html)
+            return
+
+        # Sanitize any inf/nan in numeric arrays before JSON serialization
+        colors = [c if math.isfinite(c) else 0.0 for c in colors]
+        values = [v if math.isfinite(v) else 0.5 for v in values]
+
+        # Build JSON for JS
+        try:
+            data_json = json.dumps({
+                'ids': ids,
+                'labels': labels,
+                'parents': parents,
+                'values': values,
+                'text': text,
+                'colors': colors,
+                'font_sizes': font_sizes,
+                'histories': histories,
+                'ohlc_histories': ohlc_histories,
+                'region_items': region_items,
+                'item_regions': item_regions,
+            })
+        except (ValueError, TypeError) as e:
+            print(f"[MarketWatch] JSON serialization error: {e}, falling back without OHLC")
+            data_json = json.dumps({
+                'ids': ids, 'labels': labels, 'parents': parents,
+                'values': values, 'text': text, 'colors': colors,
+                'font_sizes': font_sizes, 'histories': {},
+                'ohlc_histories': {}, 'region_items': region_items,
+                'item_regions': item_regions,
+            }, default=str)
+
         html = f'''
 <!DOCTYPE html>
 <html>
@@ -8920,460 +9890,565 @@ class PairsTradingTerminal(QMainWindow):
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        html, body {{ 
-            background: #0a0a0a; 
-            width: 100%; 
+        html, body {{
+            background: #0a0a0a;
+            width: 100%;
             height: 100%;
             overflow: hidden;
+            font-family: Arial, Helvetica, sans-serif;
         }}
         #map {{ width: 100%; height: 100%; }}
+        #loading {{
+            color: #555;
+            font-family: monospace;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+        }}
+        /* Hover tooltip */
+        #tooltip {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            pointer-events: none;
+            background: #111111;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-size: 12px;
+            color: #e8e8e8;
+            max-width: 300px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+        }}
+        #tooltip .tt-region {{ color: #888; font-size: 10px; text-transform: uppercase; margin-bottom: 4px; }}
+        #tooltip .tt-name {{ font-weight: 700; font-size: 13px; margin-bottom: 4px; }}
+        #tooltip .tt-spark {{ margin: 4px 0; }}
+        #tooltip .tt-price {{ font-size: 13px; font-weight: 600; }}
+        #tooltip .tt-change {{ font-size: 12px; font-weight: 600; }}
+        .tt-pos {{ color: #33ff33; }}
+        .tt-neg {{ color: #ff3333; }}
+        /* Detail overlay */
+        #overlay-backdrop {{
+            display: none;
+            position: fixed;
+            z-index: 998;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+        }}
+        #detail-overlay {{
+            display: none;
+            position: fixed;
+            z-index: 999;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 6px;
+            min-width: 380px;
+            max-width: 520px;
+            max-height: 80vh;
+            overflow-y: auto;
+            color: #e8e8e8;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+        }}
+        #detail-overlay::-webkit-scrollbar {{ width: 6px; }}
+        #detail-overlay::-webkit-scrollbar-track {{ background: #111; }}
+        #detail-overlay::-webkit-scrollbar-thumb {{ background: #333; border-radius: 3px; }}
+        .ov-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid #333;
+            background: #0d0d0d;
+        }}
+        .ov-region {{ font-size: 14px; font-weight: 700; color: #888; text-transform: uppercase; }}
+        .ov-close {{
+            cursor: pointer;
+            color: #666;
+            font-size: 18px;
+            width: 28px; height: 28px;
+            display: flex; align-items: center; justify-content: center;
+            border-radius: 4px;
+            border: none;
+            background: transparent;
+        }}
+        .ov-close:hover {{ color: #e8e8e8; background: #222; }}
+        .ov-main {{
+            padding: 12px 16px;
+            border-bottom: 1px solid #222;
+        }}
+        .ov-main-name {{ font-size: 15px; font-weight: 700; color: #e8e8e8; }}
+        .ov-main-row {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 6px;
+        }}
+        .ov-main-price {{ font-size: 16px; font-weight: 700; }}
+        .ov-main-change {{ font-size: 14px; font-weight: 600; }}
+        .ov-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        .ov-table tr {{ border-bottom: 1px solid #1a1a1a; }}
+        .ov-table tr:hover {{ background: #1a1a1a; }}
+        .ov-table td {{
+            padding: 8px 16px;
+            font-size: 12px;
+        }}
+        .ov-table .ov-tname {{ color: #ccc; font-weight: 600; }}
+        .ov-table .ov-tprice {{ color: #aaa; text-align: right; }}
+        .ov-table .ov-tchange {{ text-align: right; font-weight: 600; min-width: 70px; }}
     </style>
 </head>
 <body>
-    <div id="map"></div>
+    <div id="map"><div id="loading">Loading market heatmap...</div></div>
+    <div id="tooltip"></div>
+    <div id="overlay-backdrop" onclick="hideOverlay()"></div>
+    <div id="detail-overlay"><div id="overlay-content"></div></div>
     <script>
-        const mapData = {map_json};
-        
-        // Region definitions with center coordinates
-        const REGIONS = {{
-            'NORTH_AMERICA': {{
-                name: 'North America',
-                tickers: ['^GSPC', '^DJI', '^NDX', '^RUT', '^GSPTSE'],
-                center: {{ lat: 42, lon: -95 }}
-            }},
-            'SOUTH_AMERICA': {{
-                name: 'South America', 
-                tickers: ['^MXX', '^BVSP', '^MERV', '^IPSA', '^COLO-IV'],
-                center: {{ lat: -15, lon: -60 }}
-            }},
-            'EUROPE': {{
-                name: 'Europe',
-                tickers: ['^FTSE', '^FCHI', '^STOXX', '^AEX', '^GDAXI', '^SSMI', '^ATX', 
-                         '^IBEX', 'FTSEMIB.MI', 'PSI20.LS', '^BFX', '^ISEQ', 'WIG20.WA', 'XU100.IS'],
-                center: {{ lat: 48, lon: 8 }}
-            }},
-            'NORDICS': {{
-                name: 'Nordics',
-                tickers: ['^OMX', 'OBX.OL', '^OMXC25', '^OMXH25'],
-                center: {{ lat: 60, lon: 18 }}
-            }},
-            'MIDDLE_EAST': {{
-                name: 'Middle East',
-                tickers: ['^TA125.TA', '^TASI.SR', 'DFMGI.AE', 'FADGI.FGI', '^GNRI.QA'],
-                center: {{ lat: 26, lon: 45 }}
-            }},
-            'AFRICA': {{
-                name: 'Africa',
-                tickers: ['^JN0U.JO', '^CASE30'],
-                center: {{ lat: 0, lon: 25 }}
-            }},
-            'ASIA': {{
-                name: 'Asia',
-                tickers: ['^N225', '^HSI', '000001.SS', '^KS11', '^TWII', '^NSEI', '^BSESN',
-                         '^STI', '^JKSE', '^KLSE', '^SET50.BK', '^VNINDEX.VN', 'PSEI.PS', 
-                         '000300.SS', '399106.SZ'],
-                center: {{ lat: 25, lon: 105 }}
-            }},
-            'OCEANIA': {{
-                name: 'Oceania',
-                tickers: ['^AXJO', '^NZ50'],
-                center: {{ lat: -30, lon: 150 }}
-            }}
-        }};
-        
-        // Zoom threshold - below this longitude range, show individual points
-        const ZOOM_THRESHOLD = 120; // degrees of longitude visible
-        
-        let currentZoomLevel = 350; // Start zoomed out (full world view)
-        
-        function getRegionForTicker(ticker) {{
-            for (const [regionKey, region] of Object.entries(REGIONS)) {{
-                if (region.tickers.includes(ticker)) {{
-                    return regionKey;
-                }}
-            }}
-            return null;
+        console.log('Treemap script starting...');
+        const d = {data_json};
+        console.log('Data loaded: ' + d.labels.length + ' labels');
+
+        /* SVG sparkline from history data; color based on daily change_pct */
+        function makeSpark(hist, w, h, changePct) {{
+            if (!hist || hist.length < 2) return '';
+            var closes = hist.map(function(p) {{ return p[1]; }});
+            var mn = Math.min.apply(null, closes);
+            var mx = Math.max.apply(null, closes);
+            var rng = mx - mn || 1;
+            var pts = closes.map(function(v, i) {{
+                var x = (i / (closes.length - 1)) * w;
+                var y = h - ((v - mn) / rng) * (h - 2) - 1;
+                return x.toFixed(1) + ',' + y.toFixed(1);
+            }}).join(' ');
+            var clr = (changePct !== undefined ? changePct >= 0 : closes[closes.length - 1] >= closes[0]) ? '#33ff33' : '#ff3333';
+            return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+                '<polyline points="' + pts + '" fill="none" stroke="' + clr + '" stroke-width="1.5"/></svg>';
         }}
-        
-        function clusterByRegion(data) {{
-            const regionData = {{}};
-            const unassigned = [];
-            
-            // Group data by region
-            for (const item of data) {{
-                const region = getRegionForTicker(item.ticker);
-                if (region) {{
-                    if (!regionData[region]) {{
-                        regionData[region] = [];
-                    }}
-                    regionData[region].push(item);
-                }} else {{
-                    unassigned.push(item);
-                }}
+
+        /* SVG candlestick chart from OHLC data: [[date, O, H, L, C], ...] */
+        function makeCandle(ohlc, w, h) {{
+            if (!ohlc || ohlc.length < 2) return '';
+            var allH = ohlc.map(function(c) {{ return c[2]; }});
+            var allL = ohlc.map(function(c) {{ return c[3]; }});
+            var mn = Math.min.apply(null, allL);
+            var mx = Math.max.apply(null, allH);
+            var rng = mx - mn || 1;
+            var pad = 2;
+            var cw = Math.max(1, ((w - pad * 2) / ohlc.length) * 0.7);
+            var gap = (w - pad * 2) / ohlc.length;
+            var svg = '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">';
+            /* Grid lines */
+            for (var g = 0; g < 4; g++) {{
+                var gy = Math.round(h * g / 4);
+                svg += '<line x1="0" y1="' + gy + '" x2="' + w + '" y2="' + gy + '" stroke="#222" stroke-width="0.5"/>';
             }}
-            
-            // Create clusters for each region
-            const clusters = [];
-            for (const [regionKey, items] of Object.entries(regionData)) {{
-                if (items.length === 0) continue;
-                
-                const region = REGIONS[regionKey];
-                const avgChange = items.reduce((s, p) => s + p.change, 0) / items.length;
-                
-                // Color based on average change
-                let color;
-                if (avgChange >= 1.0) color = '#22c55e';
-                else if (avgChange >= 0.25) color = '#4ade80';
-                else if (avgChange >= 0) color = '#86efac';
-                else if (avgChange >= -0.25) color = '#fca5a5';
-                else if (avgChange >= -1.0) color = '#f87171';
-                else color = '#ef4444';
-                
-                clusters.push({{
-                    regionKey: regionKey,
-                    name: region.name,
-                    lat: region.center.lat,
-                    lon: region.center.lon,
-                    count: items.length,
-                    avgChange: avgChange,
-                    color: color,
-                    items: items
-                }});
+            for (var i = 0; i < ohlc.length; i++) {{
+                var o = ohlc[i][1], hi = ohlc[i][2], lo = ohlc[i][3], c = ohlc[i][4];
+                var x = pad + i * gap + gap / 2;
+                var yH = h - ((hi - mn) / rng) * (h - 4) - 2;
+                var yL = h - ((lo - mn) / rng) * (h - 4) - 2;
+                var yO = h - ((o - mn) / rng) * (h - 4) - 2;
+                var yC = h - ((c - mn) / rng) * (h - 4) - 2;
+                var bull = c >= o;
+                var clr = bull ? '#33ff33' : '#ff3333';
+                var bodyTop = Math.min(yO, yC);
+                var bodyH = Math.max(1, Math.abs(yC - yO));
+                /* Wick */
+                svg += '<line x1="' + x.toFixed(1) + '" y1="' + yH.toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yL.toFixed(1) + '" stroke="' + clr + '" stroke-width="0.8"/>';
+                /* Body */
+                svg += '<rect x="' + (x - cw / 2).toFixed(1) + '" y="' + bodyTop.toFixed(1) + '" width="' + cw.toFixed(1) + '" height="' + bodyH.toFixed(1) + '" fill="' + (bull ? clr : clr) + '" stroke="' + clr + '" stroke-width="0.5"/>';
             }}
-            
-            return {{ clusters, singles: unassigned }};
+            svg += '</svg>';
+            return svg;
         }}
-        
-        function buildTraces(showClusters) {{
-            const traces = [];
-            
-            if (mapData.length === 0) {{
-                traces.push({{
-                    type: 'scattergeo',
-                    lon: [],
-                    lat: [],
-                    mode: 'markers',
-                    marker: {{ size: 10 }},
-                    showlegend: false
-                }});
-                return traces;
+
+        /* Format change with sign and color class */
+        function fmtChange(pct) {{
+            var sign = pct >= 0 ? '+' : '';
+            var cls = pct >= 0 ? 'tt-pos' : 'tt-neg';
+            return '<span class="' + cls + '">' + sign + pct.toFixed(2) + '%</span>';
+        }}
+
+        /* Show hover tooltip near cursor */
+        function showTooltip(evt, ticker) {{
+            var info = d.item_regions[ticker];
+            if (!info) return;
+            var region = info.display;
+            var key = info.key;
+            var items = d.region_items[key] || [];
+            var item = null;
+            for (var i = 0; i < items.length; i++) {{
+                if (items[i].symbol === ticker) {{ item = items[i]; break; }}
             }}
-            
-            if (showClusters) {{
-                // Show region clusters
-                const {{ clusters, singles }} = clusterByRegion(mapData);
-                
-                if (clusters.length > 0) {{
-                    // Glow effect layer
-                    traces.push({{
-                        type: 'scattergeo',
-                        lon: clusters.map(c => c.lon),
-                        lat: clusters.map(c => c.lat),
-                        mode: 'markers',
-                        marker: {{
-                            size: clusters.map(c => Math.min(25 + c.count * 5, 55)),
-                            color: clusters.map(c => c.color),
-                            opacity: 0.2,
-                            line: {{ width: 0 }}
-                        }},
-                        hoverinfo: 'skip',
-                        showlegend: false
-                    }});
-                    
-                    // Main cluster markers
-                    const clusterHoverTexts = clusters.map(c => {{
-                        const items = c.items.map(item => 
-                            `<b>${{item.name}}</b>: ${{item.change > 0 ? '+' : ''}}${{item.change.toFixed(2)}}%`
-                        ).join('<br>');
-                        return `<b>${{c.name}}</b><br>${{c.count}} indices (avg: ${{c.avgChange > 0 ? '+' : ''}}${{c.avgChange.toFixed(2)}}%)<br><br>${{items}}`;
-                    }});
-                    
-                    traces.push({{
-                        type: 'scattergeo',
-                        lon: clusters.map(c => c.lon),
-                        lat: clusters.map(c => c.lat),
-                        mode: 'markers',
-                        marker: {{
-                            size: clusters.map(c => Math.min(15 + c.count * 3, 35)),
-                            color: clusters.map(c => c.color),
-                            opacity: 0.85,
-                            line: {{ width: 2, color: '#d4a574' }},
-                            symbol: 'circle'
-                        }},
-                        text: clusters.map(c => c.name),
-                        customdata: clusterHoverTexts,
-                        hovertemplate: '%{{customdata}}<extra></extra>',
-                        showlegend: false
-                    }});
-                }}
-                
-                // Show unassigned as singles
-                if (singles.length > 0) {{
-                    const singleHoverTexts = singles.map(d => 
-                        `<b>${{d.name}}</b><br>${{d.price}}<br>${{d.change > 0 ? '+' : ''}}${{d.change.toFixed(2)}}%`
-                    );
-                    
-                    traces.push({{
-                        type: 'scattergeo',
-                        lon: singles.map(d => d.lon),
-                        lat: singles.map(d => d.lat),
-                        mode: 'markers',
-                        marker: {{
-                            size: 10,
-                            color: singles.map(d => d.color),
-                            line: {{ width: 1.5, color: '#0a0a0a' }},
-                            opacity: 0.95
-                        }},
-                        text: singles.map(d => d.name),
-                        customdata: singleHoverTexts,
-                        hovertemplate: '%{{customdata}}<extra></extra>',
-                        showlegend: false
-                    }});
-                }}
+            if (!item) return;
+            /* Use intraday ticks for sparkline, fallback to d.histories */
+            var ohlc = (d.intraday_ohlc || {{}})[ticker];
+            var spark = '';
+            if (ohlc && ohlc.length >= 2) {{
+                var tickHist = ohlc.map(function(b) {{ return [b[0], b[4]]; }});
+                spark = makeSpark(tickHist, 120, 30, item.change_pct);
             }} else {{
-                // Show all individual points
-                const hoverTexts = mapData.map(d => 
-                    `<b>${{d.name}}</b><br>${{d.price}}<br>${{d.change > 0 ? '+' : ''}}${{d.change.toFixed(2)}}%`
-                );
-                
-                traces.push({{
-                    type: 'scattergeo',
-                    lon: mapData.map(d => d.lon),
-                    lat: mapData.map(d => d.lat),
-                    mode: 'markers',
-                    marker: {{
-                        size: 10,
-                        color: mapData.map(d => d.color),
-                        line: {{ width: 1.5, color: '#0a0a0a' }},
-                        opacity: 0.95
-                    }},
-                    text: mapData.map(d => d.name),
-                    customdata: hoverTexts,
-                    hovertemplate: '%{{customdata}}<extra></extra>',
-                    showlegend: false
-                }});
+                var hist = d.histories[ticker];
+                spark = makeSpark(hist, 120, 30, item.change_pct);
             }}
-            
-            return traces;
+            var tt = document.getElementById('tooltip');
+            tt.innerHTML =
+                '<div class="tt-region">' + region + '</div>' +
+                '<div class="tt-name">' + item.name + '</div>' +
+                (spark ? '<div class="tt-spark">' + spark + '</div>' : '') +
+                '<div class="tt-price">' + item.price_str + '</div>' +
+                '<div class="tt-change">' + fmtChange(item.change_pct) + '</div>';
+            tt.style.display = 'block';
+            /* Position near cursor */
+            var x = (evt.clientX || evt.pageX || 0) + 14;
+            var y = (evt.clientY || evt.pageY || 0) + 14;
+            if (x + 310 > window.innerWidth) x = x - 330;
+            if (y + 160 > window.innerHeight) y = y - 170;
+            tt.style.left = x + 'px';
+            tt.style.top = y + 'px';
         }}
-        
-        function getLayout() {{
-            return {{
-                geo: {{
-                    projection: {{ 
-                        type: 'natural earth',
-                        scale: 1.1
-                    }},
-                    showland: true,
-                    landcolor: '#1a1a1a',
-                    oceancolor: '#0a0a0a',
-                    coastlinecolor: '#d4a574',
-                    coastlinewidth: 0.5,
-                    showcountries: true,
-                    countrycolor: '#333',
-                    countrywidth: 0.3,
-                    showframe: false,
-                    bgcolor: '#0a0a0a',
-                    showocean: true,
-                    fitbounds: false,
-                    resolution: 110,
-                    lataxis: {{ range: [-55, 75] }},
-                    lonaxis: {{ range: [-170, 180] }},
-                    center: {{ lat: 20, lon: 10 }}
+        function hideTooltip() {{
+            document.getElementById('tooltip').style.display = 'none';
+        }}
+
+        /* Show detail overlay */
+        /* Format large numbers with K/M/B suffixes */
+        function fmtVol(v) {{
+            if (!v || v === 0) return '-';
+            if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+            if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+            if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+            return v.toString();
+        }}
+        function fmtP(v) {{
+            if (!v || v === 0) return '-';
+            return v >= 100 ? v.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) : v.toFixed(4);
+        }}
+
+        function showOverlay(ticker) {{
+            var info = d.item_regions[ticker];
+            if (!info) return;
+            var region = info.display;
+            var key = info.key;
+            var items = d.region_items[key] || [];
+            var clickedItem = null;
+            for (var i = 0; i < items.length; i++) {{
+                if (items[i].symbol === ticker) {{ clickedItem = items[i]; break; }}
+            }}
+            if (!clickedItem) return;
+
+            /* Prefer intraday candle chart from WS ticks, fallback to historic OHLC/sparkline */
+            var intradayOhlc = (d.intraday_ohlc || {{}})[ticker];
+            var chart = '';
+            if (intradayOhlc && intradayOhlc.length >= 2) {{
+                chart = makeCandle(intradayOhlc, 460, 120);
+            }}
+            if (!chart) {{
+                var ohlc = d.ohlc_histories[ticker];
+                chart = ohlc ? makeCandle(ohlc, 460, 120) : '';
+            }}
+            if (!chart) {{
+                var hist = d.histories[ticker];
+                chart = makeSpark(hist, 460, 60, clickedItem.change_pct);
+            }}
+
+            var html = '<div class="ov-header">' +
+                '<span class="ov-region">' + region + '</span>' +
+                '<button class="ov-close" onclick="hideOverlay()">&times;</button></div>';
+            html += '<div class="ov-main">';
+            html += '<div class="ov-main-name">' + clickedItem.name + '</div>';
+            if (chart) html += '<div style="margin:8px 0;">' + chart + '</div>';
+            html += '<div class="ov-main-row">';
+            html += '<span class="ov-main-price">' + clickedItem.price_str + '</span>';
+            html += '<span class="ov-main-change">' + fmtChange(clickedItem.change_pct) + '</span>';
+            html += '</div>';
+
+            /* WS extra data row: Open | Day High | Day Low | Prev Close | Volume */
+            var wi = (d.ws_info || {{}})[ticker];
+            if (wi) {{
+                html += '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">';
+                var fields = [
+                    ['Open', wi.open_price],
+                    ['High', wi.day_high],
+                    ['Low', wi.day_low],
+                    ['Prev', wi.previous_close],
+                    ['Vol', wi.day_volume]
+                ];
+                for (var f = 0; f < fields.length; f++) {{
+                    var lbl = fields[f][0];
+                    var val = fields[f][1];
+                    var vs = (lbl === 'Vol') ? fmtVol(val) : fmtP(val);
+                    html += '<div style="background:#1a1a1a;border-radius:4px;padding:4px 8px;font-size:11px;text-align:center;">' +
+                        '<div style="color:#666;font-size:9px;text-transform:uppercase;">' + lbl + '</div>' +
+                        '<div style="color:#ccc;font-weight:600;">' + vs + '</div></div>';
+                }}
+                html += '</div>';
+            }}
+            html += '</div>';
+
+            html += '<table class="ov-table">';
+            for (var i = 0; i < items.length; i++) {{
+                var it = items[i];
+                if (it.symbol === ticker) continue;
+                html += '<tr>' +
+                    '<td class="ov-tname">' + it.name + '</td>' +
+                    '<td class="ov-tprice">' + it.price_str + '</td>' +
+                    '<td class="ov-tchange">' + fmtChange(it.change_pct) + '</td>' +
+                    '</tr>';
+            }}
+            html += '</table>';
+            document.getElementById('overlay-content').innerHTML = html;
+            document.getElementById('overlay-backdrop').style.display = 'block';
+            document.getElementById('detail-overlay').style.display = 'block';
+            hideTooltip();
+        }}
+        function hideOverlay() {{
+            document.getElementById('overlay-backdrop').style.display = 'none';
+            document.getElementById('detail-overlay').style.display = 'none';
+        }}
+
+        function renderPlot() {{
+            console.log('renderPlot() called, Plotly version: ' + (typeof Plotly !== 'undefined' ? Plotly.version : 'NOT LOADED'));
+            try {{
+            var mapDiv = document.getElementById('map');
+            Plotly.newPlot(mapDiv, [{{
+                type: 'treemap',
+                ids: d.ids,
+                labels: d.labels,
+                parents: d.parents,
+                values: d.values,
+                text: d.text,
+                marker: {{
+                    colors: d.colors,
+                    colorscale: [
+                        [0,    '#ff3333'],
+                        [0.35, '#8b0000'],
+                        [0.5,  '#262626'],
+                        [0.65, '#006400'],
+                        [1,    '#33ff33']
+                    ],
+                    cmid: 0,
+                    cmin: -3,
+                    cmax: 3,
+                    line: {{ width: 0.5, color: '#0a0a0a' }}
                 }},
+                textinfo: 'label+text',
+                textposition: 'middle center',
+                hoverinfo: 'none',
+                insidetextfont: {{ color: '#e8e8e8', size: d.font_sizes }},
+                pathbar: {{ visible: false }},
+                tiling: {{ pad: 1 }},
+                branchvalues: 'total',
+                maxdepth: 2,
+                uniformtext: {{ minsize: 5, mode: 'show' }}
+            }}], {{
                 margin: {{ l: 0, r: 0, t: 0, b: 0 }},
                 paper_bgcolor: '#0a0a0a',
                 plot_bgcolor: '#0a0a0a',
-                autosize: true,
-                hoverlabel: {{
-                    bgcolor: '#1a1a1a',
-                    font: {{ size: 11, family: 'monospace', color: '#ffaa00' }},
-                    bordercolor: '#d4a574',
-                    align: 'left'
-                }},
-                dragmode: 'pan'
-            }};
-        }}
-        
-        function buildMap() {{
-            const showClusters = currentZoomLevel > ZOOM_THRESHOLD;
-            const traces = buildTraces(showClusters);
-            const layout = getLayout();
-            
-            Plotly.newPlot('map', traces, layout, {{ 
-                displayModeBar: false, 
-                responsive: true,
-                scrollZoom: true
+                font: {{ color: '#e8e8e8', family: 'Arial, Helvetica, sans-serif' }},
+                autosize: true
+            }}, {{
+                displayModeBar: false,
+                responsive: true
             }});
-            
-            // Listen for zoom/pan events
-            const mapDiv = document.getElementById('map');
-            mapDiv.on('plotly_relayout', function(eventData) {{
-                let newZoomLevel = currentZoomLevel;
-                
-                // Calculate visible longitude range
-                if (eventData['geo.lonaxis.range']) {{
-                    const lonRange = eventData['geo.lonaxis.range'];
-                    newZoomLevel = Math.abs(lonRange[1] - lonRange[0]);
-                }} else if (eventData['geo.projection.scale']) {{
-                    // Estimate from scale
-                    newZoomLevel = 350 / eventData['geo.projection.scale'];
-                }}
-                
-                // Check if we need to switch between clusters and individual points
-                const wasShowingClusters = currentZoomLevel > ZOOM_THRESHOLD;
-                const shouldShowClusters = newZoomLevel > ZOOM_THRESHOLD;
-                
-                if (wasShowingClusters !== shouldShowClusters) {{
-                    currentZoomLevel = newZoomLevel;
-                    
-                    // Rebuild with new display mode, preserving current view
-                    const newTraces = buildTraces(shouldShowClusters);
-                    
-                    // Get current geo settings
-                    const currentGeo = mapDiv._fullLayout.geo;
-                    const newLayout = getLayout();
-                    
-                    // Preserve current view bounds if available
-                    if (currentGeo) {{
-                        if (currentGeo.lonaxis && currentGeo.lonaxis.range) {{
-                            newLayout.geo.lonaxis.range = currentGeo.lonaxis.range;
-                        }}
-                        if (currentGeo.lataxis && currentGeo.lataxis.range) {{
-                            newLayout.geo.lataxis.range = currentGeo.lataxis.range;
-                        }}
-                        if (currentGeo.projection && currentGeo.projection.scale) {{
-                            newLayout.geo.projection.scale = currentGeo.projection.scale;
-                        }}
-                        if (currentGeo.center) {{
-                            newLayout.geo.center = currentGeo.center;
-                        }}
+
+            /* Click handler: overlay for items, drill-down for regions */
+            mapDiv.on('plotly_treemapclick', function(data) {{
+                if (data && data.points && data.points.length > 0) {{
+                    var point = data.points[0];
+                    var id = point.id || '';
+                    if (id.indexOf('item:') === 0) {{
+                        var ticker = id.replace('item:', '');
+                        console.log('TREEMAP_CLICK:' + ticker);
+                        showOverlay(ticker);
+                        return false;  /* Prevent drill-down for items */
                     }}
-                    
-                    Plotly.react('map', newTraces, newLayout);
-                }} else {{
-                    currentZoomLevel = newZoomLevel;
+                    /* Region clicks: allow drill-down (don't return false) */
                 }}
             }});
-            
-            // Resize on window changes
+
+            /* Hover handler: custom tooltip */
+            mapDiv.on('plotly_hover', function(data) {{
+                if (data && data.points && data.points.length > 0) {{
+                    var point = data.points[0];
+                    var id = point.id || '';
+                    if (id.indexOf('item:') === 0) {{
+                        var ticker = id.replace('item:', '');
+                        showTooltip(data.event, ticker);
+                    }}
+                }}
+            }});
+            mapDiv.on('plotly_unhover', function() {{
+                hideTooltip();
+            }});
+
             window.addEventListener('resize', function() {{
                 Plotly.Plots.resize('map');
             }});
+            /* Close overlay on Escape */
+            document.addEventListener('keydown', function(e) {{
+                if (e.key === 'Escape') hideOverlay();
+            }});
+            console.log('renderPlot() completed successfully');
+            }} catch(err) {{
+                console.log('renderPlot() ERROR: ' + err.message);
+                document.getElementById('map').innerHTML =
+                    '<div style="color:#ef4444;font-family:monospace;font-size:13px;display:flex;align-items:center;justify-content:center;height:100%;">' +
+                    'Plotly error: ' + err.message + '</div>';
+            }}
         }}
-        
-        buildMap();
+
+        /* ---- Live WebSocket price updates (called from Python via runJavaScript) ---- */
+        var _flashTimers = {{}};
+        d.intraday_ohlc = d.intraday_ohlc || {{}};
+        d.ws_info = d.ws_info || {{}};
+
+        window.updatePrices = function(payload) {{
+            var updates = payload.updates || {{}};
+            var changedTickers = [];
+            var changedDirs = {{}};
+
+            /* Store intraday OHLC and extra WS info */
+            if (payload.intraday) {{
+                for (var sym in payload.intraday) d.intraday_ohlc[sym] = payload.intraday[sym];
+            }}
+            if (payload.ws_info) {{
+                for (var sym in payload.ws_info) d.ws_info[sym] = payload.ws_info[sym];
+            }}
+
+            for (var symbol in updates) {{
+                var itemId = 'item:' + symbol;
+                var idx = d.ids.indexOf(itemId);
+                if (idx === -1) continue;
+
+                var upd = updates[symbol];
+                var oldPct = d.colors[idx];
+                var newPct = upd.change_pct;
+
+                var sign = newPct >= 0 ? '+' : '';
+                d.text[idx] = sign + newPct.toFixed(2) + '%';
+                d.colors[idx] = newPct;
+
+                /* Update region data for tooltips/overlays */
+                var info = d.item_regions[symbol];
+                if (info) {{
+                    var ritems = d.region_items[info.key] || [];
+                    for (var j = 0; j < ritems.length; j++) {{
+                        if (ritems[j].symbol === symbol) {{
+                            ritems[j].change_pct = newPct;
+                            var p = upd.price;
+                            ritems[j].price_str = p >= 100
+                                ? p.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})
+                                : (p > 0 ? p.toFixed(4) : 'N/A');
+                            break;
+                        }}
+                    }}
+                }}
+
+                var dt = symbol.replace(/^\^/, '').replace(/=X$/, '').replace(/=F$/, '');
+                changedTickers.push(dt);
+                changedDirs[dt] = newPct > oldPct ? 'up' : (newPct < oldPct ? 'down' : 'same');
+            }}
+
+            if (changedTickers.length === 0) return;
+
+            var mapDiv = document.getElementById('map');
+            /* Preserve current drill-down level (e.g. 'region:EUROPE') */
+            var curLevel = (mapDiv.data && mapDiv.data[0]) ? mapDiv.data[0].level : undefined;
+            var trace = {{
+                type: 'treemap',
+                ids: d.ids, labels: d.labels, parents: d.parents,
+                values: d.values, text: d.text,
+                marker: {{
+                    colors: d.colors,
+                    colorscale: [[0,'#ff3333'],[0.35,'#8b0000'],[0.5,'#262626'],[0.65,'#006400'],[1,'#33ff33']],
+                    cmid: 0, cmin: -3, cmax: 3,
+                    line: {{ width: 0.5, color: '#0a0a0a' }}
+                }},
+                textinfo: 'label+text',
+                textposition: 'middle center',
+                hoverinfo: 'none',
+                insidetextfont: {{ color: '#e8e8e8', size: d.font_sizes }},
+                pathbar: {{ visible: false }},
+                tiling: {{ pad: 1 }},
+                branchvalues: 'total',
+                maxdepth: 2,
+                uniformtext: {{ minsize: 5, mode: 'show' }}
+            }};
+            if (curLevel) trace.level = curLevel;
+            Plotly.react(mapDiv, [trace], {{
+                margin: {{ l: 0, r: 0, t: 0, b: 0 }},
+                paper_bgcolor: '#0a0a0a',
+                plot_bgcolor: '#0a0a0a',
+                font: {{ color: '#e8e8e8', family: 'Arial, Helvetica, sans-serif' }},
+                autosize: true
+            }});
+
+            /* Flash the %-text on changed tiles */
+            setTimeout(function() {{
+                var allText = document.querySelectorAll('#map text');
+                allText.forEach(function(textEl) {{
+                    var tspans = textEl.querySelectorAll('tspan');
+                    if (tspans.length < 1) return;
+                    var label = (tspans[0].textContent || '').trim();
+                    var dir = changedDirs[label];
+                    if (!dir || dir === 'same') return;
+
+                    var target = tspans.length > 1 ? tspans[tspans.length - 1] : tspans[0];
+                    var flashColor = dir === 'up' ? '#00ff00' : '#ff4444';
+
+                    if (_flashTimers[label]) clearTimeout(_flashTimers[label]);
+                    target.setAttribute('fill', flashColor);
+                    _flashTimers[label] = setTimeout(function() {{
+                        target.setAttribute('fill', '#e8e8e8');
+                    }}, 2000);
+                }});
+            }}, 100);
+        }};
+
+        // Wait for Plotly to be available before rendering
+        if (typeof Plotly !== 'undefined') {{
+            console.log('Plotly already available, rendering immediately');
+            renderPlot();
+        }} else {{
+            console.log('Plotly not yet loaded, waiting for script...');
+            var plotlyScript = document.querySelector('script[src*="plotly"]');
+            if (plotlyScript) {{
+                plotlyScript.addEventListener('load', function() {{
+                    console.log('Plotly script loaded via event');
+                    renderPlot();
+                }});
+                plotlyScript.addEventListener('error', function(e) {{
+                    console.log('Plotly script FAILED to load: ' + e.type);
+                    document.getElementById('map').innerHTML =
+                        '<div style="color:#ef4444;font-family:monospace;font-size:13px;display:flex;align-items:center;justify-content:center;height:100%;">' +
+                        'Failed to load Plotly library. Check internet connection.</div>';
+                }});
+            }}
+        }}
     </script>
 </body>
 </html>
 '''
-        self.map_widget.setHtml(html)
-    
-    def build_map_data(self, spots_data: List[Dict]) -> List[Dict]:
-        """Convert spot data to map format with coordinates."""
-
-        NYC_LON = -74.01096
-        NYC_LAT = 40.70694
-        r = 0.5
-
-        # Market locations (longitude, latitude)
-        locations = {
-        
-            # ======================
-            # America
-            # ======================
-            '^GSPC': (NYC_LON + 0.0000, NYC_LAT + r),       # norr
-            '^DJI':  (NYC_LON + r,       NYC_LAT + 0.0000), # öst
-            '^NDX':  (NYC_LON + 0.0000, NYC_LAT - r),       # syd
-            '^RUT':  (NYC_LON - r,       NYC_LAT + 0.0000), # väst
-        
-            '^GSPTSE': (-79.3832, 43.6532),      # TSX Composite – Toronto
-        
-            '^MXX': (-99.1332, 19.4326),         # Mexico – Mexico City
-            '^BVSP': (-46.6333, -23.5505),       # Brazil – São Paulo
-            '^MERV': (-58.3816, -34.6037),       # Argentina – Buenos Aires
-            '^IPSA': (-70.6693, -33.4489),       # Chile – Santiago
-            '^COLO-IV': (-74.0721, 4.7110),      # Colombia – Bogotá
-        
-            # ======================
-            # Europe
-            # ======================
-            '^FTSE': (-0.1278, 51.5074),         # UK – London
-            '^FCHI': (2.3522, 48.8566),          # France – Paris
-            '^STOXX': (4.0000, 50.0000),         # STOXX Europe 600 (central)
-            '^AEX': (4.9041, 52.3676),           # Netherlands – Amsterdam
-            '^GDAXI': (8.6821, 50.1109),         # Germany – Frankfurt
-            '^SSMI': (8.5417, 47.3769),          # Switzerland – Zurich
-            '^ATX': (16.3738, 48.2082),          # Austria – Vienna
-            '^IBEX': (-3.7038, 40.4168),         # Spain – Madrid
-            'FTSEMIB.MI': (9.1900, 45.4642),     # Italy – Milan
-            'PSI20.LS': (-9.1393, 38.7223),      # Portugal – Lisbon
-            '^BFX': (4.3517, 50.8503),           # Belgium – Brussels
-            '^ISEQ': (-6.2603, 53.3498),         # Ireland – Dublin
-            '^OMX': (18.0686, 59.3293),          # Sweden – Stockholm
-            'OBX.OL': (10.7522, 59.9139),        # Norway – Oslo
-            '^OMXC25': (12.5683, 55.6761),       # Denmark – Copenhagen
-            '^OMXH25': (24.9384, 60.1699),       # Finland – Helsinki
-            'WIG20.WA': (21.0122, 52.2297),      # Poland – Warsaw
-            'XU100.IS': (28.9784, 41.0082),      # Turkey – Istanbul
-        
-            # ======================
-            # Middle East
-            # ======================
-            '^TA125.TA': (34.7818, 32.0853),     # Israel – Tel Aviv
-            '^TASI.SR': (46.6753, 24.7136),      # Saudi Arabia – Riyadh
-            'DFMGI.AE': (55.2708, 25.2048),      # UAE – Dubai
-            'FADGI.FGI': (54.3773, 24.4539),     # UAE – Abu Dhabi
-            '^GNRI.QA': (51.5310, 25.2854),      # Qatar – Doha
-        
-            # ======================
-            # Africa
-            # ======================
-            '^JN0U.JO': (28.0473, -26.2041),     # South Africa – Johannesburg
-            '^CASE30': (31.2357, 30.0444),       # Egypt – Cairo
-        
-            # ======================
-            # Asia
-            # ======================
-            '^N225': (139.6917, 35.6895),        # Japan – Tokyo
-            '^HSI': (114.1694, 22.3193),         # Hong Kong
-            '000001.SS': (121.4737, 31.2304),    # China – Shanghai
-            '^KS11': (126.9780, 37.5665),        # South Korea – Seoul
-            '^TWII': (121.5654, 25.0330),        # Taiwan – Taipei
-            '^NSEI': (72.8777, 19.0760),         # India – Mumbai
-            '^BSESN': (72.8777, 19.0760),        # India – Mumbai
-            '^STI': (103.8198, 1.3521),          # Singapore
-            '^JKSE': (106.8456, -6.2088),        # Indonesia – Jakarta
-            '^KLSE': (101.6869, 3.1390),         # Malaysia – Kuala Lumpur
-            '^SET50.BK': (100.5018, 13.7563),    # Thailand – Bangkok
-            '^VNINDEX.VN': (106.6297, 10.8231),  # Vietnam – Ho Chi Minh City
-            'PSEI.PS': (120.9842, 14.5995),      # Philippines – Manila
-            '000300.SS': (121.4737, 31.2304),    # China – Shanghai (CSI 300)
-            '399106.SZ': (114.0579, 22.5431),    # China – Shenzhen
-        
-            # ======================
-            # Oceania
-            # ======================
-            '^AXJO': (151.2093, -33.8688),       # Australia – Sydney
-            '^NZ50': (174.7762, -41.2865),       # New Zealand – Wellington
-        }
-        
-        map_data = []
-        for item in spots_data:
-            ticker = item['ticker']
-            if ticker in locations:
-                lon, lat = locations[ticker]
-                map_data.append({
-                    'ticker': ticker,
-                    'name': item['name'],
-                    'lon': lon,
-                    'lat': lat,
-                    'change': item['change'],
-                    'price': item.get('price', ''),
-                    'color': item.get('color', '#ffc107')
-                })
-        
-        return map_data
+        # Write to temp file and load via file:// URL so external scripts can load
+        try:
+            treemap_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Trading')
+            os.makedirs(treemap_dir, exist_ok=True)
+            tmp_path = os.path.join(treemap_dir, 'treemap.html')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            file_url = QUrl.fromLocalFile(tmp_path)
+            print(f'[MarketWatch] Treemap HTML written to: {tmp_path} ({len(html)} bytes)')
+            self.map_widget.load(file_url)
+        except Exception as e:
+            print(f'[MarketWatch] Treemap file write error: {e}')
+            self.map_widget.setHtml(html)
 
     # ========================================================================
     # ACTIONS & SLOTS
@@ -9392,12 +10467,9 @@ class PairsTradingTerminal(QMainWindow):
         self._startup_worker = None
         self._startup_thread = None
         
-        # Get HMM cache path
-        hmm_cache_path = Paths.regime_cache_file()
-        
         # Create and start startup worker
         self._startup_thread = QThread()
-        self._startup_worker = StartupWorker(PORTFOLIO_FILE, ENGINE_CACHE_FILE, hmm_cache_path)
+        self._startup_worker = StartupWorker(PORTFOLIO_FILE, ENGINE_CACHE_FILE)
         self._startup_worker.moveToThread(self._startup_thread)
         
         # Connect signals
@@ -9410,7 +10482,6 @@ class PairsTradingTerminal(QMainWindow):
         # Connect data signals to handlers
         self._startup_worker.portfolio_loaded.connect(self._on_startup_portfolio_loaded)
         self._startup_worker.engine_loaded.connect(self._on_startup_engine_loaded)
-        self._startup_worker.hmm_loaded.connect(self._on_startup_hmm_loaded)
         self._startup_worker.status_message.connect(self.statusBar().showMessage)
         
         # Start loading
@@ -9421,22 +10492,56 @@ class PairsTradingTerminal(QMainWindow):
         """Handle portfolio loaded from startup worker."""
         self.portfolio = positions
         self.trade_history = load_trade_history(PORTFOLIO_FILE)
+        self._migrate_trade_history()
         if self._tabs_loaded.get(4, False):
             self.update_portfolio_display()
         self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
         if os.path.exists(PORTFOLIO_FILE):
             self._portfolio_file_mtime = os.path.getmtime(PORTFOLIO_FILE)
     
+    def _migrate_trade_history(self):
+        """Migrate trade history: recalculate capital and result from MF data."""
+        changed = False
+        for trade in self.trade_history:
+            entry_y = trade.get('mf_entry_price_y')
+            entry_x = trade.get('mf_entry_price_x')
+            qty_y = trade.get('mf_qty_y', 0)
+            qty_x = trade.get('mf_qty_x', 0)
+
+            # Recalculate capital from actual invested amount
+            actual_capital = 0
+            if entry_y and qty_y:
+                actual_capital += entry_y * qty_y
+            if entry_x and qty_x:
+                actual_capital += entry_x * qty_x
+
+            if actual_capital > 0 and trade.get('capital', 0) != actual_capital:
+                trade['capital'] = actual_capital
+                # Recalculate P/L percentage with correct capital
+                pnl_sek = trade.get('realized_pnl_sek', 0)
+                trade['realized_pnl_pct'] = round(pnl_sek / actual_capital * 100, 2)
+                changed = True
+
+            # Fix result based on actual P/L (not Z-score direction)
+            close_y = trade.get('mf_close_price_y')
+            close_x = trade.get('mf_close_price_x')
+            has_mf = (entry_y and close_y and qty_y) or (entry_x and close_x and qty_x)
+            if has_mf:
+                pnl_sek = trade.get('realized_pnl_sek', 0)
+                correct_result = "PROFIT" if pnl_sek >= 0 else "LOSS"
+                if trade.get('result') != correct_result:
+                    trade['result'] = correct_result
+                    changed = True
+
+        if changed:
+            save_portfolio(self.portfolio, trade_history=self.trade_history)
+            print("[Migration] Trade history capital and result fields updated")
+
     def _on_startup_engine_loaded(self, cache_data: dict):
         """Handle engine cache loaded from startup worker."""
         self._apply_engine_cache(cache_data)
         if os.path.exists(ENGINE_CACHE_FILE):
             self._engine_cache_mtime = os.path.getmtime(ENGINE_CACHE_FILE)
-    
-    def _on_startup_hmm_loaded(self, detector):
-        """Handle HMM detector loaded from startup worker."""
-        self.detector = detector
-        self.update_hmm_display()
     
     def _on_startup_finished(self):
         """Handle startup worker finished - start market data fetching.
@@ -9451,10 +10556,9 @@ class PairsTradingTerminal(QMainWindow):
         
         # Markera att startup är klar
         self._startup_complete = True
-        
-        # Start the refresh chain: market watch → volatility → news (sequentiell)
-        # News chains from volatility completion with 15-min cooldown check
-        QTimer.singleShot(500, lambda: self.refresh_market_watch(force_full=True))
+
+        # WS-first: start WebSocket for all market tickers (replaces yf.download for treemap)
+        QTimer.singleShot(500, self._start_ws_market_feed)
     
     def load_saved_portfolio(self):
         """Load saved portfolio positions from file."""
@@ -9679,8 +10783,11 @@ class PairsTradingTerminal(QMainWindow):
                             local_keys.add(key)
                     self.trade_history = merged_history
                     
-                    # Filter out positions that are in trade_history
-                    closed_keys = {(t['pair'], t.get('entry_date', '')) for t in self.trade_history}
+                    # Filter out positions that are CLOSED in trade_history
+                    closed_keys = {(t['pair'], t.get('entry_date', ''))
+                                   for t in self.trade_history
+                                   if t.get('status') not in ('OPEN', None)
+                                   and t.get('close_date')}
                     filtered = [p for p in new_positions
                                 if (p['pair'], p.get('entry_date', '')) not in closed_keys]
                     self.portfolio = filtered
@@ -9731,735 +10838,13 @@ class PairsTradingTerminal(QMainWindow):
             if os.path.exists(PORTFOLIO_FILE):
                 self._portfolio_file_mtime = os.path.getmtime(PORTFOLIO_FILE)
     
-    def load_cached_hmm(self):
-        """Load cached HMM model and update all UI elements.
-        
-        Prioritizes AdvancedRegimeDetector cache, falls back to basic RegimeDetector.
-        """
-        # Regime icons (3-state model)
-        regime_icons = {
-            0: "▲",   # RISK-ON - up arrow
-            1: "●",   # NEUTRAL - circle
-            2: "▼",   # RISK-OFF - down arrow
-        }
-        
-        # First try to load AdvancedRegimeDetector cache
-        advanced_cache_path = Paths.regime_cache_file()
-        
-        if os.path.exists(advanced_cache_path):
-            try:
-                import pickle
-                with open(advanced_cache_path, 'rb') as f:
-                    cache_data = pickle.load(f)
-                
-                # Get detector directly from cache
-                if 'detector' in cache_data:
-                    detector = cache_data['detector']
-                    cache_time = cache_data.get('timestamp', None)
-                else:
-                    # Old format - the cache is the detector itself
-                    detector = cache_data
-                    cache_time = None
-                
-                if detector.fitted:
-                    self.detector = detector
-                    
-                    # Get current regime using advanced method
-                    regime_data = detector.get_current_regime()
-                    
-                    if regime_data and 'primary' in regime_data:
-                        primary = regime_data['primary']
-                        current_state = primary.get('state_id', 0)
-                        regime_info = REGIMES.get(current_state, REGIMES[0])
-                        prob = primary.get('probability', 0.5)
-                        
-                        # Set main regime display
-                        icon = regime_icons.get(current_state, "●")
-                        self.regime_icon_label.setText(icon)
-                        self.regime_icon_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 28px; background: transparent; border: none;")
-                        
-                        self.regime_name_label.setText(f"{regime_info['name']}")
-                        self.regime_name_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 18px; font-weight: 700; background: transparent; border: none;")
-                        self.regime_prob_label.setText(f"Confidence: {prob:.0%}")
-                        self.regime_desc_label.setText(regime_info['description'])
-                        
-                        # Update advanced statistics
-                        self._update_regime_statistics_advanced(detector, regime_data)
-                    
-            except (ImportError, ModuleNotFoundError) as e:
-                # Cache was created with old module structure - delete it
-                print(f"Cache incompatible with new module structure, deleting: {e}")
-                try:
-                    os.remove(advanced_cache_path)
-                    print(f"Deleted old cache file: {advanced_cache_path}")
-                except:
-                    pass
-            except Exception as e:
-                print(f"Advanced HMM cache load error: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Fall back to basic RegimeDetector with new API
-        try:
-            detector = RegimeDetector(model_type='hsmm', lookback_years=30)
-            if detector.load_model():
-                self.detector = detector
-                
-                # Get current regime
-                regime_data = detector.get_current_regime()
-                if regime_data and 'primary' in regime_data:
-                    primary = regime_data['primary']
-                    current_state = primary.get('state_id', 0)
-                    regime_info = REGIMES.get(current_state, REGIMES[0])
-                    prob = primary.get('probability', 0.5)
-                    
-                    # Set main regime display
-                    icon = regime_icons.get(current_state, "●")
-                    self.regime_icon_label.setText(icon)
-                    self.regime_icon_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 28px; background: transparent; border: none;")
-                    
-                    self.regime_name_label.setText(f"{regime_info['name']}")
-                    self.regime_name_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 18px; font-weight: 600; background: transparent; border: none;")
-                    self.regime_prob_label.setText(f"Confidence: {prob:.0%}")
-                    self.regime_desc_label.setText(regime_info['description'])
-                    
-                    # Update statistics
-                    self._update_regime_statistics_advanced(detector, regime_data)
-                    
-                    return
-            
-            # No cache available
-            self._set_no_regime_state()
-        except Exception as e:
-            self._set_no_regime_state()
-            print(f"HMM load error: {e}")
-    
-    def _update_regime_statistics(self, detector, current_state):
-        """Update the expanded regime statistics UI."""
-        try:
-            states = detector.states
-            probs = detector.regime_probs
-            
-            # Calculate current regime duration
-            duration = 1
-            for i in range(len(states) - 2, -1, -1):
-                if states.iloc[i] == current_state:
-                    duration += 1
-                else:
-                    break
-            self.regime_duration_label.setText(f"{duration} months")
-            
-            # Calculate average duration for current regime
-            regime_durations = []
-            current_duration = 0
-            for state in states:
-                if state == current_state:
-                    current_duration += 1
-                elif current_duration > 0:
-                    regime_durations.append(current_duration)
-                    current_duration = 0
-            if current_duration > 0:
-                regime_durations.append(current_duration)
-            
-            avg_duration = np.mean(regime_durations) if regime_durations else 0
-            self.regime_avg_duration_label.setText(f"{avg_duration:.1f} months")
-            
-            # Count transitions
-            transitions = sum(1 for i in range(1, len(states)) if states.iloc[i] != states.iloc[i-1])
-            self.regime_transitions_label.setText(f"{transitions}")
-            
-            # Calculate stability (% of time in current regime)
-            stability = (states == current_state).sum() / len(states) * 100
-            self.regime_stability_label.setText(f"{stability:.1f}%")
-            
-            # Update window label
-            if hasattr(self, 'regime_window_label'):
-                self.regime_window_label.setText(f"{len(states)} months")
-            
-            # Update regime distribution labels
-            if hasattr(self, 'regime_dist_labels'):
-                for state_id, pct_lbl in self.regime_dist_labels.items():
-                    pct = (states == state_id).sum() / len(states) * 100
-                    pct_lbl.setText(f"{pct:.1f}%")
-            
-            # Update probability bars (new format: tuple of (bar, label))
-            if probs is not None and len(probs) > 0:
-                current_probs = probs[-1]
-                for state, bar_data in self.regime_prob_bars.items():
-                    if isinstance(bar_data, tuple):
-                        prob_bar, pct_lbl = bar_data
-                        if state < len(current_probs):
-                            val = int(current_probs[state] * 100)
-                            prob_bar.setValue(val)
-                            pct_lbl.setText(f"{val}%")
-                        else:
-                            prob_bar.setValue(0)
-                            pct_lbl.setText("0%")
-                    else:
-                        # Old format (just bar)
-                        if state < len(current_probs):
-                            bar_data.setValue(int(current_probs[state] * 100))
-                        else:
-                            bar_data.setValue(0)
-        except Exception as e:
-            print(f"Error updating regime statistics: {e}")
-    
-    def _set_no_regime_state(self):
-        """Set UI state when no regime data available."""
-        if hasattr(self, 'regime_icon_label') and self.regime_icon_label:
-            self.regime_icon_label.setText("○")
-            self.regime_icon_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 28px; background: transparent; border: none;")
-        if hasattr(self, 'regime_name_label') and self.regime_name_label:
-            self.regime_name_label.setText("No regime data")
-            self.regime_name_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 18px; font-weight: 600; background: transparent; border: none;")
-        if hasattr(self, 'regime_prob_label') and self.regime_prob_label:
-            self.regime_prob_label.setText("Run HMM fit from menu")
-        if hasattr(self, 'regime_desc_label') and self.regime_desc_label:
-            self.regime_desc_label.setText("")
-        
-        if hasattr(self, 'regime_duration_label') and self.regime_duration_label:
-            self.regime_duration_label.setText("-- months")
-        if hasattr(self, 'regime_avg_duration_label') and self.regime_avg_duration_label:
-            self.regime_avg_duration_label.setText("-- months")
-        if hasattr(self, 'regime_transitions_label') and self.regime_transitions_label:
-            self.regime_transitions_label.setText("--")
-        if hasattr(self, 'regime_stability_label') and self.regime_stability_label:
-            self.regime_stability_label.setText("--%")
-        
-        if hasattr(self, 'regime_window_label') and self.regime_window_label:
-            self.regime_window_label.setText("--")
-        
-        if hasattr(self, 'regime_dist_labels') and self.regime_dist_labels:
-            for pct_lbl in self.regime_dist_labels.values():
-                if pct_lbl:
-                    pct_lbl.setText("--%")
-        
-        if hasattr(self, 'regime_prob_bars') and self.regime_prob_bars:
-            for bar_data in self.regime_prob_bars.values():
-                if isinstance(bar_data, tuple):
-                    bar_data[0].setValue(0)
-                    bar_data[1].setText("0%")
-                elif bar_data:
-                    bar_data.setValue(0)
-        
-        # Reset change forecast labels
-        if hasattr(self, 'change_prob_1d_label') and self.change_prob_1d_label:
-            self.change_prob_1d_label.setText("--")
-        if hasattr(self, 'change_prob_5d_label') and self.change_prob_5d_label:
-            self.change_prob_5d_label.setText("--")
-        if hasattr(self, 'change_prob_20d_label') and self.change_prob_20d_label:
-            self.change_prob_20d_label.setText("--")
-        if hasattr(self, 'expected_change_label') and self.expected_change_label:
-            self.expected_change_label.setText("-- months")
-        if hasattr(self, 'next_regime_label') and self.next_regime_label:
-            self.next_regime_label.setText("--")
-        if hasattr(self, 'expected_remaining_label') and self.expected_remaining_label:
-            self.expected_remaining_label.setText("-- months")
-        
-        if hasattr(self, 'model_fitted_label') and self.model_fitted_label:
-            self.model_fitted_label.setText("Model: Not fitted")
-            self.model_fitted_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; background: transparent;")
-        
-        # Sync compact HMM card
-        self._sync_compact_hmm_card("NEUTRAL", 0, "--", "--", COLORS['warning'])
-    
-    def _sync_compact_hmm_card(self, regime_name: str, confidence: float, duration: str, 
-                                next_regime: str, regime_color: str):
-        """Sync the compact HMM card with current regime data."""
-        if hasattr(self, 'hmm_compact_card') and self.hmm_compact_card is not None:
-            self.hmm_compact_card.update_regime(
-                regime_name=regime_name,
-                confidence=confidence,
-                duration=duration,
-                next_regime=next_regime,
-                regime_color=regime_color
-            )
-    
-    def _set_error_regime_state(self, error: str):
-        """Set UI state when error loading regime."""
-        self.regime_icon_label.setText("✕")
-        self.regime_icon_label.setStyleSheet(f"color: {COLORS['negative']}; font-size: 28px; background: transparent; border: none;")
-        self.regime_name_label.setText("HMM not loaded")
-        self.regime_name_label.setStyleSheet(f"color: {COLORS['negative']}; font-size: 18px; font-weight: 600; background: transparent; border: none;")
-        self.regime_prob_label.setText(f"Error: {error[:40]}")
-        self.regime_desc_label.setText("")
-        
-        self.regime_duration_label.setText("-- months")
-        self.regime_avg_duration_label.setText("-- months")
-        self.regime_transitions_label.setText("--")
-        self.regime_stability_label.setText("--%")
-        
-        if hasattr(self, 'regime_window_label'):
-            self.regime_window_label.setText("--")
-        
-        if hasattr(self, 'regime_dist_labels'):
-            for pct_lbl in self.regime_dist_labels.values():
-                pct_lbl.setText("--%")
-        
-        for bar_data in self.regime_prob_bars.values():
-            if isinstance(bar_data, tuple):
-                bar_data[0].setValue(0)
-                bar_data[1].setText("0%")
-            else:
-                bar_data.setValue(0)
-        
-        self.model_fitted_label.setText("Model: Error")
-        self.model_fitted_label.setStyleSheet("color: #ff1744; font-size: 11px; background: transparent;")
-        
-        # Sync compact HMM card
-        self._sync_compact_hmm_card("ERROR", 0, "--", "--", COLORS['negative'])
-    
-    def fit_hmm_model(self):
-        """Fit HMM model in background thread."""
-        self.regime_name_label.setText("Fitting model...")
-        self.regime_prob_label.setText("Please wait...")
-        self.regime_desc_label.setText("")
-        self.statusBar().showMessage("Fitting HMM model...")
-        
-        # Run in background thread
-        self.hmm_thread = QThread()
-        self.hmm_worker = HMMWorker()
-        self.hmm_worker.moveToThread(self.hmm_thread)
-        
-        self.hmm_thread.started.connect(self.hmm_worker.run)
-        self.hmm_worker.finished.connect(self.hmm_thread.quit)
-        self.hmm_worker.progress.connect(self.on_hmm_progress)
-        self.hmm_worker.result.connect(self.on_hmm_complete)
-        self.hmm_worker.error.connect(self.on_hmm_error)
-        
-        self.hmm_thread.start()
-    
-    def on_hmm_progress(self, progress: int, message: str):
-        """Handle HMM progress update."""
-        self.regime_prob_label.setText(f"{message} ({progress}%)")
-        self.statusBar().showMessage(message)
-    
-    def on_hmm_complete(self, detector):
-        """Handle HMM fit completion with advanced detector."""
-        self.detector = detector
-        
-        # Regime icons (3-state model)
-        regime_icons = {
-            0: "▲",   # RISK-ON
-            1: "●",   # NEUTRAL
-            2: "▼",   # RISK-OFF
-        }
-        
-        try:
-            # Get comprehensive regime info from advanced detector
-            regime_data = detector.get_current_regime()
-            primary = regime_data['primary']
-            
-            current_state = primary['state_id']
-            regime_info = REGIMES[current_state]
-            prob = primary['probability']
-            
-            # Set icon
-            icon = regime_icons.get(current_state, "●")
-            self.regime_icon_label.setText(icon)
-            self.regime_icon_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 28px; background: transparent; border: none;")
-            
-            self.regime_name_label.setText(f"{regime_info['name']}")
-            self.regime_name_label.setStyleSheet(f"color: {regime_info['color']}; font-size: 18px; font-weight: 600; background: transparent; border: none;")
-            self.regime_prob_label.setText(f"Confidence: {prob:.0%}")
-            self.regime_desc_label.setText(regime_info['description'])
-            
-            # Update expanded statistics with advanced metrics
-            self._update_regime_statistics_advanced(detector, regime_data)
-            
-        except Exception as e:
-            print(f"Error in on_hmm_complete: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fallback to basic display
-            self.regime_name_label.setText("Model Fitted")
-            self.regime_prob_label.setText("See details below")
-        
-        self.statusBar().showMessage("Advanced HMM model fitted successfully")
-        
-        # If this was part of a scheduled scan, send Discord notification
-        if hasattr(self, '_is_scheduled_scan') and self._is_scheduled_scan:
-            self._is_scheduled_scan = False  # Reset flag
-            self._scheduled_scan_running = False  # Reset guard flag
-            self.send_scan_results_to_discord()
-            self.statusBar().showMessage("Scheduled scan complete - results sent to Discord")
-    
-    def _update_regime_statistics_advanced(self, detector, regime_data):
-        """Update regime statistics UI with advanced metrics."""
-        try:
-            primary = regime_data['primary']
-            change_forecast = regime_data['change_forecast']
-            stability = regime_data['stability']
-            
-            current_state = primary['state_id']
-            
-            # Current duration (from HSMM if available)
-            if 'current_duration' in primary:
-                duration = primary['current_duration']
-            else:
-                duration = stability.get('current_duration', 0)
-            
-            # Defensive: check if widgets exist before updating
-            if hasattr(self, 'regime_duration_label') and self.regime_duration_label:
-                self.regime_duration_label.setText(f"{duration} months")
-            
-            # Average duration
-            avg_duration = stability.get('avg_regime_duration', 0)
-            if hasattr(self, 'regime_avg_duration_label') and self.regime_avg_duration_label:
-                self.regime_avg_duration_label.setText(f"{avg_duration:.1f} months")
-            
-            # Transitions
-            transitions = stability.get('total_transitions', 0)
-            if hasattr(self, 'regime_transitions_label') and self.regime_transitions_label:
-                self.regime_transitions_label.setText(f"{transitions}")
-            
-            # Stability score
-            regime_dist = stability.get('regime_distribution', {})
-            current_regime_name = REGIMES[current_state]['name']
-            stability_pct = regime_dist.get(current_regime_name, 0) * 100
-            if hasattr(self, 'regime_stability_label') and self.regime_stability_label:
-                self.regime_stability_label.setText(f"{stability_pct:.1f}%")
-            
-            # Update window label
-            if hasattr(self, 'regime_window_label'):
-                n_obs = len(detector.states) if hasattr(detector, 'states') else 0
-                self.regime_window_label.setText(f"{n_obs} months")
-            
-            # Update regime distribution labels
-            if hasattr(self, 'regime_dist_labels'):
-                for state_id, pct_lbl in self.regime_dist_labels.items():
-                    regime_name = REGIMES[state_id]['name']
-                    pct = regime_dist.get(regime_name, 0) * 100
-                    pct_lbl.setText(f"{pct:.1f}%")
-            
-            # Update probability bars with proper normalization:
-            # 1. Ensure minimum 1% for all regimes
-            # 2. Cap maximum at 90%
-            # 3. Normalize so sum = 100%
-            if hasattr(detector, 'regime_probs') and detector.regime_probs is not None:
-                raw_probs = detector.regime_probs[-1].copy()
-                n_states = len(raw_probs)
-                
-                # Store normalized probs for transition matrix too
-                self._normalized_probs = self._normalize_probabilities(raw_probs)
-                
-                for state, bar_data in self.regime_prob_bars.items():
-                    if isinstance(bar_data, tuple):
-                        prob_bar, pct_lbl = bar_data
-                        if state < len(self._normalized_probs):
-                            val = max(1, int(round(self._normalized_probs[state] * 100)))
-                            prob_bar.setValue(val)
-                            pct_lbl.setText(f"{val}%")
-                    else:
-                        if state < len(self._normalized_probs):
-                            bar_data.setValue(max(1, int(round(self._normalized_probs[state] * 100))))
-            
-            # Update advanced metrics (change probabilities - now monthly)
-            if hasattr(self, 'change_prob_1d_label'):
-                self.change_prob_1d_label.setText(f"{change_forecast.get('1m', 0.1):.1%}")
-            if hasattr(self, 'change_prob_5d_label'):
-                self.change_prob_5d_label.setText(f"{change_forecast.get('3m', 0.3):.1%}")
-            if hasattr(self, 'change_prob_20d_label'):
-                self.change_prob_20d_label.setText(f"{change_forecast.get('12m', 0.7):.1%}")
-            if hasattr(self, 'expected_change_label'):
-                self.expected_change_label.setText(f"{change_forecast.get('expected_months', 6):.0f} months")
-            if hasattr(self, 'next_regime_label'):
-                next_regime_name = change_forecast['most_likely_next']
-                self.next_regime_label.setText(next_regime_name)
-                # Use color from forecast if available, otherwise lookup by name
-                if 'next_state_color' in change_forecast:
-                    next_color = change_forecast['next_state_color']
-                else:
-                    # Fallback colors matching REGIMES in regime_hmm.py (3-state model)
-                    regime_colors = {
-                        'RISK-ON': '#22c55e',      # Green
-                        'NEUTRAL': '#f59e0b',      # Orange/Amber
-                        'RISK-OFF': '#ef4444'      # Red
-                    }
-                    next_color = regime_colors.get(next_regime_name, COLORS['text_secondary'])
-                self.next_regime_label.setStyleSheet(f"color: {next_color}; font-size: 12px; font-weight: 600; background: transparent;")
-            
-            # HSMM-specific: Expected remaining duration (in months)
-            if hasattr(self, 'expected_remaining_label') and 'expected_remaining' in primary:
-                self.expected_remaining_label.setText(f"{primary['expected_remaining']:.0f} months")
-            
-            # Update transition matrix display with RAW values (no normalization - show actual HMM parameters)
-            if hasattr(self, 'trans_matrix_labels') and hasattr(detector, 'get_transition_matrix'):
-                try:
-                    raw_trans = detector.get_transition_matrix()
-                    n_states = raw_trans.shape[0]  # Get actual number of states
-                    
-                    # Display raw transition probabilities
-                    for from_state in range(n_states):
-                        for to_state in range(n_states):
-                            if (from_state, to_state) in self.trans_matrix_labels:
-                                prob_pct = raw_trans[from_state, to_state] * 100
-                                cell_lbl = self.trans_matrix_labels[(from_state, to_state)]
-                                if prob_pct >= 10:
-                                    cell_lbl.setText(f"{prob_pct:.0f}%")
-                                elif prob_pct >= 1:
-                                    cell_lbl.setText(f"{prob_pct:.1f}%")
-                                else:
-                                    cell_lbl.setText(f"{prob_pct:.2f}%")
-                    
-                    # Update expected duration legend based on current regime (monthly)
-                    if hasattr(self, 'expected_duration_legend'):
-                        stay_prob = raw_trans[current_state, current_state]
-                        if stay_prob < 1:
-                            expected_months = 1 / (1 - stay_prob)
-                            self.expected_duration_legend.setText(f"P(stay)={stay_prob:.1%} → Expected ~{expected_months:.0f} months")
-                        else:
-                            self.expected_duration_legend.setText("P(stay)≈100% → Very stable regime")
-                            
-                except Exception as te:
-                    print(f"Error updating transition matrix: {te}")
-            
-            # Sync compact HMM card with current data
-            current_regime_name = REGIMES[current_state]['name']
-            current_color = REGIMES[current_state]['color']
-            duration_str = f"{duration} mo" if isinstance(duration, (int, float)) else str(duration)
-            next_regime = change_forecast.get('most_likely_next', '--')
-            prob_pct = primary.get('probability', 0.5) * 100
-            
-            self._sync_compact_hmm_card(
-                regime_name=current_regime_name,
-                confidence=prob_pct,
-                duration=duration_str,
-                next_regime=next_regime,
-                regime_color=current_color
-            )
-            
-        except Exception as e:
-            print(f"Error updating advanced regime statistics: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def on_hmm_error(self, error: str):
-        """Handle HMM fit error."""
-        self.regime_icon_label.setText("✕")
-        self.regime_icon_label.setStyleSheet("color: #ff1744; font-size: 24px; background: transparent; border: none;")
-        self.regime_name_label.setText("Error fitting HMM")
-        self.regime_name_label.setStyleSheet("color: #ff1744; font-size: 11px; font-weight: 600; background: transparent; border: none;")
-        self.regime_prob_label.setText(error[:40])
-        self.statusBar().showMessage(f"HMM error: {error}")
-        
-        # Sync compact card
-        self._sync_compact_hmm_card("ERROR", 0, "--", "--", COLORS['negative'])
-        
-        # If this was part of a scheduled scan, still send Discord notification with error
-        if hasattr(self, '_is_scheduled_scan') and self._is_scheduled_scan:
-            self._is_scheduled_scan = False  # Reset flag
-            self._scheduled_scan_running = False  # Reset guard flag
-            self.send_discord_notification(
-                title="⚠️ Scheduled Scan - HMM Error",
-                description=f"Pair scan completed but HMM fitting failed:\n{error}",
-                color=0xff0000  # Red
-            )
-            self.statusBar().showMessage("Scheduled scan: HMM failed - error sent to Discord")
-    
-    def refresh_market_watch(self, force_full: bool = False):
-        """Refresh market watch data asynchronously.
-        
-        OPTIMERING: Flyttar tung yfinance.download till bakgrundstråd.
-        
-        Note: All indices are always fetched regardless of market hours.
-        The force_full parameter is kept for API compatibility but is ignored.
-        """
-        # Vänta tills startup är klar (förhindra tidiga anrop)
+    def refresh_market_watch(self):
+        """Restart WebSocket market feed (manual refresh). No yf.download."""
         if not self._startup_complete:
-            print(f"[MarketWatch] Skipped - startup not complete yet")
             return
-        
-        # Don't start if already running - använd säker flagga
-        if self._market_watch_running:
-            print("[MarketWatch] Skipped - already running (flag)")
-            return
-        
-        # CRITICAL: Also check if old thread is still alive (even if flag was reset by watchdog)
-        # This prevents the bug where watchdog resets flag → new thread starts → TWO parallel fetches
-        if self._market_watch_thread is not None and self._market_watch_thread.isRunning():
-            print("[MarketWatch] Skipped - old thread still alive")
-            return
-        
-        # Cooldown: prevent re-entry within 90 seconds (batches with timeouts can take 80s+)
-        now = time.time()
-        if hasattr(self, '_market_watch_last_start') and (now - self._market_watch_last_start) < 90:
-            print(f"[MarketWatch] Skipped - cooldown ({now - self._market_watch_last_start:.0f}s < 90s)")
-            return
-        
-        # SET FLAG IMMEDIATELY to prevent re-entrant calls
-        self._market_watch_running = True
-        self._market_watch_last_start = now
-        
-        # Clear existing items
-        while self.market_list_layout.count():
-            child = self.market_list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        
-        # Show loading indicator
-        loading_label = QLabel("⏳ Loading market data...")
-        loading_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; padding: 20px;")
-        loading_label.setAlignment(Qt.AlignCenter)
-        self.market_list_layout.addWidget(loading_label)
-        
-        # Complete instrument definitions
-        indices = {
-            # ======================
-            # America
-            # ======================
-            '^GSPC': ('S&P 500', 'AMERICA'),
-            '^NDX': ('NASDAQ 100', 'AMERICA'),
-            '^DJI': ('Dow Jones', 'AMERICA'),
-            '^RUT': ('Russell 2000', 'AMERICA'),
-            '^GSPTSE': ('Toronto', 'AMERICA'),
-            '^MXX': ('Mexico City', 'AMERICA'),
-            '^BVSP': ('São Paulo', 'AMERICA'),
-            '^MERV': ('Buenos Aires', 'AMERICA'),
-            '^IPSA': ('Santiago', 'AMERICA'),
-            '^COLO-IV': ('Bogotá', 'AMERICA'),
-            # ======================
-            # Europe
-            # ======================
-            '^FTSE': ('London', 'EUROPE'),
-            '^FCHI': ('Paris', 'EUROPE'),
-            '^STOXX': ('Europe 600', 'EUROPE'),
-            '^AEX': ('Amsterdam', 'EUROPE'),
-            '^GDAXI': ('Frankfurt', 'EUROPE'),
-            '^SSMI': ('Zürich', 'EUROPE'),
-            '^ATX': ('Vienna', 'EUROPE'),
-            '^IBEX': ('Madrid', 'EUROPE'),
-            'FTSEMIB.MI': ('Milano', 'EUROPE'),
-            'PSI20.LS': ('Lisbon', 'EUROPE'),
-            '^BFX': ('Brussels', 'EUROPE'),
-            '^ISEQ': ('Dublin', 'EUROPE'),
-            'XU100.IS': ('Istanbul', 'EUROPE'),            
-            '^OMX': ('Stockholm', 'EUROPE'),
-            'OBX.OL': ('Oslo', 'EUROPE'),
-            '^OMXC25': ('Copenhagen', 'EUROPE'),
-            '^OMXH25': ('Helsinki', 'EUROPE'),
-            'WIG20.WA': ('Warsaw', 'EUROPE'),
-            # ======================
-            # Middle East
-            # ======================
-            '^TA125.TA': ('Tel Aviv', 'MIDDLE EAST'),
-            '^TASI.SR': ('Riyadh', 'MIDDLE EAST'),
-            'DFMGI.AE': ('Dubai', 'MIDDLE EAST'),
-            'FADGI.FGI': ('Abu Dhabi', 'MIDDLE EAST'),
-            '^GNRI.QA': ('Qatar', 'MIDDLE EAST'),
-            # ======================
-            # Africa
-            # ======================
-            '^JN0U.JO': ('Johannesburg', 'AFRICA'),
-            '^CASE30': ('Cairo', 'AFRICA'),
-            # ======================
-            # Asia
-            # ======================
-            '^N225': ('Tokyo', 'ASIA'),
-            '^HSI': ('Hong Kong', 'ASIA'),
-            '000001.SS': ('Shanghai', 'ASIA'),
-            '^KS11': ('Seoul', 'ASIA'),
-            '^TWII': ('Taipei', 'ASIA'),
-            '^NSEI': ('Nifty 50', 'ASIA'),
-            '^BSESN': ('Mumbai', 'ASIA'),
-            '^STI': ('Singapore', 'ASIA'),
-            '^JKSE': ('Jakarta', 'ASIA'),
-            '^KLSE': ('Kuala Lumpur', 'ASIA'),
-            '^SET50.BK': ('Bangkok', 'ASIA'),
-            '^VNINDEX.VN': ('Ho Chi Minh City', 'ASIA'),
-            'PSEI.PS': ('Manila', 'ASIA'),
-            '000300.SS': ('Shanghai', 'ASIA'),
-            '399106.SZ': ('Shenzen', 'ASIA'),
-            # ======================
-            # Oceania
-            # ======================
-            '^AXJO': ('Sydney', 'OCEANIA'),
-            '^NZ50': ('Wellington', 'OCEANIA'),
-        }
-        
-        macro = {
-            # Currencies
-            'EURUSD=X': ('EUR/USD', 'CURRENCIES'),
-            'EURSEK=X': ('EUR/SEK', 'CURRENCIES'),
-            'GBPUSD=X': ('GBP/USD', 'CURRENCIES'),
-            'USDJPY=X': ('USD/JPY', 'CURRENCIES'),
-            'USDCHF=X': ('USD/CHF', 'CURRENCIES'),
-            'AUDUSD=X': ('AUD/USD', 'CURRENCIES'),
-            'USDCAD=X': ('USD/CAD', 'CURRENCIES'),
-            'USDSEK=X': ('USD/SEK', 'CURRENCIES'),
-            # Commodities
-            'GC=F': ('Gold', 'COMMODITIES'),
-            'SI=F': ('Silver', 'COMMODITIES'),
-            'CL=F': ('Crude Oil', 'COMMODITIES'),
-            'NG=F': ('Natural Gas', 'COMMODITIES'),
-            'HG=F': ('Copper', 'COMMODITIES'),
-            # Yields
-            '^TNX': ('10Y Yield', 'YIELDS'),
-            '^FVX': ('5Y Yield', 'YIELDS'),
-            '^TYX': ('30Y Yield', 'YIELDS'),
-            '^IRX': ('3M Yield', 'YIELDS'),
-        }
-        
-        # =====================================================================
-        # ALWAYS FETCH ALL INDICES - No market filtering
-        # Macro data (currencies, commodities, yields) always fetched (24h markets)
-        # =====================================================================
-        filtered_indices = indices
-        print(f"[MarketWatch] Fetching all {len(indices)} indices + {len(macro)} macro...")
-        self.statusBar().showMessage(f"Fetching {len(indices)} indices + {len(macro)} macro...")
-        
-        # Combine all indices with macro
-        all_instruments = {**filtered_indices, **macro}
-        
-        # Store FULL instruments dict for display (all markets, not just open ones)
-        self._all_instruments_full = {**indices, **macro}
-        
-        # Store full indices dict for display purposes
-        self._all_indices_cache = indices
-        
-        # Create and start worker (flag already set at guard)
-        self._market_watch_thread = QThread()
-        self._market_watch_worker = MarketWatchWorker(all_instruments)
-        self._market_watch_worker.moveToThread(self._market_watch_thread)
-        
-        self._market_watch_thread.started.connect(self._market_watch_worker.run)
-        self._market_watch_worker.finished.connect(self._market_watch_thread.quit)
-        # VIKTIGT: Återställ flagga och rensa referenser när tråden är klar
-        self._market_watch_thread.finished.connect(self._on_market_watch_thread_finished)
-        self._market_watch_worker.result.connect(self._on_market_watch_received)
-        self._market_watch_worker.error.connect(self._on_market_watch_error)
-        self._market_watch_worker.status_message.connect(self.statusBar().showMessage)
-        
-        self._market_watch_thread.start()
-        self.statusBar().showMessage("Fetching market data in background...")
-    
-    def _on_market_watch_thread_finished(self):
-        """Handle market watch thread completion — clean up and chain to volatility.
-        
-        Always cleans up refs (even if watchdog already reset the flag).
-        Uses generation counter to prevent stale completions from chaining.
-        """
-        # Track which generation completed
-        gen = getattr(self, '_market_watch_generation', 0)
-        was_running = self._market_watch_running
-        self._market_watch_running = False
-        
-        elapsed = time.time() - getattr(self, '_market_watch_last_start', 0)
-        print(f"[MarketWatch] Thread finished ({elapsed:.1f}s, gen={gen}, was_running={was_running})")
-        
-        # Always clean up references
-        if self._market_watch_worker is not None:
-            self._market_watch_worker.deleteLater()
-        if self._market_watch_thread is not None:
-            self._market_watch_thread.deleteLater()
-        
-        self._market_watch_worker = None
-        self._market_watch_thread = None
-        
-        # Only chain to volatility if this was the expected completion
-        # (not a stale thread that finished after watchdog reset)
-        if was_running:
-            QTimer.singleShot(2000, self._start_volatility_refresh_safe)
+        print("[MarketWatch] Manual refresh — restarting WebSocket feed")
+        self._ws_treemap_rendered = False
+        self._start_ws_market_feed(trigger_volatility=False)
     
     def _start_volatility_refresh_safe(self):
         """Safely start volatility refresh after a delay."""
@@ -10471,464 +10856,295 @@ class PairsTradingTerminal(QMainWindow):
             import traceback
             traceback.print_exc()
     
-    def _on_market_watch_received(self, close, all_instruments: dict):
-        """Handle received market watch data - runs on GUI thread (safe).
-        
-        OPTIMERING: UI-uppdatering sker efter att data hämtats i bakgrunden.
-        Kombinerar ny data med cachad data för att visa alla marknader.
-        """
-        try:
-            # DEBUG: Visa vad som faktiskt hämtades
-            fetched_tickers = list(close.columns) if hasattr(close, 'columns') else []
-            print(f"[MarketWatch] Received {len(fetched_tickers)} tickers from yfinance")
-            print(f"[MarketWatch] Requested {len(all_instruments)} instruments")
-            if len(fetched_tickers) < 20:
-                print(f"[MarketWatch] Fetched tickers: {fetched_tickers}")
-            
-            # =====================================================================
-            # SMART CACHING - Combine new data with cached data for full display
-            # =====================================================================
-            # Update cache with newly fetched data
-            if self._market_data_cache is None:
-                self._market_data_cache = close.copy()
-                print(f"[MarketWatch] Created new cache with {len(close.columns)} columns")
-            else:
-                # Update only the columns we just fetched (preserves cached data for closed markets)
-                before_cols = len(self._market_data_cache.columns)
-                for col in close.columns:
-                    self._market_data_cache[col] = close[col]
-                after_cols = len(self._market_data_cache.columns)
-                print(f"[MarketWatch] Updated cache: {before_cols} -> {after_cols} columns")
-            
-            # Use full instruments dict (all markets) for display, not just what was fetched
-            if self._all_instruments_full:
-                instruments = dict(self._all_instruments_full)
-                print(f"[MarketWatch] Using _all_instruments_full with {len(instruments)} instruments")
-            else:
-                instruments = dict(all_instruments)
-                print(f"[MarketWatch] WARNING: _all_instruments_full is empty, using all_instruments with {len(instruments)} instruments")
-            
-            # Use combined data (new + cached) for display
-            display_close = self._market_data_cache
-            print(f"[MarketWatch] display_close has {len(display_close.columns)} columns")
-            
-            # Track which tickers were just updated vs showing cached
-            freshly_updated_tickers = set(close.columns)
-            print(f"[MarketWatch] freshly_updated_tickers: {len(freshly_updated_tickers)}")
-            
-            # Clear loading indicator
-            while self.market_list_layout.count():
-                child = self.market_list_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
-            
-            
-            # Get unique trading dates
-            if hasattr(display_close.index, 'date'):
-                dates = pd.Series(display_close.index.date)
-                unique_dates = sorted(dates.unique())
-                
-                if len(unique_dates) >= 2:
-                    most_recent_day = unique_dates[-1]
-                    previous_day = unique_dates[-2]
-                elif len(unique_dates) == 1:
-                    most_recent_day = unique_dates[0]
-                    previous_day = None
-                else:
-                    most_recent_day = None
-                    previous_day = None
-            else:
-                most_recent_day = None
-                previous_day = None
-                       
-            # Group by category
-            categories = {}
-            for ticker, (name, category) in instruments.items():
-                if category not in categories:
-                    categories[category] = []
-                categories[category].append((ticker, name))
-            
-            
-            # Order of categories
-            category_order = ['AMERICA', 'EUROPE', 'MIDDLE EAST', 'AFRICA', 'ASIA', 'OCEANIA', 
-                            'CURRENCIES', 'COMMODITIES', 'YIELDS']
-            
-            # Category colors
-            category_colors = {
-                'AMERICA': COLORS['accent'],
-                'EUROPE': COLORS['accent'],
-                'MIDDLE EAST': COLORS['accent'],
-                'AFRICA': COLORS['accent'],
-                'ASIA': COLORS['accent'],
-                'OCEANIA': COLORS['accent'],
-                'CURRENCIES': COLORS['info'],
-                'COMMODITIES': COLORS['warning'],
-                'YIELDS': '#9c27b0',
-            }
-            
-            # Map coordinates for scatter plot
-            scatter_spots = []
-            widgets_added = 0
-            fresh_count = 0
-            
-            # DEBUG: Visa column mismatch
-            instrument_tickers = set(instruments.keys())
-            data_columns = set(display_close.columns)
-            matching = instrument_tickers & data_columns
-            missing = instrument_tickers - data_columns
-            print(f"[MarketWatch] Instrument tickers: {len(instrument_tickers)}, Data columns: {len(data_columns)}")
-            print(f"[MarketWatch] Matching tickers: {len(matching)}, Missing: {len(missing)}")
-            if len(missing) > 0 and len(missing) < 20:
-                print(f"[MarketWatch] Missing tickers: {missing}")
-            
-            for category in category_order:
-                if category not in categories:
-                    continue
-                    
-                # Region header
-                cat_color = category_colors.get(category, COLORS['accent'])
-                region_label = QLabel(category)
-                region_label.setStyleSheet(f"color: {cat_color}; font-size: 13px; font-weight: 700; padding: 12px 0 4px 0; letter-spacing: 1.5px; border-bottom: 2px solid {COLORS['accent']};")
-                self.market_list_layout.addWidget(region_label)
-                widgets_added += 1
-                
-                for ticker, name in categories[category]:
-                    # Check if we have data for this ticker (either fresh or cached)
-                    if ticker not in display_close.columns:
-                        continue
-                    
-                    # Track if this is cached data (market closed)
-                    # Process this ticker
-                    
-                    try:
-                        ticker_series = display_close[ticker].dropna()
-                        if len(ticker_series) < 1:
-                            continue
-                        
-                        latest = ticker_series.iloc[-1]
-                        
-                        # Calculate change and sparkline data
-                        if most_recent_day is not None and hasattr(ticker_series.index, 'date'):
-                            ticker_dates = pd.Series(ticker_series.index.date)
-                            unique_ticker_dates = sorted(ticker_dates.unique())
-                            
-                            if len(unique_ticker_dates) >= 2:
-                                ticker_latest_day = unique_ticker_dates[-1]
-                                ticker_prev_day = unique_ticker_dates[-2]
-                                
-                                latest_mask = ticker_dates == ticker_latest_day
-                                latest_day_data = ticker_series[latest_mask.values]
-                                
-                                prev_mask = ticker_dates == ticker_prev_day
-                                prev_day_data = ticker_series[prev_mask.values]
-                                
-                                sparkline_data = latest_day_data.tolist() if len(latest_day_data) > 0 else [latest]
-                                
-                                if len(prev_day_data) > 0:
-                                    prev_close = prev_day_data.iloc[-1]
-                                    current_close = latest_day_data.iloc[-1] if len(latest_day_data) > 0 else latest
-                                    if pd.notna(prev_close) and prev_close != 0:
-                                        change = ((current_close / prev_close) - 1) * 100
-                                    else:
-                                        change = 0.0
-                                else:
-                                    change = 0.0
-                            elif len(unique_ticker_dates) == 1:
-                                ticker_day = unique_ticker_dates[0]
-                                day_mask = ticker_dates == ticker_day
-                                day_data = ticker_series[day_mask.values]
-                                sparkline_data = day_data.tolist() if len(day_data) > 0 else [latest]
-                                change = 0.0
-                            else:
-                                sparkline_data = [latest]
-                                change = 0.0
-                        else:
-                            sparkline_data = ticker_series.tolist()[-20:]
-                            prev_close = ticker_series.iloc[0] if len(ticker_series) > 1 else latest
-                            if pd.notna(prev_close) and prev_close != 0:
-                                change = ((latest / prev_close) - 1) * 100
-                            else:
-                                change = 0.0
-                        
-                        # Create market item frame
-                        item_frame = QFrame()
-                        item_frame.setStyleSheet(f"""
-                            QFrame {{
-                                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                    stop:0 {COLORS['bg_elevated']}, 
-                                    stop:1 {COLORS['bg_card']});
-                                border: 1px solid {COLORS['border_subtle']};
-                                border-radius: 3px;
-                            }}
-                            QFrame:hover {{
-                                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                    stop:0 {COLORS['bg_hover']}, 
-                                    stop:1 {COLORS['bg_elevated']});
-                                border-color: {COLORS['accent_dark']};
-                            }}
-                        """)
-                        item_layout = QHBoxLayout(item_frame)
-                        item_layout.setContentsMargins(8, 5, 8, 5)
-                        item_layout.setSpacing(8)
-                        
-                        # Name label
-                        display_name = name.upper()
-                        name_color = COLORS['text_primary']
-                        
-                        name_label = QLabel(display_name)
-                        name_label.setStyleSheet(f"color: {name_color}; font-size: 13px; font-weight: 500; background: transparent; border: none;")
-                        name_label.setMinimumWidth(85)
-                        name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                        item_layout.addWidget(name_label, stretch=2)
-                        
-                        # Format price
-                        if category == 'CURRENCIES':
-                            price_text = f"{latest:.4f}"
-                        elif category == 'YIELDS':
-                            price_text = f"{latest:.2f}%"
-                        else:
-                            price_text = f"{latest:,.2f}"
-                        
-                        # Price label
-                        price_label = QLabel(price_text)
-                        price_label.setStyleSheet(f"color: {COLORS['accent_bright']}; font-size: 13px; font-family: 'JetBrains Mono', monospace; font-weight: 600; background: transparent; border: none;")
-                        price_label.setMinimumWidth(70)
-                        price_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        item_layout.addWidget(price_label, stretch=1)
-                        
-                        # Change label
-                        if change > 0:
-                            change_color = COLORS['positive']
-                        elif change < 0:
-                            change_color = COLORS['negative']
-                        else:
-                            change_color = COLORS['neutral']
-                        
-                        change_label = QLabel(f"{change:+.2f}%")
-                        change_label.setStyleSheet(f"color: {change_color}; font-size: 13px; font-family: 'JetBrains Mono', monospace; font-weight: 600; background: transparent; border: none;")
-                        change_label.setMinimumWidth(55)
-                        change_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        item_layout.addWidget(change_label, stretch=1)
-                        
-                        # Sparkline
-                        sparkline = SparklineWidget()
-                        sparkline.set_data(sparkline_data, change_color)
-                        sparkline.setMinimumWidth(40)
-                        sparkline.setMaximumWidth(60)
-                        item_layout.addWidget(sparkline, stretch=0)
-                        self.market_list_layout.addWidget(item_frame)
-                        widgets_added += 1
-                        
-                        # Count processed items
-                        fresh_count += 1
-                        
-                        # Add to scatter map data
-                        if category in ['AMERICA', 'EUROPE', 'ASIA', 'OCEANIA', 'MIDDLE EAST', 'AFRICA']:
-                            scatter_spots.append({
-                                'ticker': ticker,
-                                'change': change,
-                                'name': name,
-                                'price': price_text,
-                                'color': change_color
-                            })
-                        
-                    except Exception as e:
-                        print(f"[MarketWatch] Error processing ticker {ticker}: {e}")
-                        pass
-            
-            print(f"[MarketWatch] Loop complete: {widgets_added} widgets created, {fresh_count} tickers processed")
-            self.market_list_layout.addStretch()
-            
-            # Update map if available
-            if hasattr(self, 'map_widget'):
-                map_data = self.build_map_data(scatter_spots)
-                self.update_plotly_map(map_data)
-            
-            # VIKTIGT: Force complete layout refresh
-            # 1. Säg till market_list att beräkna om sin storlek
-            self.market_list.adjustSize()
-            
-            # 2. Uppdatera layouten
-            self.market_list_layout.activate()
-            
-            # 3. Force scroll-area att uppdatera sitt innehåll
-            if hasattr(self, 'market_scroll'):
-                self.market_scroll.setWidget(self.market_list)
-                self.market_scroll.updateGeometry()
-            
-            # 4. Process events för att säkerställa rendering
-            QApplication.processEvents()
-            
-            # 5. Slutlig repaint
-            self.market_list.update()
-            self.market_list.repaint()
-            
-            print(f"[MarketWatch] UI updated: {widgets_added} widgets, {fresh_count} items")
-            self.statusBar().showMessage(f"Market data updated: {fresh_count} indices")
-                    
-        except Exception as e:
-            import traceback
-            print(f"Market watch UI error: {e}")
-            traceback.print_exc()
-            self.statusBar().showMessage(f"Market data error: {e}")
-    
-    def _on_market_watch_error(self, error: str):
-        """Handle market watch fetch error."""
-        # Clear loading indicator
-        while self.market_list_layout.count():
-            child = self.market_list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        
-        error_label = QLabel(f"Error: {error[:50]}")
-        error_label.setStyleSheet("color: #ff1744; font-size: 11px;")
-        self.market_list_layout.addWidget(error_label)
-        self.statusBar().showMessage(f"Market data error: {error}")
-    
-    def update_market_map_spots(self, spots_data):
-        """Update the world map with market data."""
-        if not PYQTGRAPH_AVAILABLE or not hasattr(self, 'market_scatter'):
-            return
-        
-        NYC_LON = -74.01096
-        NYC_LAT = 40.70694
-        r = 0.5
+    def _start_ws_market_feed(self, trigger_volatility=True):
+        """Start WebSocket for all market instruments (replaces yf.download for treemap)."""
+        tickers = list(self.MARKET_INSTRUMENTS.keys())
+        # Add VIX/VVIX for live volatility card updates
+        for extra in ['^VIX', '^VVIX']:
+            if extra not in tickers:
+                tickers.append(extra)
 
-        # Market locations (longitude, latitude)
-        locations = {
-        
-            # ======================
-            # America
-            # ======================
-            '^GSPC': (NYC_LON + 0.0000, NYC_LAT + r),       # norr
-            '^DJI':  (NYC_LON + r,       NYC_LAT + 0.0000), # öst
-            '^NDX':  (NYC_LON + 0.0000, NYC_LAT - r),       # syd
-            '^RUT':  (NYC_LON - r,       NYC_LAT + 0.0000), # väst
-        
-            '^GSPTSE': (-79.3832, 43.6532),      # TSX Composite – Toronto
-        
-            '^MXX': (-99.1332, 19.4326),         # Mexico – Mexico City
-            '^BVSP': (-46.6333, -23.5505),       # Brazil – São Paulo
-            '^MERV': (-58.3816, -34.6037),       # Argentina – Buenos Aires
-            '^IPSA': (-70.6693, -33.4489),       # Chile – Santiago
-            '^COLO-IV': (-74.0721, 4.7110),      # Colombia – Bogotá
-        
-            # ======================
-            # Europe
-            # ======================
-            '^FTSE': (-0.1278, 51.5074),         # UK – London
-            '^FCHI': (2.3522, 48.8566),          # France – Paris
-            '^STOXX': (4.0000, 50.0000),         # STOXX Europe 600 (central)
-            '^AEX': (4.9041, 52.3676),           # Netherlands – Amsterdam
-            '^GDAXI': (8.6821, 50.1109),         # Germany – Frankfurt
-            '^SSMI': (8.5417, 47.3769),          # Switzerland – Zurich
-            '^ATX': (16.3738, 48.2082),          # Austria – Vienna
-            '^IBEX': (-3.7038, 40.4168),         # Spain – Madrid
-            'FTSEMIB.MI': (9.1900, 45.4642),     # Italy – Milan
-            'PSI20.LS': (-9.1393, 38.7223),      # Portugal – Lisbon
-            '^BFX': (4.3517, 50.8503),           # Belgium – Brussels
-            '^ISEQ': (-6.2603, 53.3498),         # Ireland – Dublin
-            '^OMX': (18.0686, 59.3293),          # Sweden – Stockholm
-            'OBX.OL': (10.7522, 59.9139),        # Norway – Oslo
-            '^OMXC25': (12.5683, 55.6761),       # Denmark – Copenhagen
-            '^OMXH25': (24.9384, 60.1699),       # Finland – Helsinki
-            'WIG20.WA': (21.0122, 52.2297),      # Poland – Warsaw
-            'XU100.IS': (28.9784, 41.0082),      # Turkey – Istanbul
-        
-            # ======================
-            # Middle East
-            # ======================
-            '^TA125.TA': (34.7818, 32.0853),     # Israel – Tel Aviv
-            '^TASI.SR': (46.6753, 24.7136),      # Saudi Arabia – Riyadh
-            'DFMGI.AE': (55.2708, 25.2048),      # UAE – Dubai
-            'FADGI.FGI': (54.3773, 24.4539),     # UAE – Abu Dhabi
-            '^GNRI.QA': (51.5310, 25.2854),      # Qatar – Doha
-        
-            # ======================
-            # Africa
-            # ======================
-            '^JN0U.JO': (28.0473, -26.2041),     # South Africa – Johannesburg
-            '^CASE30': (31.2357, 30.0444),       # Egypt – Cairo
-        
-            # ======================
-            # Asia
-            # ======================
-            '^N225': (139.6917, 35.6895),        # Japan – Tokyo
-            '^HSI': (114.1694, 22.3193),         # Hong Kong
-            '000001.SS': (121.4737, 31.2304),    # China – Shanghai
-            '^KS11': (126.9780, 37.5665),        # South Korea – Seoul
-            '^TWII': (121.5654, 25.0330),        # Taiwan – Taipei
-            '^NSEI': (72.8777, 19.0760),         # India – Mumbai
-            '^BSESN': (72.8777, 19.0760),        # India – Mumbai
-            '^STI': (103.8198, 1.3521),          # Singapore
-            '^JKSE': (106.8456, -6.2088),        # Indonesia – Jakarta
-            '^KLSE': (101.6869, 3.1390),         # Malaysia – Kuala Lumpur
-            '^SET50.BK': (100.5018, 13.7563),    # Thailand – Bangkok
-            '^VNINDEX.VN': (106.6297, 10.8231),  # Vietnam – Ho Chi Minh City
-            'PSEI.PS': (120.9842, 14.5995),      # Philippines – Manila
-            '000300.SS': (121.4737, 31.2304),    # China – Shanghai (CSI 300)
-            '399106.SZ': (114.0579, 22.5431),    # China – Shenzhen
-        
-            # ======================
-            # Oceania
-            # ======================
-            '^AXJO': (151.2093, -33.8688),       # Australia – Sydney
-            '^NZ50': (174.7762, -41.2865),       # New Zealand – Wellington
-        }
-        
-        spots = []
-        for item in spots_data:
-            ticker = item['ticker']
-            change = item['change']
-            
-            if ticker in locations:
-                lon, lat = locations[ticker]
-                
-                # Color based on change
-                if change > 0.5:
-                    color = '#00c853'  # Green
-                elif change < -0.5:
-                    color = '#ff1744'  # Red
-                else:
-                    color = '#ffc107'  # Yellow
-                
-                spots.append({
-                    'pos': (lon, lat),
-                    'brush': pg.mkBrush(color),
-                    'size': 8 + min(abs(change) * 2, 8)
+        # Clean up old refs
+        self._stop_market_websocket()
+
+        self._ws_thread = QThread()
+        self._ws_worker = MarketWatchWebSocket(tickers)
+        self._ws_worker.moveToThread(self._ws_thread)
+        self._ws_thread.started.connect(self._ws_worker.run)
+        self._ws_worker.price_update.connect(self._on_ws_price_update)
+        self._ws_worker.connected.connect(self._on_ws_connected)
+        self._ws_worker.status_message.connect(self.statusBar().showMessage)
+        self._ws_worker.error.connect(lambda e: print(f"[WS] {e}"))
+        self._ws_thread.start()
+        print(f"[WS] Starting WebSocket feed for {len(tickers)} tickers (WS-first mode)")
+
+        # Start volatility yf.download independently (for percentiles only, once at startup)
+        if trigger_volatility:
+            QTimer.singleShot(2000, self._start_volatility_refresh_safe)
+
+        # Fetch intraday OHLC (1d/5m) to seed overlay candlestick charts
+        QTimer.singleShot(5000, self._fetch_intraday_ohlc)
+
+    def _on_ws_connected(self):
+        """WS connected — schedule first treemap render after initial snapshots arrive."""
+        if not self._ws_treemap_rendered:
+            # Wait 4s for WS snapshots to accumulate, then render all instruments
+            QTimer.singleShot(4000, self._render_initial_treemap_from_ws)
+
+    def _render_initial_treemap_from_ws(self):
+        """Build treemap from ALL instruments, using WS data where available.
+
+        Renders all 71+ instruments immediately — instruments without WS
+        snapshots yet show as gray (0% change) and update via the 5s timer.
+        """
+        if self._ws_treemap_rendered:
+            return
+
+        self._ws_treemap_rendered = True
+        ws_count = 0
+        items = []
+        # Iterate ALL instruments — use WS cache if available, placeholder if not
+        for symbol, (name, market) in self.MARKET_INSTRUMENTS.items():
+            cached = self._market_data_cache.get(symbol)
+            if cached:
+                ws_count += 1
+                items.append({
+                    'market': market,
+                    'symbol': symbol,
+                    'name': name,
+                    'price': cached.get('price', 0),
+                    'change': cached.get('change', 0),
+                    'change_pct': cached.get('change_pct', 0),
                 })
-        
-        if spots:
-            self.market_scatter.setData(spots)
-    
+            else:
+                # Placeholder — will be updated by WS + 5s render timer
+                items.append({
+                    'market': market,
+                    'symbol': symbol,
+                    'name': name,
+                    'price': 0,
+                    'change': 0,
+                    'change_pct': 0,
+                })
+
+        if items and hasattr(self, 'map_widget'):
+            self.update_treemap_heatmap(items)
+            print(f"[WS] Initial treemap rendered: {len(items)} instruments ({ws_count} with WS data)")
+            self.statusBar().showMessage(f"Market data: {len(items)} instruments ({ws_count} live)")
+        else:
+            print(f"[WS] No items for treemap")
+
+    def _fetch_intraday_ohlc(self):
+        """Fetch today's intraday 5-min OHLC for all instruments (background)."""
+        tickers = list(self.MARKET_INSTRUMENTS.keys())
+        self._intraday_thread = QThread()
+        self._intraday_worker = IntradayOHLCWorker(tickers, self.MARKET_INSTRUMENTS)
+        self._intraday_worker.moveToThread(self._intraday_thread)
+        self._intraday_thread.started.connect(self._intraday_worker.run)
+        self._intraday_worker.finished.connect(self._intraday_thread.quit)
+        self._intraday_worker.result.connect(self._on_intraday_ohlc_received)
+        self._intraday_worker.error.connect(lambda e: print(f"[Intraday] Error: {e}"))
+        self._intraday_thread.start()
+
+    def _on_intraday_ohlc_received(self, data: dict):
+        """Handle intraday OHLC data — seed charts and extra info for overlays."""
+        count = 0
+        for symbol, payload in data.items():
+            ohlc = payload.get('ohlc', [])
+            info = payload.get('info', {})
+            if ohlc:
+                self._intraday_ohlc_seed[symbol] = ohlc
+                count += 1
+            # Seed ws_extra_info if WS hasn't provided real values yet
+            if info and symbol not in self._ws_extra_info:
+                self._ws_extra_info[symbol] = {
+                    'day_high': info.get('day_high', 0),
+                    'day_low': info.get('day_low', 0),
+                    'day_volume': info.get('day_volume', 0),
+                    'open_price': info.get('open_price', 0),
+                    'previous_close': 0,
+                    'short_name': '',
+                }
+            elif info:
+                # Fill in zeros from WS with download data
+                ws = self._ws_extra_info[symbol]
+                if not ws.get('day_high'):
+                    ws['day_high'] = info.get('day_high', 0)
+                if not ws.get('day_low'):
+                    ws['day_low'] = info.get('day_low', 0)
+                if not ws.get('day_volume'):
+                    ws['day_volume'] = info.get('day_volume', 0)
+                if not ws.get('open_price'):
+                    ws['open_price'] = info.get('open_price', 0)
+
+        print(f"[Intraday] Seeded OHLC charts for {count} instruments")
+
+        # Push all intraday data to JS immediately
+        if count > 0 and hasattr(self, 'map_widget'):
+            intraday_js = {}
+            ws_info_js = {}
+            for symbol in data:
+                ohlc = self._intraday_ohlc_seed.get(symbol)
+                if ohlc:
+                    intraday_js[symbol] = ohlc
+                if symbol in self._ws_extra_info:
+                    ws_info_js[symbol] = self._ws_extra_info[symbol]
+            payload = json.dumps({'updates': {}, 'intraday': intraday_js, 'ws_info': ws_info_js})
+            js = f'if(window.updatePrices)window.updatePrices({payload});'
+            self.map_widget.page().runJavaScript(js)
+
+    def _on_treemap_click(self, ticker: str):
+        """Handle treemap tile click — now handled by JS overlay in treemap."""
+        print(f"[Treemap] Click on {ticker} (handled by JS overlay)")
+
+    def _on_ws_price_update(self, update: dict):
+        """Handle a single live price update from WebSocket."""
+        symbol = update['symbol']
+
+        # Accumulate tick history for intraday charts
+        ts = update.get('timestamp', time.time())
+        if symbol not in self._ws_tick_history:
+            self._ws_tick_history[symbol] = []
+        self._ws_tick_history[symbol].append((ts, update['price']))
+
+        # Store extra WS info for overlay
+        self._ws_extra_info[symbol] = {
+            'day_high': update.get('day_high', 0),
+            'day_low': update.get('day_low', 0),
+            'day_volume': update.get('day_volume', 0),
+            'previous_close': update.get('previous_close', 0),
+            'open_price': update.get('open_price', 0),
+            'short_name': update.get('short_name', ''),
+        }
+
+        # VIX/VVIX live updates to volatility cards
+        if symbol == '^VIX' and hasattr(self, 'vix_card'):
+            self.vix_card.value_label.setText(f"{update['price']:.2f}")
+        elif symbol == '^VVIX' and hasattr(self, 'vvix_card'):
+            self.vvix_card.value_label.setText(f"{update['price']:.2f}")
+
+        # Build/update market data cache entry for treemap
+        if symbol in self.MARKET_INSTRUMENTS:
+            name, market = self.MARKET_INSTRUMENTS[symbol]
+            if symbol not in self._market_data_cache:
+                self._market_data_cache[symbol] = {
+                    'symbol': symbol, 'name': name, 'market': market,
+                }
+            cached = self._market_data_cache[symbol]
+            cached['price'] = update['price']
+            cached['change'] = update['change']
+            cached['change_pct'] = update['change_pct']
+            self._ws_cache_dirty = True
+            self._ws_changed_symbols.add(symbol)
+
+    def _render_ws_updates(self):
+        """Batch update treemap via JS injection if WebSocket updated prices (every 5s)."""
+        if not self._ws_cache_dirty:
+            return
+        self._ws_cache_dirty = False
+        changed = self._ws_changed_symbols.copy()
+        self._ws_changed_symbols.clear()
+
+        if not changed or not hasattr(self, 'map_widget'):
+            return
+
+        updates = {}
+        intraday = {}
+        ws_info = {}
+        for symbol in changed:
+            if symbol in self._market_data_cache:
+                c = self._market_data_cache[symbol]
+                updates[symbol] = {
+                    'price': c.get('price', 0),
+                    'change': c.get('change', 0),
+                    'change_pct': c.get('change_pct', 0),
+                }
+            if symbol in self._ws_tick_history:
+                intraday[symbol] = self._build_intraday_ohlc(symbol)
+            if symbol in self._ws_extra_info:
+                ws_info[symbol] = self._ws_extra_info[symbol]
+
+        if updates:
+            payload = json.dumps({'updates': updates, 'intraday': intraday, 'ws_info': ws_info})
+            js = f'if(window.updatePrices)window.updatePrices({payload});'
+            self.map_widget.page().runJavaScript(js)
+
+    def _build_intraday_ohlc(self, symbol, interval_min=5):
+        """Build intraday OHLC: seeded history + WS tick-derived bars merged."""
+        # Start with seeded bars from yf.download (keyed by bucket timestamp)
+        bars = {}
+        seed = self._intraday_ohlc_seed.get(symbol, [])
+        for bar in seed:
+            ts = int(bar[0])
+            bars[ts] = {'o': bar[1], 'h': bar[2], 'l': bar[3], 'c': bar[4]}
+
+        # Layer WS ticks on top (extends chart beyond seed data)
+        ticks = self._ws_tick_history.get(symbol, [])
+        for ts, price in ticks:
+            bucket = int(ts // (interval_min * 60)) * (interval_min * 60)
+            if bucket not in bars:
+                bars[bucket] = {'o': price, 'h': price, 'l': price, 'c': price}
+            else:
+                b = bars[bucket]
+                b['h'] = max(b['h'], price)
+                b['l'] = min(b['l'], price)
+                b['c'] = price
+
+        if not bars:
+            return []
+        return [[t, b['o'], b['h'], b['l'], b['c']] for t, b in sorted(bars.items())]
+
+    def _stop_market_websocket(self):
+        """Stop the WebSocket connection and thread."""
+        if self._ws_worker is not None:
+            self._ws_worker.stop()
+        if self._ws_thread is not None and self._ws_thread.isRunning():
+            self._ws_thread.quit()
+            self._ws_thread.wait(3000)
+        self._ws_worker = None
+        self._ws_thread = None
+
     def refresh_market_data(self):
         """Refresh volatility data (VIX, VVIX, SKEW, MOVE) asynchronously.
-        
+
         OPTIMERING: Flyttar tung yfinance.download till bakgrundstrad.
+        First load uses period='max' for full history. Subsequent refreshes
+        use period='1y' to avoid re-downloading decades of data every 5 min.
+        Cooldown of 5 minutes prevents excessive fetching.
         """
         print("[Volatility] refresh_market_data called")
-        
+
         # Don't start if already running - använd säker flagga
         if self._volatility_running:
             print("[Volatility] Already running (flag), skipping")
             return
-        
+
         # Also check if old thread is still alive
         if self._volatility_thread is not None and self._volatility_thread.isRunning():
             print("[Volatility] Old thread still alive, skipping")
             return
-        
+
+        # Cooldown: skip if last fetch was less than 5 minutes ago
+        now = time.time()
+        last_vol = getattr(self, '_volatility_last_start', 0)
+        if last_vol > 0 and (now - last_vol) < 300:
+            print(f"[Volatility] Skipped - cooldown ({now - last_vol:.0f}s < 300s)")
+            return
+
         tickers = ['^VIX', '^VVIX', '^SKEW', '^MOVE']
-        
+
+        # Always fetch full history for accurate percentile calculations
+        vol_period = 'max'
+
         # Sätt flagga INNAN vi skapar tråden
         self._volatility_running = True
-        self._volatility_last_start = time.time()
-        print(f"[Volatility] Creating thread for {tickers}")
+        self._volatility_last_start = now
+        print(f"[Volatility] Creating thread for {tickers} (period={vol_period})")
         
         try:
             # Create and start worker
             self._volatility_thread = QThread()
-            self._volatility_worker = VolatilityDataWorker(tickers)
+            self._volatility_worker = VolatilityDataWorker(tickers, period=vol_period)
             self._volatility_worker.moveToThread(self._volatility_thread)
             
             self._volatility_thread.started.connect(self._volatility_worker.run)
@@ -10981,7 +11197,7 @@ class PairsTradingTerminal(QMainWindow):
             if len(close) == 0:
                 print("No volatility data returned")
                 return
-            
+
             # Antal dagar för sparkline (senaste ~30 handelsdagar)
             SPARKLINE_DAYS = 30
             
@@ -11260,12 +11476,12 @@ class PairsTradingTerminal(QMainWindow):
         
         self.statusBar().showMessage(f"Analysis complete: {n_viable} viable pairs found")
         
-        # If this was a scheduled scan, continue with HMM fitting
+        # If this was a scheduled scan, send Discord and reset
         if self._is_scheduled_scan:
-            self.statusBar().showMessage("Scheduled scan: Fitting HMM model...")
-            # Store flag for HMM completion
-            self._scheduled_hmm_pending = True
-            self.fit_hmm_model()
+            self._is_scheduled_scan = False
+            self._scheduled_scan_running = False
+            self.send_scan_results_to_discord()
+            self.statusBar().showMessage("Scheduled scan complete - results sent to Discord")
     
     def _update_metric_value(self, frame: Optional[QFrame], value: str):
         """Update the value label inside a metric frame.
@@ -11324,6 +11540,19 @@ class PairsTradingTerminal(QMainWindow):
                 self.viable_table.setItem(i, 3, QTableWidgetItem(f"{row.johansen_trace:.2f}"))
                 self.viable_table.setItem(i, 4, QTableWidgetItem(f"{row.hurst_exponent:.2f}"))
                 self.viable_table.setItem(i, 5, QTableWidgetItem(f"{row.correlation:.2f}"))
+                # Kalman diagnostics
+                ks = getattr(row, 'kalman_stability', None)
+                self.viable_table.setItem(i, 6, QTableWidgetItem(
+                    f"{ks:.2f}" if ks is not None else "N/A"))
+                ir = getattr(row, 'kalman_innovation_ratio', None)
+                self.viable_table.setItem(i, 7, QTableWidgetItem(
+                    f"{ir:.2f}" if ir is not None else "N/A"))
+                rs = getattr(row, 'kalman_regime_score', None)
+                self.viable_table.setItem(i, 8, QTableWidgetItem(
+                    f"{rs:.2f}" if rs is not None else "N/A"))
+                ts = getattr(row, 'kalman_theta_significant', None)
+                self.viable_table.setItem(i, 9, QTableWidgetItem(
+                    "Yes" if ts else ("No" if ts is not None else "N/A")))
         finally:
             self.viable_table.setUpdatesEnabled(True)
     
@@ -11371,10 +11600,10 @@ class PairsTradingTerminal(QMainWindow):
         if selected:
             pair = self.viable_table.item(selected[0].row(), 0).text()
             self.selected_pair = pair
-            
-            # Switch to OU tab and select this pair
-            self.ou_pair_combo.setCurrentText(pair)
+
+            # Switch to OU tab first (triggers lazy load if needed), then select pair
             self.tabs.setCurrentIndex(2)
+            self.ou_pair_combo.setCurrentText(pair)
     
     def update_ou_pair_list(self):
         """Update OU analytics pair dropdown.
@@ -11578,41 +11807,53 @@ class PairsTradingTerminal(QMainWindow):
         self.ou_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{y_ticker} (Y)")
         self.ou_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{x_ticker} + α")
         
-        # ===== Z-SCORE =====
+        # ===== SPREAD with μ and ±2σ BANDS =====
         self.ou_zscore_plot.clear()
         
-        # Use Kalman time-varying z-scores if available (no look-ahead bias)
-        kalman = getattr(ou, '_kalman', None)
-        if kalman is not None and kalman.zscore_history is not None:
-            # Kalman history has n-1 points (AR(1) loses first obs)
-            # Pad front with NaN to align with x_axis
-            kalman_z = kalman.zscore_history
-            n_pad = len(x_axis) - len(kalman_z)
-            if n_pad > 0:
-                zscore_values = np.concatenate([np.full(n_pad, np.nan), kalman_z])
-            else:
-                zscore_values = kalman_z[-len(x_axis):]
-            
-            # Also plot the static z-score as faint reference (clamped at ±3)
-            # Static Z = uses final global μ and σ for ALL points (has look-ahead bias)
-            # Kalman Z = uses time-varying μ_t and expanding-window σ_t at each point (no bias)
-            static_z = np.clip(((spread - ou.mu) / ou.eq_std).values, -3, 3)
-            self.ou_zscore_plot.addLegend(offset=(60, 5))
-            self.ou_zscore_plot.plot(x_axis, static_z, 
-                pen=pg.mkPen('#9c27b0', width=1, style=Qt.DashLine),
-                name='Static Z')
-            self.ou_zscore_plot.plot(x_axis, zscore_values, 
-                pen=pg.mkPen('#00e5ff', width=2),
-                name='Kalman Z')
-            zscore = pd.Series(zscore_values, index=spread.index)
-        else:
-            zscore_values = np.clip(((spread - ou.mu) / ou.eq_std).values, -3, 3)
-            self.ou_zscore_plot.plot(x_axis, zscore_values, pen=pg.mkPen('#9c27b0', width=2))
-            zscore = (spread - ou.mu) / ou.eq_std
+        spread_values = spread.values
         
-        self.ou_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-        self.ou_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-        self.ou_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+        # Use Kalman time-varying μ and σ if available
+        kalman = getattr(ou, '_kalman', None)
+        if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
+            mu_hist = kalman.mu_history
+            std_hist = kalman.eq_std_history
+            
+            # Pad front to align with x_axis (Kalman history has n-1 points)
+            n_pad = len(x_axis) - len(mu_hist)
+            if n_pad > 0:
+                mu_vals = np.concatenate([np.full(n_pad, np.nan), mu_hist])
+                std_vals = np.concatenate([np.full(n_pad, np.nan), std_hist])
+            else:
+                mu_vals = mu_hist[-len(x_axis):]
+                std_vals = std_hist[-len(x_axis):]
+            
+            upper_2 = mu_vals + 2 * std_vals
+            lower_2 = mu_vals - 2 * std_vals
+            
+            # Plot ±2σ band as fill
+            try:
+                upper_curve = self.ou_zscore_plot.plot(x_axis, upper_2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+                lower_curve = self.ou_zscore_plot.plot(x_axis, lower_2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+                fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 255, 255, 20))
+                self.ou_zscore_plot.addItem(fill)
+            except Exception:
+                pass
+            
+            # Plot μ line
+            self.ou_zscore_plot.plot(x_axis, mu_vals, pen=pg.mkPen('#ffffff', width=1), name='μ')
+        else:
+            # Fallback: static μ and σ from final OU params
+            mu_val = ou.mu
+            eq_std_val = ou.eq_std
+            self.ou_zscore_plot.addLine(y=mu_val, pen=pg.mkPen('#ffffff', width=1))
+            self.ou_zscore_plot.addLine(y=mu_val + 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+            self.ou_zscore_plot.addLine(y=mu_val - 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+        
+        # Plot the raw spread
+        self.ou_zscore_plot.plot(x_axis, spread_values, pen=pg.mkPen('#00e5ff', width=2), name='Spread')
+        
+        # Keep zscore Series for crosshair (show spread value on hover)
+        zscore = spread
         
         # ===== AUTO-RANGE: Reset view to show full data after plotting =====
         self._ou_syncing_plots = True
@@ -11641,7 +11882,7 @@ class PairsTradingTerminal(QMainWindow):
             self.zscore_crosshair = CrosshairManager(
                 self.ou_zscore_plot,
                 dates=dates,
-                data_series={'Z-Score': zscore.values},
+                data_series={'Spread': zscore.values},
                 label_format="{:.2f}"
             )
             
@@ -11806,28 +12047,46 @@ class PairsTradingTerminal(QMainWindow):
             self.signal_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{y_ticker} (Y)")
             self.signal_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{x_ticker} + α")
             
-            # ===== Z-SCORE =====
+            # ===== SPREAD with μ and ±2σ BANDS =====
             self.signal_zscore_plot.clear()
             
-            # Use Kalman time-varying z-scores if available
-            kalman = getattr(ou, '_kalman', None)
-            if kalman is not None and kalman.zscore_history is not None:
-                kalman_z = kalman.zscore_history
-                n_pad = len(x_axis) - len(kalman_z)
-                if n_pad > 0:
-                    zscore_values = np.concatenate([np.full(n_pad, np.nan), kalman_z])
-                else:
-                    zscore_values = kalman_z[-len(x_axis):]
-                
-                self.signal_zscore_plot.plot(x_axis, zscore_values, pen=pg.mkPen('#00e5ff', width=2))
-                zscore = pd.Series(zscore_values, index=spread.index)
-            else:
-                zscore = (spread - ou.mu) / ou.eq_std
-                self.signal_zscore_plot.plot(x_axis, zscore.values, pen=pg.mkPen('#9c27b0', width=2))
+            spread_values = spread.values
             
-            self.signal_zscore_plot.addLine(y=2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.signal_zscore_plot.addLine(y=-2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-            self.signal_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+            # Use Kalman time-varying μ and σ if available
+            kalman = getattr(ou, '_kalman', None)
+            if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
+                mu_hist = kalman.mu_history
+                std_hist = kalman.eq_std_history
+                
+                n_pad = len(x_axis) - len(mu_hist)
+                if n_pad > 0:
+                    mu_vals = np.concatenate([np.full(n_pad, np.nan), mu_hist])
+                    std_vals = np.concatenate([np.full(n_pad, np.nan), std_hist])
+                else:
+                    mu_vals = mu_hist[-len(x_axis):]
+                    std_vals = std_hist[-len(x_axis):]
+                
+                upper_2 = mu_vals + 2 * std_vals
+                lower_2 = mu_vals - 2 * std_vals
+                
+                try:
+                    upper_curve = self.signal_zscore_plot.plot(x_axis, upper_2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+                    lower_curve = self.signal_zscore_plot.plot(x_axis, lower_2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+                    fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 255, 255, 20))
+                    self.signal_zscore_plot.addItem(fill)
+                except Exception:
+                    pass
+                
+                self.signal_zscore_plot.plot(x_axis, mu_vals, pen=pg.mkPen('#ffffff', width=1))
+            else:
+                mu_val = ou.mu
+                eq_std_val = ou.eq_std
+                self.signal_zscore_plot.addLine(y=mu_val, pen=pg.mkPen('#ffffff', width=1))
+                self.signal_zscore_plot.addLine(y=mu_val + 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+                self.signal_zscore_plot.addLine(y=mu_val - 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
+            
+            self.signal_zscore_plot.plot(x_axis, spread_values, pen=pg.mkPen('#00e5ff', width=2))
+            zscore = spread
             
             # ===== AUTO-RANGE: Reset view to show full data after plotting =====
             # Temporarily block sync signals to avoid recursive range triggering
@@ -11858,7 +12117,7 @@ class PairsTradingTerminal(QMainWindow):
                 self.signal_zscore_crosshair = CrosshairManager(
                     self.signal_zscore_plot,
                     dates=dates,
-                    data_series={'Z-Score': zscore.values},
+                    data_series={'Spread': zscore.values},
                     label_format="{:.2f}"
                 )
                 
@@ -11956,64 +12215,43 @@ class PairsTradingTerminal(QMainWindow):
             pair_stats = self.engine.viable_pairs[self.engine.viable_pairs['pair'] == pair].iloc[0]
             hedge_ratio = pair_stats['hedge_ratio']
             
-            # Get notional from spin box
+            # Calculate minimum units via the new auto-minimum function
+            min_result = calculate_minifuture_minimum_units(hedge_ratio, mf_y, mf_x, dir_y, dir_x)
+
+            if min_result:
+                # Auto-update notional to match minimum capital requirement
+                min_capital = math.ceil(min_result['total_capital'])
+                self.notional_spin.blockSignals(True)
+                self.notional_spin.setValue(max(min_capital, self.notional_spin.value()))
+                self.notional_spin.blockSignals(False)
+
             notional = self.notional_spin.value()
-            
+
             # Calculate position sizing
             mf_positions = calculate_minifuture_position(notional, hedge_ratio, mf_y, mf_x, direction)
-            
+
             # Store for later use
             self.current_mf_positions = mf_positions
-            
-            # Helper function to calculate instrument price and actual allocation
-            def calc_actual_allocation(mf_data, target_capital, dir_leg):
-                """Calculate units and actual allocation for any instrument type."""
-                if not mf_data:
-                    return None, None, None, None
-                
-                product_type = mf_data.get('product_type', 'Mini Future')
-                spot_price = mf_data.get('spot_price', 0)
-                leverage = mf_data.get('leverage', 1)
-                fin_level = mf_data.get('financing_level')
-                
-                # Check if instrument_price was pre-calculated (for certificates with multiplier)
-                instrument_price = mf_data.get('instrument_price')
-                
-                if instrument_price is None:
-                    # Calculate instrument price based on product type
-                    if product_type == 'Mini Future' and fin_level is not None:
-                        if dir_leg == 'Long':
-                            instrument_price = spot_price - fin_level
-                        else:
-                            instrument_price = fin_level - spot_price
-                    elif product_type == 'Certificate':
-                        # Certificate with financing level and multiplier
-                        multiplier = mf_data.get('multiplier')
-                        if fin_level is not None and multiplier is not None:
-                            if dir_leg == 'Long':
-                                instrument_price = multiplier * (spot_price - fin_level)
-                            else:
-                                instrument_price = multiplier * (fin_level - spot_price)
-                        else:
-                            # Fallback approximation (may not be accurate)
-                            instrument_price = spot_price / leverage if leverage > 0 else 100
-                    else:
-                        # Generic fallback
-                        instrument_price = spot_price / leverage if leverage > 0 else 100
-                
-                # Ensure positive price
-                instrument_price = max(0.01, abs(instrument_price))
-                
-                # Calculate units (whole numbers only)
-                units = max(1, int(target_capital / instrument_price))
-                actual_allocation = units * instrument_price
-                deviation_pct = abs(actual_allocation - target_capital) / target_capital * 100 if target_capital > 0 else 0
-                
-                return instrument_price, units, actual_allocation, deviation_pct
-            
-            # Calculate actual allocations for both legs
-            inst_price_y, units_y, actual_y, dev_y = calc_actual_allocation(mf_y, mf_positions['capital_y'], dir_y)
-            inst_price_x, units_x, actual_x, dev_x = calc_actual_allocation(mf_x, mf_positions['capital_x'], dir_x)
+
+            # Use auto-minimum units if available, otherwise fall back
+            if min_result:
+                inst_price_y = min_result['price_y']
+                inst_price_x = min_result['price_x']
+                # Scale units proportionally if notional is above minimum
+                if notional > min_result['total_capital']:
+                    scale = notional / min_result['total_capital']
+                    units_y = max(1, int(min_result['units_y'] * scale))
+                    units_x = max(1, int(min_result['units_x'] * scale))
+                else:
+                    units_y = min_result['units_y']
+                    units_x = min_result['units_x']
+                actual_y = units_y * inst_price_y
+                actual_x = units_x * inst_price_x
+                dev_y = abs(actual_y - mf_positions['capital_y']) / mf_positions['capital_y'] * 100 if mf_positions['capital_y'] > 0 else 0
+                dev_x = abs(actual_x - mf_positions['capital_x']) / mf_positions['capital_x'] * 100 if mf_positions['capital_x'] > 0 else 0
+            else:
+                inst_price_y, units_y, actual_y, dev_y = None, None, None, 0
+                inst_price_x, units_x, actual_x, dev_x = None, None, None, 0
             
             # Update Y leg display
             action_y = "LONG POSITION:" if dir_y == "Long" else "SHORT POSITION:"
@@ -12953,30 +13191,44 @@ class PairsTradingTerminal(QMainWindow):
             current_z = pos.get('current_z', entry_z)
             z_change = current_z - entry_z
             direction = pos['direction']
-            
-            # For LONG: profit when Z increases (becomes less negative)
-            # For SHORT: profit when Z decreases
-            profit = (z_change > 0) if direction == 'LONG' else (z_change < 0)
-            
+
             # Calculate realized P/L from MF prices
             pnl_y = 0
             pnl_x = 0
-            total_capital = pos.get('mf_total_capital', pos.get('notional', 0))
-            
+
             entry_y = pos.get('mf_entry_price_y')
             current_y = pos.get('mf_current_price_y')
             qty_y = pos.get('mf_qty_y', 0)
             if entry_y and current_y and qty_y:
                 pnl_y = (current_y - entry_y) * qty_y
-            
+
             entry_x = pos.get('mf_entry_price_x')
             current_x = pos.get('mf_current_price_x')
             qty_x = pos.get('mf_qty_x', 0)
             if entry_x and current_x and qty_x:
                 pnl_x = (current_x - entry_x) * qty_x
-            
+
             realized_pnl_sek = pnl_y + pnl_x
+
+            # Capital = actual invested amount (entry_price * qty per leg)
+            total_capital = 0
+            if entry_y and qty_y:
+                total_capital += entry_y * qty_y
+            if entry_x and qty_x:
+                total_capital += entry_x * qty_x
+            # Fallback if no MF data entered
+            if total_capital == 0:
+                total_capital = pos.get('mf_total_capital', pos.get('notional', 0))
+
             realized_pnl_pct = (realized_pnl_sek / total_capital * 100) if total_capital > 0 else 0
+
+            # Determine profit/loss from actual realized P/L (not Z-score direction)
+            has_mf_data = (entry_y and current_y and qty_y) or (entry_x and current_x and qty_x)
+            if has_mf_data:
+                profit = realized_pnl_sek >= 0
+            else:
+                # Fallback to Z-score direction when no MF prices available
+                profit = (z_change > 0) if direction == 'LONG' else (z_change < 0)
             
             status = pos.get('status', 'MANUAL CLOSE')
             
@@ -13106,7 +13358,6 @@ def main():
         print(f"Auto-updater disabled: {e}")
     
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()

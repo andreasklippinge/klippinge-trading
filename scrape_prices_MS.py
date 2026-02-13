@@ -6,16 +6,41 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import pandas as pd
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 from dataclasses import dataclass
 
+
+class TTLCache:
+    """Simple TTL cache with max size to prevent unbounded growth."""
+    def __init__(self, ttl: int = 300, maxsize: int = 100):
+        self._cache = OrderedDict()
+        self._ttl = ttl
+        self._maxsize = maxsize
+
+    def get(self, key):
+        if key in self._cache:
+            value, timestamp = self._cache[key]
+            if (datetime.now() - timestamp).total_seconds() < self._ttl:
+                return value
+            del self._cache[key]
+        return None
+
+    def set(self, key, value):
+        self._cache[key] = (value, datetime.now())
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+
 # Cache
 _minifutures_cache: pd.DataFrame = None
 _minifutures_cache_time: datetime = None
-_price_cache: dict = {}
-_price_cache_time: datetime = None
+_price_cache = TTLCache(ttl=300, maxsize=100)
+
+# Module-level session (lazy-initialized)
+_session: Optional[requests.Session] = None
 
 SCRAPING_AVAILABLE = True
 
@@ -134,16 +159,24 @@ def fetch_product_detail(session: requests.Session, isin: str) -> Optional[Produ
         return None
 
 
+def _get_session() -> requests.Session:
+    """Get or create module-level session (reused across calls)."""
+    global _session
+    if _session is None:
+        _session = create_session()
+    return _session
+
+
 def get_buy_price(isin: str) -> Optional[float]:
     """Hämta köppris för en specifik ISIN."""
-    session = create_session()
+    session = _get_session()
     quote = fetch_product_detail(session, isin)
     return quote.buy_price if quote else None
 
 
 def get_quotes_batch(isins: list[str]) -> dict[str, ProductQuote]:
     """Hämta priser för flera ISINs parallellt."""
-    session = create_session()
+    session = _get_session()
     results = {}
     
     with ThreadPoolExecutor(max_workers=5) as executor:

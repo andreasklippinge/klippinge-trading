@@ -11,11 +11,11 @@ Features:
     4. Particle Filter - Online updates
     5. Jump Detection - Fast regime shift identification
 
-4-State Regime Model:
-    0: RISK-ON      - Expansion: Strong growth, moderate inflation
-    1: RISK-OFF     - Contraction: Falling growth, risk aversion
-    2: DEFLATION    - Crisis: Falling growth AND inflation
-    3: STAGFLATION  - Stress: Weak growth, high inflation
+4-State Macro Regime Model (Growth × Inflation):
+    0: GOLDILOCKS   - Strong growth, low/falling inflation
+    1: REFLATION    - Strong growth, rising inflation
+    2: DEFLATION    - Weak growth, low/falling inflation
+    3: STAGFLATION  - Weak growth, rising inflation
 
 Author: Klippinge Investment Trading Terminal
 Version: 4.0 - Hedge Fund Grade
@@ -32,6 +32,7 @@ import warnings
 import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
 from scipy import stats
@@ -61,56 +62,64 @@ except ImportError:
 
 
 # =============================================================================
-# REGIME DEFINITIONS (3-STATE MODEL)
+# REGIME DEFINITIONS (4-STATE GROWTH × INFLATION MODEL)
 # =============================================================================
 
-N_REGIMES = 3  # Global constant for number of regimes
+N_REGIMES = 4  # Global constant for number of regimes
 
 REGIMES = {
     0: {
-        'name': 'RISK-ON',
-        'color': '#22c55e',  # Green
-        'description': 'Expansion phase. Equities lead, credit spreads tight, volatility suppressed. '
-                      'Favor cyclicals, small caps, high beta. Carry strategies perform well.',
-        'assets': 'Long equities, risk assets',
-        'expected_duration_months': 14.0,
+        'name': 'GOLDILOCKS',
+        'color': '#22c55e',       # Green
+        'description': 'Strong growth, low/falling inflation. Equities lead, spreads tight, '
+                      'vol suppressed. Favor cyclicals, small caps, high beta, carry.',
+        'assets': 'Long equities, credit, small caps',
+        'expected_duration_weeks': 52,
         'expected_signs': {
-            'equity_mom': 1, 'bond_mom': -1, 'vix': -1,
+            'equity_mom': 1, 'bond_mom': 0, 'vix': -1,
             'yield_curve': 1, 'credit_spread': 1,
+            'inflation_mom': -1, 'commodity_mom': 0,
         }
     },
     1: {
-        'name': 'NEUTRAL',
-        'color': '#f59e0b',  # Amber/Orange
-        'description': 'Transition phase. Mixed signals, moderate volatility. '
-                      'Balanced allocation, focus on quality and dividend yield.',
-        'assets': 'Balanced, quality stocks, dividends',
-        'expected_duration_months': 8.0,
+        'name': 'REFLATION',
+        'color': '#f59e0b',       # Amber/Orange
+        'description': 'Strong growth with rising inflation. Commodities & real assets lead. '
+                      'Central banks tightening, yield curve flattening.',
+        'assets': 'Commodities, TIPS, energy, value stocks',
+        'expected_duration_weeks': 35,
         'expected_signs': {
-            'equity_mom': 0, 'bond_mom': 0, 'vix': 0,
-            'yield_curve': 0, 'credit_spread': 0,
+            'equity_mom': 1, 'bond_mom': -1, 'vix': 0,
+            'yield_curve': -1, 'credit_spread': 0,
+            'inflation_mom': 1, 'commodity_mom': 1,
         }
     },
     2: {
-        'name': 'RISK-OFF',
-        'color': '#ef4444',  # Red
-        'description': 'Risk aversion / crisis phase. Defensive assets outperform, credit widens, '
-                      'volatility spikes. Flight to quality - bonds, gold, cash, low beta.',
-        'assets': 'Defensive, bonds, gold, cash',
-        'expected_duration_months': 5.0,
+        'name': 'DEFLATION',
+        'color': '#3b82f6',       # Blue
+        'description': 'Weak growth, low/falling inflation. Flight to quality — nominal bonds rally, '
+                      'equities fall, VIX spikes. Defensive positioning.',
+        'assets': 'Long bonds, defensive equities, gold',
+        'expected_duration_weeks': 26,
         'expected_signs': {
             'equity_mom': -1, 'bond_mom': 1, 'vix': 1,
-            'yield_curve': -1, 'credit_spread': -1,
+            'yield_curve': 0, 'credit_spread': -1,
+            'inflation_mom': -1, 'commodity_mom': -1,
         }
-    }
-}
-
-# Legacy 4-regime definitions (kept for backward compatibility)
-REGIMES_4STATE = {
-    0: {'name': 'RISK-ON', 'color': '#22c55e'},
-    1: {'name': 'RISK-OFF', 'color': '#f59e0b'},
-    2: {'name': 'DEFLATION', 'color': '#3b82f6'},
-    3: {'name': 'STAGFLATION', 'color': '#ef4444'},
+    },
+    3: {
+        'name': 'STAGFLATION',
+        'color': '#ef4444',       # Red
+        'description': 'Weak growth with rising inflation — worst of both worlds. Neither equities '
+                      'nor nominal bonds work. Gold, commodities, cash, real assets.',
+        'assets': 'Gold, commodities, cash, short duration',
+        'expected_duration_weeks': 18,
+        'expected_signs': {
+            'equity_mom': -1, 'bond_mom': -1, 'vix': 1,
+            'yield_curve': -1, 'credit_spread': -1,
+            'inflation_mom': 1, 'commodity_mom': 1,
+        }
+    },
 }
 
 
@@ -332,13 +341,13 @@ class StickyHMM:
         gamma_smooth = np.maximum(gamma_smooth, prob_floor)
         gamma_smooth /= gamma_smooth.sum(axis=1, keepdims=True)
         
-        # Cap maximum probability at 85%
-        prob_cap = 0.85
+        # Cap maximum probability at 92%
+        prob_cap = 0.92
         gamma_smooth = np.minimum(gamma_smooth, prob_cap)
         gamma_smooth /= gamma_smooth.sum(axis=1, keepdims=True)
-        
+
         # Temporal smoothing (EMA with recent observations)
-        alpha_smooth = 0.7  # Weight on current observation
+        alpha_smooth = 0.85  # Weight on current observation
         for t in range(1, len(gamma_smooth)):
             gamma_smooth[t] = alpha_smooth * gamma_smooth[t] + (1 - alpha_smooth) * gamma_smooth[t-1]
         
@@ -400,7 +409,7 @@ class StickyHMM:
         
         # Temperature scaling on emissions to prevent overconfidence
         # Higher temperature = more uniform (less extreme) probabilities
-        temperature = 2.0
+        temperature = 1.5
         log_emission_scaled = log_emission / temperature
         
         log_trans = np.log(self.transition_matrix_ + 1e-10)
@@ -482,42 +491,44 @@ class StickyHMM:
         Uses optimal matching (Hungarian algorithm) for proper state labeling.
         
         3-State Model:
-        - RISK-ON:  High equity (+), low VIX (-), weak bonds (-)
-        - NEUTRAL:  Mixed/moderate signals
-        - RISK-OFF: Low equity (-), high VIX (+), strong bonds (+)
+        - GOLDILOCKS:  High equity (+), low VIX (-), low inflation (-)
+        - DEFLATION:   Low equity (-), high VIX (+), strong bonds (+), low inflation (-)
+        - STAGFLATION: Low equity (-), high VIX (+), weak bonds (-), high inflation (+)
         """
         n_states = len(self.emissions_)
-        
+
         if n_states not in [3, 4]:
             print(f"Warning: Reordering not implemented for {n_states} states")
             return
-        
+
         n_features = len(self.emissions_[0].mean_)
-        
+
         # Expected z-score characteristics for each regime
         if n_states == 3:
             expected = {
-                0: {'equity': +0.8, 'vix': -0.8, 'bonds': -0.3, 'name': 'RISK-ON'},
-                1: {'equity':  0.0, 'vix':  0.0, 'bonds':  0.0, 'name': 'NEUTRAL'},
-                2: {'equity': -0.5, 'vix': +0.8, 'bonds': +0.5, 'name': 'RISK-OFF'},
+                0: {'equity': +0.8, 'vix': -0.8, 'bonds': -0.3, 'inflation': 0.0, 'name': 'GOLDILOCKS'},
+                1: {'equity':  0.0, 'vix':  0.0, 'bonds':  0.0, 'inflation': 0.0, 'name': 'REFLATION'},
+                2: {'equity': -0.5, 'vix': +0.8, 'bonds': +0.5, 'inflation': 0.0, 'name': 'DEFLATION'},
             }
-        else:  # 4 states (legacy)
+        else:  # 4 states
             expected = {
-                0: {'equity': +1.0, 'vix': -1.0, 'bonds': -0.5, 'name': 'RISK-ON'},
-                1: {'equity': -0.5, 'vix': +1.0, 'bonds': +0.5, 'name': 'RISK-OFF'},
-                2: {'equity': -0.3, 'vix': +0.3, 'bonds': +1.0, 'name': 'DEFLATION'},
-                3: {'equity': -0.5, 'vix': +0.5, 'bonds': -1.0, 'name': 'STAGFLATION'},
+                0: {'equity': +0.8, 'vix': -0.8, 'bonds':  0.0, 'inflation': -0.5, 'name': 'GOLDILOCKS'},
+                1: {'equity': +0.5, 'vix':  0.0, 'bonds': -0.5, 'inflation': +0.8, 'name': 'REFLATION'},
+                2: {'equity': -0.5, 'vix': +0.8, 'bonds': +0.8, 'inflation': -0.5, 'name': 'DEFLATION'},
+                3: {'equity': -0.5, 'vix': +0.5, 'bonds': -0.5, 'inflation': +0.8, 'name': 'STAGFLATION'},
             }
-        
+
         # Extract characteristics for each HMM state
+        # Feature indices: 0=equity_mom, 1=bond_mom, 3=vix, 12=inflation_mom
         state_chars = []
         for e in self.emissions_:
             state_chars.append({
                 'equity': e.mean_[0],
                 'vix': e.mean_[3] if n_features > 3 else 0,
                 'bonds': e.mean_[1] if n_features > 1 else 0,
+                'inflation': e.mean_[12] if n_features > 12 else 0,
             })
-        
+
         # Build cost matrix for Hungarian algorithm
         cost_matrix = np.zeros((n_states, n_states))
         for hmm_state in range(n_states):
@@ -527,7 +538,8 @@ class StickyHMM:
                 # Weighted squared differences
                 cost = (2.0 * (sc['equity'] - exp['equity'])**2 +
                        1.5 * (sc['vix'] - exp['vix'])**2 +
-                       1.0 * (sc['bonds'] - exp['bonds'])**2)
+                       1.0 * (sc['bonds'] - exp['bonds'])**2 +
+                       1.5 * (sc['inflation'] - exp['inflation'])**2)
                 cost_matrix[hmm_state, regime] = cost
         
         # Use Hungarian algorithm for optimal assignment
@@ -567,12 +579,9 @@ class StickyHMM:
             sc = state_chars[new_order[i]]
             
             # Check if assignment makes sense
-            if n_states == 3 and i == 1:  # NEUTRAL - more lenient
-                status = "✓"
-            else:
-                equity_ok = (sc['equity'] > 0) == (exp['equity'] > 0) or abs(sc['equity']) < 0.15
-                vix_ok = (sc['vix'] > 0) == (exp['vix'] > 0) or abs(sc['vix']) < 0.25
-                status = "✓" if (equity_ok and vix_ok) else "⚠️ MISMATCH"
+            equity_ok = (sc['equity'] > 0) == (exp['equity'] > 0) or abs(sc['equity']) < 0.15
+            vix_ok = (sc['vix'] > 0) == (exp['vix'] > 0) or abs(sc['vix']) < 0.25
+            status = "✓" if (equity_ok and vix_ok) else "⚠️ MISMATCH"
             
     
     def get_transition_matrix(self) -> np.ndarray:
@@ -697,11 +706,14 @@ class TimeVaryingTransitionHMM:
     
     def _set_economic_priors(self):
         """Set economic priors for time-varying transitions."""
-        # For 3-state model: RISK-ON (0), NEUTRAL (1), RISK-OFF (2)
-        # Higher VIX increases transition to RISK-OFF
-        if self.n_states >= 3:
-            self.W[:, min(2, self.n_states-1), 0] = 0.5  # VIX -> RISK-OFF
-            self.W[:, 0, 0] = -0.3  # VIX -> not RISK-ON
+        if self.n_states >= 4:
+            # 4-state model: VIX increase → favors deflation/stagflation
+            self.W[:, 2, 0] = 0.4   # VIX → DEFLATION
+            self.W[:, 3, 0] = 0.3   # VIX → STAGFLATION
+            self.W[:, 0, 0] = -0.3  # VIX → not GOLDILOCKS
+        elif self.n_states >= 3:
+            self.W[:, min(2, self.n_states-1), 0] = 0.5
+            self.W[:, 0, 0] = -0.3
         np.fill_diagonal(self.b, 2.0)  # Sticky diagonal
     
     def get_transition_matrix(self, context: np.ndarray) -> np.ndarray:
@@ -805,27 +817,31 @@ class RegimeFeatures:
     """Robust feature engineering with individual ticker downloads."""
     
     TICKERS = {
-        'SPY': 'S&P 500 ETF', 
+        'SPY': 'S&P 500 ETF',
         'TLT': '20+ Year Treasury ETF',
         'GLD': 'Gold ETF',
-        '^VIX': 'VIX Index', 
+        '^VIX': 'VIX Index',
         '^TNX': '10-Year Treasury Yield',
-        '^IRX': '3-Month Treasury Yield', 
+        '^IRX': '3-Month Treasury Yield',
         'IWM': 'Russell 2000 ETF',
-        'EEM': 'Emerging Markets ETF', 
-        'HYG': 'High Yield Bond ETF', 
+        'EEM': 'Emerging Markets ETF',
+        'HYG': 'High Yield Bond ETF',
         'LQD': 'Investment Grade Bond ETF',
         'VUG': 'Growth ETF',
         'VTV': 'Value ETF',
+        'TIP': 'TIPS ETF',
+        'DBC': 'Commodities ETF',
     }
     
     FEATURE_NAMES = [
         'equity_mom', 'bond_mom', 'gold_mom', 'vix',
-        'yield_curve', 'credit_spread', 'small_large', 
-        'em_dm', 'growth_value'
+        'yield_curve', 'credit_spread', 'small_large',
+        'em_dm', 'growth_value',
+        'equity_vol', 'momentum_breadth', 'credit_momentum',
+        'inflation_mom', 'commodity_mom', 'real_yield'
     ]
     
-    def __init__(self, lookback_years: int = 30, zscore_window: int = 24):
+    def __init__(self, lookback_years: int = 30, zscore_window: int = 52):
         self.lookback_years = lookback_years
         self.zscore_window = zscore_window
         self.raw_data: Optional[pd.DataFrame] = None
@@ -834,9 +850,10 @@ class RegimeFeatures:
     def fetch_data(self, progress_callback: Callable = None) -> pd.DataFrame:
         """
         Fetch data with robust error handling.
-        
-        IMPORTANT: Uses DAILY data and resamples to monthly because yfinance's
+
+        IMPORTANT: Uses DAILY data and resamples to weekly because yfinance's
         interval="1mo" has a known bug where data can be months behind.
+        Weekly resolution gives ~1560 data points over 30 years (4x more than monthly).
         """
         if progress_callback:
             progress_callback(5, "Fetching market data...")
@@ -870,18 +887,17 @@ class RegimeFeatures:
                 else:
                     closes = data
                 
-                # Resample daily to monthly (last trading day of month)
-                # 'ME' for pandas >= 2.0, 'M' for older versions
+                # Resample daily to weekly (last trading day of week, Friday)
                 try:
-                    monthly_closes = closes.resample('ME').last()
+                    weekly_closes = closes.resample('W-FRI').last()
                 except ValueError:
-                    monthly_closes = closes.resample('M').last()
-                
+                    weekly_closes = closes.resample('W').last()
+
                 # Check what we got
                 for ticker in tickers:
-                    if ticker in monthly_closes.columns:
-                        series = monthly_closes[ticker].dropna()
-                        if len(series) > 50:
+                    if ticker in weekly_closes.columns:
+                        series = weekly_closes[ticker].dropna()
+                        if len(series) > 200:
                             all_data[ticker] = series
                 
                 if len(all_data) >= 4:
@@ -898,37 +914,42 @@ class RegimeFeatures:
             if progress_callback:
                 progress_callback(7, f"Downloading {len(missing)} missing tickers...")
             
-            for i, ticker in enumerate(missing):
-                try:
-                    df = yf.download(
-                        ticker, 
-                        start=start_date.strftime('%Y-%m-%d'),
-                        end=end_date.strftime('%Y-%m-%d'),
-                        interval="1d",  # Daily data
-                        progress=False,
-                        timeout=30,
-                        ignore_tz=True
-                    )
-                    if df is not None and len(df) > 50:
-                        if 'Close' in df.columns:
-                            # Resample to monthly (pandas version compatible)
-                            try:
-                                monthly = df['Close'].resample('ME').last().dropna()
-                            except ValueError:
-                                monthly = df['Close'].resample('M').last().dropna()
-                            if len(monthly) > 50:
-                                all_data[ticker] = monthly
-                        elif len(df.columns) == 1:
-                            try:
-                                monthly = df.iloc[:, 0].resample('ME').last().dropna()
-                            except ValueError:
-                                monthly = df.iloc[:, 0].resample('M').last().dropna()
-                            if len(monthly) > 50:
-                                all_data[ticker] = monthly
-                except Exception as e:
-                    print(f"Failed to download {ticker}: {e}")
-                
-                time.sleep(0.2)  # Rate limiting
+            def _download_single_ticker(ticker):
+                time.sleep(0.1)  # Rate limiting per worker
+                df = yf.download(
+                    ticker,
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    interval="1d",
+                    progress=False,
+                    timeout=30,
+                    ignore_tz=True
+                )
+                return ticker, df
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(_download_single_ticker, t): t for t in missing}
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    try:
+                        _, df = future.result()
+                        if df is not None and len(df) > 200:
+                            if 'Close' in df.columns:
+                                try:
+                                    weekly = df['Close'].resample('W-FRI').last().dropna()
+                                except ValueError:
+                                    weekly = df['Close'].resample('W').last().dropna()
+                                if len(weekly) > 200:
+                                    all_data[ticker] = weekly
+                            elif len(df.columns) == 1:
+                                try:
+                                    weekly = df.iloc[:, 0].resample('W-FRI').last().dropna()
+                                except ValueError:
+                                    weekly = df.iloc[:, 0].resample('W').last().dropna()
+                                if len(weekly) > 200:
+                                    all_data[ticker] = weekly
+                    except Exception as e:
+                        print(f"Failed to download {ticker}: {e}")
         
         if len(all_data) < 4:
             raise ValueError(f"Only got {len(all_data)} tickers. Need at least 4. Got: {list(all_data.keys())}")
@@ -939,11 +960,11 @@ class RegimeFeatures:
         # Debug: Show actual date range
         
         if progress_callback:
-            progress_callback(10, f"Downloaded {len(all_data)} tickers, {len(self.raw_data)} months")
+            progress_callback(10, f"Downloaded {len(all_data)} tickers, {len(self.raw_data)} weeks")
         
         return self.raw_data
     
-    def compute_features(self, momentum_window: int = 3, 
+    def compute_features(self, momentum_window: int = 13,
                         progress_callback: Callable = None) -> pd.DataFrame:
         """Compute features with graceful handling of missing data."""
         if progress_callback:
@@ -997,7 +1018,36 @@ class RegimeFeatures:
         # 9. Growth/Value ratio
         if 'VUG' in df.columns and 'VTV' in df.columns:
             features['growth_value'] = self._zscore(df['VUG'] / df['VTV'])
-        
+
+        # 10. Equity volatility (annualized 20-week rolling std)
+        if 'SPY' in df.columns:
+            spy_returns = df['SPY'].pct_change()
+            equity_vol_raw = spy_returns.rolling(20, min_periods=10).std() * np.sqrt(52)
+            features['equity_vol'] = self._zscore(equity_vol_raw)
+
+        # 11. Momentum breadth (IWM momentum minus SPY momentum)
+        if 'IWM' in df.columns and 'SPY' in df.columns:
+            iwm_mom = df['IWM'].pct_change(momentum_window)
+            spy_mom = df['SPY'].pct_change(momentum_window)
+            features['momentum_breadth'] = self._zscore(iwm_mom - spy_mom)
+
+        # 12. Credit momentum (HYG/LQD ratio momentum)
+        if 'HYG' in df.columns and 'LQD' in df.columns:
+            credit_ratio = df['HYG'] / df['LQD']
+            features['credit_momentum'] = self._zscore(credit_ratio.pct_change(momentum_window))
+
+        # 13. Inflation momentum (TIP/TLT ratio = breakeven inflation proxy)
+        if 'TIP' in df.columns and 'TLT' in df.columns:
+            features['inflation_mom'] = self._zscore((df['TIP'] / df['TLT']).pct_change(momentum_window))
+
+        # 14. Commodity momentum
+        if 'DBC' in df.columns:
+            features['commodity_mom'] = self._zscore(df['DBC'].pct_change(momentum_window))
+
+        # 15. Real yield proxy (bond return minus inflation compensation)
+        if 'TLT' in df.columns and 'TIP' in df.columns:
+            features['real_yield'] = self._zscore(df['TLT'] / df['TIP'])
+
         # Drop rows with NaN and clip outliers
         features = features.dropna()
         features = features.clip(-4, 4)
@@ -1006,21 +1056,22 @@ class RegimeFeatures:
         if len(features.columns) < 4:
             raise ValueError(f"Only {len(features.columns)} features computed. Need at least 4.")
         
-        if len(features) < 50:
-            raise ValueError(f"Only {len(features)} observations after cleaning. Need at least 50.")
+        if len(features) < 100:
+            raise ValueError(f"Only {len(features)} observations after cleaning. Need at least 100.")
         
         self.features = features
         
         if progress_callback:
-            progress_callback(20, f"Computed {len(features.columns)} features, {len(features)} months")
+            progress_callback(20, f"Computed {len(features.columns)} features, {len(features)} weeks")
         
         
         return features
     
     def _zscore(self, series: pd.Series) -> pd.Series:
         """Standard rolling z-score."""
-        rolling_mean = series.rolling(window=self.zscore_window, min_periods=12).mean()
-        rolling_std = series.rolling(window=self.zscore_window, min_periods=12).std()
+        min_per = max(int(self.zscore_window * 0.5), 12)
+        rolling_mean = series.rolling(window=self.zscore_window, min_periods=min_per).mean()
+        rolling_std = series.rolling(window=self.zscore_window, min_periods=min_per).std()
         return (series - rolling_mean) / (rolling_std + 1e-8)
     
     def get_feature_matrix(self) -> np.ndarray:
@@ -1048,7 +1099,7 @@ class RegimeDetector:
         regime = detector.get_current_regime()
     """
     
-    CACHE_PATH = os.path.expanduser("~/.regime_cache_monthly.pkl")
+    CACHE_PATH = os.path.expanduser("~/.regime_cache_weekly.pkl")
     
     def __init__(self,
                  model_type: str = 'hsmm',
@@ -1056,7 +1107,7 @@ class RegimeDetector:
                  use_particle_filter: bool = True,
                  use_tv_transitions: bool = True,
                  use_bayesian: bool = False,
-                 stickiness: float = 15.0,  # Reduced from 40 for more realistic transitions
+                 stickiness: float = 10.0,  # Reduced for weekly resolution
                  use_student_t: bool = True):
         
         self.model_type = model_type
@@ -1165,7 +1216,7 @@ class RegimeDetector:
         uncertainty = entropy / np.log(len(probs))
         
         current_duration = self._compute_current_duration()
-        expected_duration = REGIMES[current_state].get('expected_duration_months', 8.0)
+        expected_duration = REGIMES[current_state].get('expected_duration_weeks', 35.0)
         expected_remaining = max(0, expected_duration - current_duration)
         
         primary = {
@@ -1205,23 +1256,23 @@ class RegimeDetector:
     def _get_change_forecast(self, current_state: int) -> Dict[str, Any]:
         trans_mat = self.get_transition_matrix()
         stay_prob = trans_mat[current_state, current_state]
-        
+
         change_probs = []
         cumulative_stay = 1.0
-        for _ in range(12):
+        for _ in range(52):
             change_probs.append(cumulative_stay * (1 - stay_prob))
             cumulative_stay *= stay_prob
-        
-        # Calculate expected months until regime change
-        # Cap at 120 months (10 years) to avoid unrealistic values from very sticky HMM
+
+        # Calculate expected weeks until regime change
+        # Cap at 520 weeks (10 years) to avoid unrealistic values from very sticky HMM
         if stay_prob < 0.9999:
-            expected_months = 1.0 / (1 - stay_prob)
+            expected_weeks = 1.0 / (1 - stay_prob)
         else:
-            expected_months = 120.0  # Default cap for extremely sticky regimes
-        
+            expected_weeks = 520.0  # Default cap for extremely sticky regimes
+
         # Apply reasonable cap (max 10 years)
-        expected_months = min(expected_months, 120.0)
-        
+        expected_weeks = min(expected_weeks, 520.0)
+
         trans_row = trans_mat[current_state].copy()
         trans_row[current_state] = 0
         if trans_row.sum() > 0:
@@ -1229,12 +1280,19 @@ class RegimeDetector:
             next_state = int(np.argmax(trans_row))
         else:
             next_state = (current_state + 1) % N_REGIMES
-        
+
         return {
-            '1m': change_probs[0] if change_probs else 0.1,
-            '3m': change_probs[2] if len(change_probs) > 2 else 0.3,
+            # Weekly keys
+            '1w': change_probs[0] if change_probs else 0.02,
+            '4w': change_probs[3] if len(change_probs) > 3 else 0.1,
+            '13w': change_probs[12] if len(change_probs) > 12 else 0.3,
+            '52w': change_probs[-1] if change_probs else 0.7,
+            'expected_weeks': expected_weeks,
+            # Backward-compatible monthly keys
+            '1m': change_probs[3] if len(change_probs) > 3 else 0.1,
+            '3m': change_probs[12] if len(change_probs) > 12 else 0.3,
             '12m': change_probs[-1] if change_probs else 0.7,
-            'expected_months': expected_months,
+            'expected_months': expected_weeks / 4.33,
             'most_likely_next': REGIMES[next_state]['name'],
             'next_state_id': next_state,
             'next_state_color': REGIMES[next_state]['color']
@@ -1280,16 +1338,23 @@ class RegimeDetector:
     
     def load_model(self, path: str = None) -> bool:
         path = path or self.CACHE_PATH
-        
+
         if not os.path.exists(path):
             return False
-        
+
         try:
             with open(path, 'rb') as f:
                 cache_data = pickle.load(f)
-            
+
             if 'detector' in cache_data:
                 cached = cache_data['detector']
+                # Invalidate cache if N_REGIMES changed (e.g. 3→4 state upgrade)
+                cached_n = getattr(cached, 'regime_probs', None)
+                if cached_n is not None and hasattr(cached_n, 'shape') and len(cached_n.shape) > 1:
+                    if cached_n.shape[1] != N_REGIMES:
+                        print(f"Cache invalidated: cached {cached_n.shape[1]} states != current {N_REGIMES} states")
+                        os.remove(path)
+                        return False
                 self.primary_model = cached.primary_model
                 self.states = cached.states
                 self.regime_probs = cached.regime_probs
@@ -1299,10 +1364,10 @@ class RegimeDetector:
                 self.uncertainty = getattr(cached, 'uncertainty', None)
                 self.fitted = cached.fitted
                 return True
-                
+
         except Exception as e:
             print(f"Load error: {e}")
-        
+
         return False
 
 
@@ -1325,16 +1390,17 @@ if __name__ == "__main__":
     print("HEDGE FUND GRADE MARKET REGIME DETECTION")
     print("=" * 70)
     
-    # Delete cache
-    cache_path = os.path.expanduser("~/.regime_cache_monthly.pkl")
-    if os.path.exists(cache_path):
-        print(f"\nDeleting cache: {cache_path}")
-        os.remove(cache_path)
-    
+    # Delete old caches
+    for old_cache in ["~/.regime_cache_monthly.pkl", "~/.regime_cache_weekly.pkl"]:
+        cache_path = os.path.expanduser(old_cache)
+        if os.path.exists(cache_path):
+            print(f"\nDeleting cache: {cache_path}")
+            os.remove(cache_path)
+
     detector = RegimeDetector(
         model_type='hsmm',
         lookback_years=30,
-        stickiness=15.0,  # Reduced for more realistic transitions
+        stickiness=10.0,  # Weekly resolution stickiness
         use_student_t=True
     )
     
@@ -1348,8 +1414,8 @@ if __name__ == "__main__":
         print(f"CURRENT REGIME: {primary['name']}")
         print(f"{'═' * 70}")
         print(f"  Confidence:   {primary['probability']:.1%}")
-        print(f"  Duration:     {primary['current_duration']} months")
-        
+        print(f"  Duration:     {primary['current_duration']} weeks")
+
         print(f"\nREGIME PROBABILITIES:")
         for state_id, prob in primary['all_probabilities'].items():
             name = REGIMES[state_id]['name']
@@ -1363,8 +1429,11 @@ if __name__ == "__main__":
         
         forecast = regime['change_forecast']
         print(f"\nCHANGE FORECAST:")
-        print(f"  1-month:  {forecast['1m']:.1%}")
-        print(f"  3-month:  {forecast['3m']:.1%}")
+        print(f"  1-week:   {forecast['1w']:.1%}")
+        print(f"  4-week:   {forecast['4w']:.1%}")
+        print(f"  13-week:  {forecast['13w']:.1%}")
+        print(f"  52-week:  {forecast['52w']:.1%}")
+        print(f"  Expected: {forecast['expected_weeks']:.0f} weeks")
         print(f"  Next:     {forecast['most_likely_next']}")
         
         print(f"\n{'═' * 70}")

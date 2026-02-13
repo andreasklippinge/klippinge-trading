@@ -720,7 +720,8 @@ class KalmanOUEstimator:
                 cusum_minus = max(0, cusum_minus - vi + 1 - k)
                 max_cusum = max(max_cusum, cusum_plus, cusum_minus)
             
-            regime_change_score = max_cusum
+            # Normalize by √N so threshold is comparable across series lengths
+            regime_change_score = max_cusum / np.sqrt(len(v2))
         else:
             regime_change_score = 0.0
         
@@ -1229,6 +1230,7 @@ class PairsTradingEngine:
         self.ou_models = {}
         self.signals = {}
         self.positions = {}
+        self._ou_params_cache = {}  # pair -> {ou, spread, z, data_len}
     
     def _set_defaults(self):
         """Set default configuration values."""
@@ -1366,9 +1368,9 @@ class PairsTradingEngine:
         valid_tickers = missing_pct[missing_pct < 0.30].index.tolist()
         data = data[valid_tickers]
         
-        # Store raw data for pair-specific calculations
-        self.raw_price_data = data.copy()
-        
+        # Store raw data for pair-specific calculations (read-only reference, no copy needed)
+        self.raw_price_data = data
+
         # Keep NaN - correlation uses min_periods, pair testing uses pairwise dropna
         self.price_data = data
         
@@ -1652,12 +1654,35 @@ class PairsTradingEngine:
                         hurst = 0.5
                 
                 # === OU parameters on the Engle-Granger spread ===
+                # Primary: Kalman filter (consistent with OU Analytics tab)
+                # Fallback: AR(1) OLS
                 if len(spread) > 50:
                     try:
-                        ou_params = self.fit_ou_parameters(spread)
+                        kalman = KalmanOUEstimator(
+                            q_scale=1e-5, adaptive_q=True,
+                            smoother=True, cusum_threshold=4.0
+                        )
+                        kalman_result = kalman.fit(spread)
+                        if kalman_result.valid:
+                            ou_params = OUParameters(
+                                theta=kalman_result.theta,
+                                mu=kalman_result.mu,
+                                sigma=kalman_result.sigma,
+                                eq_std=kalman_result.eq_std,
+                                half_life_days=kalman_result.half_life_days,
+                                ar1_coef=kalman_result.ar1_coef,
+                                valid=True
+                            )
+                            ou_params._kalman = kalman_result
                     except Exception:
-                        ou_params = None
-            
+                        pass
+                    # Fallback to OLS if Kalman failed
+                    if ou_params is None:
+                        try:
+                            ou_params = self.fit_ou_parameters(spread)
+                        except Exception:
+                            ou_params = None
+
             # === Determine what passed/failed ===
             
             # Engle-Granger test: p-value < threshold
@@ -1693,10 +1718,33 @@ class PairsTradingEngine:
                 ar1_coef = 0
                 ou_valid = False
             
-            # === Final viability: Option B ===
-            # EG passes AND Johansen passes AND half-life valid AND Hurst valid
-            is_viable = passes_coint and passes_halflife and ou_valid and passes_hurst
-            
+            # === Kalman diagnostics (integrated — no separate post-screening step) ===
+            kalman_result = getattr(ou_params, '_kalman', None) if ou_params else None
+            if kalman_result is not None:
+                k_stability = kalman_result.param_stability
+                k_inn_ratio = kalman_result.innovation_ratio
+                k_regime = kalman_result.regime_change_score
+                k_theta_sig = (kalman_result.theta > 1.96 * kalman_result.theta_std
+                               if kalman_result.theta_std > 0 else False)
+                kalman_checks = [
+                    k_stability > 0.4,
+                    0.4 <= k_inn_ratio <= 2.5,
+                    k_regime < 5.0,
+                    k_theta_sig,
+                ]
+                passes_kalman = sum(kalman_checks) >= 3
+            else:
+                k_stability = 0.0
+                k_inn_ratio = 0.0
+                k_regime = 99.0
+                k_theta_sig = False
+                passes_kalman = False
+
+            # === Final viability ===
+            # EG + Johansen + half-life + Hurst + Kalman validation
+            is_viable = (passes_coint and passes_halflife and ou_valid
+                         and passes_hurst and passes_kalman)
+
             return {
                 'pair': f"{t1}/{t2}",
                 'ticker_y': t1,
@@ -1722,6 +1770,11 @@ class PairsTradingEngine:
                 'passes_coint': passes_coint,
                 'passes_halflife': passes_halflife,
                 'passes_hurst': passes_hurst,
+                'passes_kalman': passes_kalman,
+                'kalman_stability': round(k_stability, 4),
+                'kalman_innovation_ratio': round(k_inn_ratio, 4),
+                'kalman_regime_score': round(k_regime, 4),
+                'kalman_theta_significant': bool(k_theta_sig),
                 'data_length': data_length,
                 'is_viable': is_viable
             }
@@ -1751,12 +1804,93 @@ class PairsTradingEngine:
                 'passes_coint': False,
                 'passes_halflife': False,
                 'passes_hurst': False,
+                'passes_kalman': False,
+                'kalman_stability': 0.0,
+                'kalman_innovation_ratio': 0.0,
+                'kalman_regime_score': 99.0,
+                'kalman_theta_significant': False,
                 'data_length': 0,
                 'is_viable': False,
                 'error': str(e)[:100]
             }
     
-    def screen_pairs(self, tickers: List[str] = None, 
+    def _kalman_validate_pair(self, row, data: pd.DataFrame,
+                             raw_data: pd.DataFrame) -> dict:
+        """Run Kalman filter validation on a viable pair.
+
+        Returns dict with Kalman diagnostic columns.
+        """
+        defaults = {
+            'kalman_stability': 0.0,
+            'kalman_innovation_ratio': 0.0,
+            'kalman_regime_score': 99.0,
+            'kalman_theta_significant': False,
+            'passes_kalman': False,
+        }
+
+        try:
+            t1 = row.ticker_y
+            t2 = row.ticker_x
+
+            if t1 in raw_data.columns and t2 in raw_data.columns:
+                pair_data = raw_data[[t1, t2]].dropna()
+            else:
+                pair_data = data[[t1, t2]].dropna()
+
+            if len(pair_data) < 60:
+                return defaults
+
+            y = pair_data[t1]
+            x = pair_data[t2]
+
+            # Compute EG spread using hedge ratio from screening
+            hedge = getattr(row, 'hedge_ratio', 1.0)
+            intercept = getattr(row, 'intercept', 0.0)
+            spread = y - hedge * x - intercept
+
+            # Run Kalman filter
+            kalman = KalmanOUEstimator(
+                q_scale=1e-5, adaptive_q=True,
+                smoother=True, cusum_threshold=4.0
+            )
+            result = kalman.fit(spread)
+
+            if not result.valid:
+                return defaults
+
+            stability = result.param_stability
+            inn_ratio = result.innovation_ratio
+            regime = result.regime_change_score
+
+            # Theta significance: 95% CI excludes 0
+            theta_sig = (result.theta > 1.96 * result.theta_std
+                         if result.theta_std > 0 else False)
+
+            # Relaxed criteria — at least 3 of 4 must pass
+            checks = [
+                stability > 0.4,
+                0.4 <= inn_ratio <= 2.5,
+                regime < 5.0,
+                theta_sig,
+            ]
+            passes = sum(checks) >= 3
+
+            pair_name = getattr(row, 'pair', '?')
+            print(f"  [Kalman] {pair_name}: stab={stability:.2f} ir={inn_ratio:.2f} "
+                  f"regime={regime:.1f} theta_sig={theta_sig} → {'PASS' if passes else 'FAIL'}")
+
+            return {
+                'kalman_stability': round(stability, 4),
+                'kalman_innovation_ratio': round(inn_ratio, 4),
+                'kalman_regime_score': round(regime, 4),
+                'kalman_theta_significant': bool(theta_sig),
+                'passes_kalman': bool(passes),
+            }
+        except Exception as e:
+            print(f"Kalman validation failed for {getattr(row, 'pair', '?')}: {e}")
+            return defaults
+
+    def screen_pairs(self, tickers: List[str] = None,
                      sector_groups: Dict[str, List[str]] = None,
                      use_exchange_groups: bool = True,
                      correlation_prefilter: bool = True,
@@ -1776,14 +1910,15 @@ class PairsTradingEngine:
         
         data = self.price_data
         available_tickers = data.columns.tolist()
-        
+        available_tickers_set = set(available_tickers)
+
         if progress_callback:
             progress_callback('grouping', 0, 0, f"Starting with {len(available_tickers)} tickers")
 
         groups = {'ALL': available_tickers}
-        
-        # Filter to groups with enough tickers
-        groups = {k: [t for t in v if t in available_tickers] 
+
+        # Filter to groups with enough tickers (O(1) set lookup)
+        groups = {k: [t for t in v if t in available_tickers_set]
                   for k, v in groups.items()}
         groups = {k: v for k, v in groups.items() if len(v) >= min_group_size}
         
@@ -1802,10 +1937,9 @@ class PairsTradingEngine:
             # pandas .corr() handles pairwise complete observations automatically
             returns = data.pct_change()
             
-            # Scale min_periods with data length for reliable correlations
-            # Use at least 20% of available data, minimum 50, capped at 252 (1 year)
-            data_length = len(returns)
-            min_obs_for_corr = min(252, max(50, int(data_length * 0.2)))
+            # Fixed min_periods for deterministic results across scan sizes
+            # 100 ≈ ~5 months of daily data — enough for reliable correlation
+            min_obs_for_corr = 100
             
             # Check we have enough data
             valid_return_counts = returns.count()
@@ -1894,18 +2028,20 @@ class PairsTradingEngine:
         
         self.pairs_stats = results_df
         self.viable_pairs = results_df[results_df['is_viable']].copy() if len(results_df) > 0 else pd.DataFrame()
-        
+        self._ou_params_cache = {}  # Invalidate OU cache on new scan
+
+        print(f"[Scan] {len(self.viable_pairs)} viable pairs (Kalman-integrated)")
+
         # Build OU models for viable pairs
-        for _, row in self.viable_pairs.iterrows():
-            pair = row['pair']
-            self.ou_models[pair] = OUProcess(
-                theta=row['theta'],
-                mu=row['mu'],
-                sigma=row['sigma']
+        for row in self.viable_pairs.itertuples():
+            self.ou_models[row.pair] = OUProcess(
+                theta=row.theta,
+                mu=row.mu,
+                sigma=row.sigma
             )
-        
+
         if progress_callback:
-            progress_callback('complete', len(results_df), len(results_df), 
+            progress_callback('complete', len(results_df), len(results_df),
                             f"Found {len(self.viable_pairs)} viable pairs from {len(results_df)} tested ({len(candidate_pairs)} candidates)")
         
         return results_df
@@ -2185,18 +2321,25 @@ class PairsTradingEngine:
             Tuple of (OUProcess, eg_spread_series, current_zscore)
         """
         t1, t2 = pair.split('/')
-        
+
         # Use raw data if available and requested, otherwise fall back to price_data
         if use_raw_data and self.raw_price_data is not None and len(self.raw_price_data) > 0:
             data_source = self.raw_price_data
         else:
             data_source = self.price_data
-        
+
         if t1 not in data_source.columns or t2 not in data_source.columns:
             raise ValueError(f"Tickers {t1} or {t2} not found in data")
-        
+
         # Get pair-specific aligned data
         pair_data = data_source[[t1, t2]].dropna()
+
+        # Check OU params cache (same data length = same result)
+        cache_key = (pair, method, use_raw_data)
+        if cache_key in self._ou_params_cache:
+            cached = self._ou_params_cache[cache_key]
+            if cached['data_len'] == len(pair_data):
+                return cached['ou'], cached['spread'], cached['z']
         
         if len(pair_data) < 50:
             raise ValueError(f"Insufficient data for pair {pair}: only {len(pair_data)} points")
@@ -2301,8 +2444,14 @@ class PairsTradingEngine:
             current_spread = eg_spread.iloc[-1]
             current_z = ou.zscore(current_spread)
         
+        # Cache result for subsequent calls with same data
+        self._ou_params_cache[cache_key] = {
+            'ou': ou, 'spread': eg_spread, 'z': current_z,
+            'data_len': len(pair_data)
+        }
+
         return ou, eg_spread, current_z
-    
+
     def get_spread_history(self, pair: str, use_raw_data: bool = True) -> pd.DataFrame:
         """Get historical spread data with z-scores and bands using Engle-Granger spread."""
         t1, t2 = pair.split('/')

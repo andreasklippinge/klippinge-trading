@@ -154,7 +154,7 @@ class Paths:
     
     @staticmethod
     def regime_cache_file() -> str:
-        return str(get_user_data_dir() / "regime_cache_advanced.pkl")
+        return str(get_user_data_dir() / "regime_cache_weekly.pkl")
     
     @staticmethod
     def notification_config_file() -> str:
@@ -299,12 +299,17 @@ def find_matched_tickers_csv() -> str:
     Find the underliggande_matchade_tickers.csv file.
     Priority:
         1. User data directory
-        2. Bundled default
+        2. Trading subdirectory
+        3. Bundled default
     """
-    user_copy = get_user_data_dir() / "underliggande_matchade_tickers.csv"
-    if user_copy.exists():
-        return str(user_copy)
-    
+    candidates = [
+        get_user_data_dir() / "underliggande_matchade_tickers.csv",
+        get_trading_data_dir() / "underliggande_matchade_tickers.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+
     return Paths.default_matched_tickers_csv()
 
 
