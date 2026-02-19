@@ -172,23 +172,23 @@ class OUProcess:
         result, _ = integrate.quad(integrand, x_target, x0)
         return result / self.theta
     
-    def win_probability(self, S0: float, take_profit: float, stop_loss: float, 
-                       n_sims: int = 20000, max_time_years: float = 0.5) -> Dict:
+    def win_probability(self, S0: float, take_profit: float, stop_loss: float,
+                       n_sims: int = 5000, max_time_years: float = 0.5) -> Dict:
         """
         P(hit take_profit before stop_loss | S_0) via Monte Carlo.
         """
         dt = 1/252
         n_steps = int(max_time_years / dt)
-        
-        np.random.seed(42)
+
+        rng = np.random.RandomState(42)
         S = np.full(n_sims, S0)
-        
+
         hit_tp = np.zeros(n_sims, dtype=bool)
         hit_sl = np.zeros(n_sims, dtype=bool)
         hit_time = np.full(n_sims, np.nan)
-        
+
         going_down = S0 > self.mu
-        
+
         for step in range(n_steps):
             if going_down:
                 new_tp = (S <= take_profit) & ~hit_tp & ~hit_sl
@@ -196,15 +196,19 @@ class OUProcess:
             else:
                 new_tp = (S >= take_profit) & ~hit_tp & ~hit_sl
                 new_sl = (S <= stop_loss) & ~hit_tp & ~hit_sl
-            
+
             hit_tp |= new_tp
             hit_sl |= new_sl
             hit_time[new_tp | new_sl] = step * dt
-            
+
             if (hit_tp | hit_sl).all():
                 break
-            
-            dW = np.random.randn(n_sims) * np.sqrt(dt)
+
+            # Early exit: >99% resolved → marginal gain from continuing
+            if step > 10 and (hit_tp | hit_sl).sum() / n_sims > 0.99:
+                break
+
+            dW = rng.randn(n_sims) * np.sqrt(dt)
             S = S + self.theta * (self.mu - S) * dt + self.sigma * dW
         
         n_wins = hit_tp.sum()
@@ -491,7 +495,7 @@ class KalmanOUEstimator:
             idx = t - 1  # Storage index
             
             # === PREDICT ===
-            x_pred = x.copy()                  # F = I, so x_pred = x
+            x_pred = x                          # F = I → x_pred = x (no copy needed)
             P_pred = P + Q                     # P_pred = F·P·Fᵀ + Q = P + Q
             
             x_pred_hist[idx] = x_pred
@@ -1226,16 +1230,18 @@ class PairsTradingEngine:
         self.price_data = None
         self.raw_price_data = None  # Stores data before global alignment
         self.pairs_stats = []
+        self._pair_index = {}  # O(1) pair lookup
         self.viable_pairs = []
         self.ou_models = {}
         self.signals = {}
         self.positions = {}
         self._ou_params_cache = {}  # pair -> {ou, spread, z, data_len}
+        self._window_details = {}  # pair -> list of per-window result dicts
     
     def _set_defaults(self):
         """Set default configuration values."""
         defaults = {
-            'lookback_period': '2y',
+            'lookback_period': 'max',
             'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
@@ -1244,11 +1250,14 @@ class PairsTradingEngine:
             'stop_zscore': 3.5,
             'min_win_prob': 0.55,
             'min_correlation': 0.8,
-            'max_hurst': 0.5, 
+            'max_hurst': 0.5,
             'fractional_kelly': 0.25,
             'max_position_pct': 0.10,
             'max_sector_exposure': 0.30,
             'drawdown_limit': 0.15,
+            'robustness_windows': [500, 750, 1000, 1250, 1500, 1750, 2000],
+            'min_windows_passed': 4,
+            'max_data_points': 2500,
         }
         for key, value in defaults.items():
             if key not in self.config:
@@ -1289,7 +1298,7 @@ class PairsTradingEngine:
             return self.price_data
         
         # Download in smaller batches for reliability
-        batch_size = 200
+        batch_size = 100
         all_data = {}
         failed_count = 0
         
@@ -1310,7 +1319,7 @@ class PairsTradingEngine:
                     interval='1d', 
                     auto_adjust=True, 
                     progress=False,
-                    threads=10,
+                    threads=False,
                     group_by='ticker',
                     ignore_tz=True
                 )
@@ -1360,22 +1369,22 @@ class PairsTradingEngine:
         if max_days is not None and len(data) > max_days:
             data = data.iloc[-max_days:]
         
+        # Safety cap: truncate to max_data_points
+        max_pts = self.config.get('max_data_points')
+        if max_pts and len(data) > max_pts:
+            data = data.iloc[-max_pts:]
+
         # Forward fill gaps first
         data = data.ffill()
-        
-        # Drop tickers with more than 30% missing data
-        missing_pct = data.isna().sum() / len(data)
-        valid_tickers = missing_pct[missing_pct < 0.30].index.tolist()
-        data = data[valid_tickers]
-        
+
         # Store raw data for pair-specific calculations (read-only reference, no copy needed)
         self.raw_price_data = data
 
         # Keep NaN - correlation uses min_periods, pair testing uses pairwise dropna
         self.price_data = data
-        
+
         if progress_callback:
-            progress_callback(total_batches, total_batches, f"Loaded {len(data.columns)}/{len(tickers)} tickers ({len(data)} days)")
+            progress_callback(total_batches, total_batches, f"Loaded {len(data.columns)} tickers ({len(data)} days)")
         
         return data
     
@@ -1435,52 +1444,48 @@ class PairsTradingEngine:
             return 0.5
         
         fluctuations = []
-        
+
         for w in window_sizes:
             n_windows = n // w
             if n_windows < 2:
                 continue
-            
-            rms_list = []
-            for i in range(n_windows):
-                # Extract segment
-                start_idx = i * w
-                end_idx = start_idx + w
-                segment = x[start_idx:end_idx]
-                
-                # Fit polynomial trend to segment
-                t = np.arange(w)
-                try:
-                    coeffs = np.polyfit(t, segment, order)
-                    trend = np.polyval(coeffs, t)
-                    
-                    # Calculate RMS of detrended segment
-                    detrended = segment - trend
-                    rms = np.sqrt(np.mean(detrended ** 2))
-                    
-                    if rms > 0 and np.isfinite(rms):
-                        rms_list.append(rms)
-                except:
-                    continue
-            
-            if rms_list:
-                fluctuations.append((w, np.mean(rms_list)))
-        
+
+            # Vectoriserad: reshapa alla segment till en matris och batch-processa
+            t = np.arange(w, dtype=np.float64)
+            segments = x[:n_windows * w].reshape(n_windows, w)
+
+            try:
+                # Batch polyfit: beräkna linjär trend för alla segment samtidigt
+                # y = a*t + b → Vandermonde-matris
+                V = np.vstack([t, np.ones(w)]).T  # (w, 2)
+                # Least squares: coeffs = (V^T V)^-1 V^T segments^T
+                VtV_inv_Vt = np.linalg.lstsq(V, segments.T, rcond=None)[0]  # (2, n_windows)
+                trends = (V @ VtV_inv_Vt).T  # (n_windows, w)
+                detrended = segments - trends
+                rms_vals = np.sqrt(np.mean(detrended ** 2, axis=1))
+
+                # Filtrera bort ogiltiga värden
+                valid = (rms_vals > 0) & np.isfinite(rms_vals)
+                if valid.any():
+                    fluctuations.append((w, np.mean(rms_vals[valid])))
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+
         if len(fluctuations) < 4:
             return 0.5
-        
+
         # Hurst exponent = slope of log(F) vs log(n)
         log_n = np.log([f[0] for f in fluctuations])
         log_f = np.log([f[1] for f in fluctuations])
-        
+
         try:
             hurst, _ = np.polyfit(log_n, log_f, 1)
-            
+
             # Sanity bounds
             if not np.isfinite(hurst):
                 return 0.5
             return np.clip(hurst, 0.0, 1.0)
-        except:
+        except (ValueError, np.linalg.LinAlgError):
             return 0.5
     
     def test_cointegration(self, y: pd.Series, x: pd.Series) -> Dict:
@@ -1581,6 +1586,303 @@ class PairsTradingEngine:
             half_life_days=half_life_days, ar1_coef=b, valid=True
         )
     
+    def _test_pair_single_window(self, t1: str, t2: str, y: pd.Series,
+                                    x: pd.Series, window_size: int) -> Dict:
+        """
+        Test a pair on a single data window. Cheapest-first with early exit.
+
+        Order: Correlation → OLS+Hurst → Engle-Granger → Johansen → Kalman+half-life
+
+        Returns:
+            Dict with 'passed' bool and diagnostics/OU params if passed.
+        """
+        fail = {
+            'passed': False, 'window_size': window_size, 'failed_at': None,
+            'correlation': None, 'hurst_exponent': None,
+            'eg_pvalue': None, 'eg_statistic': None,
+            'johansen_trace': None, 'johansen_crit': None,
+            'half_life_days': None, 'kalman_stability': None,
+            'kalman_innovation_ratio': None, 'kalman_regime_score': None,
+            'kalman_theta_significant': None,
+        }
+
+        # --- 1. Correlation (~0.1ms) ---
+        corr = y.pct_change().corr(x.pct_change())
+        if np.isnan(corr) or corr < self.config['min_correlation']:
+            fail['correlation'] = corr if not np.isnan(corr) else 0.0
+            fail['failed_at'] = 'correlation'
+            return fail
+        fail['correlation'] = corr
+
+        # --- 2. OLS hedge ratio + spread → Hurst DFA (~2ms) ---
+        try:
+            x_const = sm.add_constant(x)
+            model = sm.OLS(y, x_const).fit()
+            hedge_ratio = float(model.params.iloc[1])
+            intercept = float(model.params.iloc[0])
+            spread = y - hedge_ratio * x - intercept
+        except Exception:
+            fail['failed_at'] = 'ols'
+            return fail
+
+        if len(spread) < 50:
+            fail['failed_at'] = 'spread_length'
+            return fail
+
+        try:
+            hurst = self.calculate_hurst_exponent(spread)
+        except Exception:
+            hurst = 0.5
+        fail['hurst_exponent'] = hurst
+        if hurst > self.config.get('max_hurst', 0.5):
+            fail['failed_at'] = 'hurst'
+            return fail
+
+        # --- 3. Engle-Granger ADF on spread (~5ms) ---
+        try:
+            adf_result = adfuller(spread.dropna(), autolag='AIC')
+            eg_pvalue = float(adf_result[1])
+            eg_stat = float(adf_result[0])
+        except Exception:
+            fail['failed_at'] = 'eg_cointegration'
+            return fail
+        fail['eg_pvalue'] = eg_pvalue
+        fail['eg_statistic'] = eg_stat
+        if eg_pvalue >= self.config['max_adf_pvalue']:
+            fail['failed_at'] = 'eg_cointegration'
+            return fail
+
+        # --- 4. Johansen trace test (~10ms) ---
+        try:
+            combined = pd.concat([y, x], axis=1).reset_index(drop=True)
+            johansen_result = coint_johansen(combined.values, 0, 1)
+            johansen_trace = float(johansen_result.lr1[0])
+            johansen_crit = float(johansen_result.cvt[0, 1])
+        except Exception:
+            fail['failed_at'] = 'johansen'
+            return fail
+        fail['johansen_trace'] = johansen_trace
+        fail['johansen_crit'] = johansen_crit
+        if johansen_trace <= johansen_crit:
+            fail['failed_at'] = 'johansen'
+            return fail
+
+        # --- 5. Kalman OU + half-life (~50ms) ---
+        ou_params = None
+        try:
+            kalman = KalmanOUEstimator(
+                q_scale=1e-5, adaptive_q=True,
+                smoother=True, cusum_threshold=4.0
+            )
+            kalman_result = kalman.fit(spread)
+            if kalman_result.valid:
+                ou_params = OUParameters(
+                    theta=kalman_result.theta,
+                    mu=kalman_result.mu,
+                    sigma=kalman_result.sigma,
+                    eq_std=kalman_result.eq_std,
+                    half_life_days=kalman_result.half_life_days,
+                    ar1_coef=kalman_result.ar1_coef,
+                    valid=True
+                )
+                ou_params._kalman = kalman_result
+        except Exception:
+            pass
+
+        if ou_params is None:
+            try:
+                ou_params = self.fit_ou_parameters(spread)
+            except Exception:
+                fail['failed_at'] = 'half_life'
+                return fail
+
+        if ou_params is None or not ou_params.valid:
+            fail['failed_at'] = 'half_life'
+            return fail
+
+        half_life = ou_params.half_life_days
+        fail['half_life_days'] = half_life
+        if not (self.config['min_half_life'] <= half_life <= self.config['max_half_life']):
+            fail['failed_at'] = 'half_life'
+            return fail
+
+        # Kalman diagnostics — at least 3 of 4 must pass
+        kalman_res = getattr(ou_params, '_kalman', None)
+        if kalman_res is not None:
+            k_stability = kalman_res.param_stability
+            k_inn_ratio = kalman_res.innovation_ratio
+            k_regime = kalman_res.regime_change_score
+            k_theta_sig = (kalman_res.theta > 1.96 * kalman_res.theta_std
+                           if kalman_res.theta_std > 0 else False)
+            kalman_checks = [
+                k_stability > 0.4,
+                0.4 <= k_inn_ratio <= 2.5,
+                k_regime < 5.0,
+                k_theta_sig,
+            ]
+            passes_kalman = sum(kalman_checks) >= 3
+        else:
+            passes_kalman = False
+            k_stability = 0.0
+            k_inn_ratio = 0.0
+            k_regime = 99.0
+            k_theta_sig = False
+
+        fail['kalman_stability'] = round(k_stability, 4)
+        fail['kalman_innovation_ratio'] = round(k_inn_ratio, 4)
+        fail['kalman_regime_score'] = round(k_regime, 4)
+        fail['kalman_theta_significant'] = bool(k_theta_sig)
+        if not passes_kalman:
+            fail['failed_at'] = 'kalman'
+            return fail
+
+        # --- All tests passed ---
+        return {
+            'passed': True,
+            'window_size': window_size,
+            'correlation': corr,
+            'hurst_exponent': hurst,
+            'eg_pvalue': eg_pvalue,
+            'eg_statistic': eg_stat,
+            'johansen_trace': johansen_trace,
+            'johansen_crit': johansen_crit,
+            'half_life_days': half_life,
+            'theta': ou_params.theta,
+            'mu': ou_params.mu,
+            'sigma': ou_params.sigma,
+            'eq_std': ou_params.eq_std,
+            'ar1_coef': ou_params.ar1_coef,
+            'hedge_ratio': hedge_ratio,
+            'intercept': intercept,
+            'ou_valid': True,
+            'ou_params': ou_params,
+            'kalman_stability': round(k_stability, 4),
+            'kalman_innovation_ratio': round(k_inn_ratio, 4),
+            'kalman_regime_score': round(k_regime, 4),
+            'kalman_theta_significant': bool(k_theta_sig),
+        }
+
+    def _test_pair_multi_window(self, pair_info: Tuple, data: pd.DataFrame,
+                                 raw_data: pd.DataFrame) -> Dict:
+        """
+        Test a pair across multiple lookback windows for robustness.
+
+        OU parameters are taken from the shortest passing window (most current).
+        """
+        t1, t2, group_name, precomputed_corr = pair_info
+
+        # Defaults for failure return
+        fail_result = {
+            'pair': f"{t1}/{t2}", 'ticker_y': t1, 'ticker_x': t2,
+            'group': group_name,
+            'correlation': precomputed_corr if precomputed_corr else 0,
+            'hurst_exponent': 0.5, 'eg_pvalue': 1.0, 'eg_statistic': 0,
+            'johansen_trace': 0, 'johansen_crit': 999,
+            'half_life_days': np.inf, 'theta': 0, 'mu': 0, 'sigma': 0,
+            'eq_std': 0, 'ar1_coef': 0, 'hedge_ratio': 1.0, 'intercept': 0.0,
+            'ou_valid': False,
+            'passes_eg': False, 'passes_johansen': False, 'passes_coint': False,
+            'passes_halflife': False, 'passes_hurst': False, 'passes_kalman': False,
+            'kalman_stability': 0.0, 'kalman_innovation_ratio': 0.0,
+            'kalman_regime_score': 99.0, 'kalman_theta_significant': False,
+            'data_length': 0, 'is_viable': False,
+            'robustness_score': 0.0, 'windows_passed': 0,
+            'windows_tested': 0, 'passing_windows': [],
+        }
+
+        try:
+            # Align pair data
+            if t1 in raw_data.columns and t2 in raw_data.columns:
+                pair_data = raw_data[[t1, t2]].dropna()
+            else:
+                pair_data = data[[t1, t2]].dropna()
+
+            data_length = len(pair_data)
+            if data_length < 50:
+                fail_result['data_length'] = data_length
+                return fail_result
+
+            windows = sorted(self.config.get('robustness_windows',
+                                             [500, 750, 1000, 1250, 1500, 1750, 2000]))
+            min_windows_req = self.config.get('min_windows_passed', 4)
+
+            windows_passed = 0
+            windows_tested = 0
+            passing_windows = []
+            best_result = None  # From shortest passing window
+            all_window_results = []
+
+            for window_size in windows:
+                if data_length < window_size:
+                    continue
+                windows_tested += 1
+
+                y = pair_data.iloc[-window_size:][t1]
+                x = pair_data.iloc[-window_size:][t2]
+
+                result = self._test_pair_single_window(t1, t2, y, x, window_size)
+                # Store per-window result (strip heavy ou_params object)
+                window_record = {k: v for k, v in result.items() if k != 'ou_params'}
+                all_window_results.append(window_record)
+                if result['passed']:
+                    windows_passed += 1
+                    passing_windows.append(window_size)
+                    if best_result is None:  # Shortest = most current
+                        best_result = result
+
+            if windows_tested == 0:
+                fail_result['data_length'] = data_length
+                fail_result['window_details'] = all_window_results
+                return fail_result
+
+            robustness_score = windows_passed / windows_tested if windows_tested > 0 else 0.0
+            is_viable = (windows_passed >= min_windows_req) and (best_result is not None)
+
+            if best_result is not None:
+                return {
+                    'pair': f"{t1}/{t2}", 'ticker_y': t1, 'ticker_x': t2,
+                    'group': group_name,
+                    'correlation': best_result['correlation'],
+                    'hurst_exponent': best_result['hurst_exponent'],
+                    'eg_pvalue': best_result['eg_pvalue'],
+                    'eg_statistic': best_result['eg_statistic'],
+                    'johansen_trace': best_result['johansen_trace'],
+                    'johansen_crit': best_result['johansen_crit'],
+                    'half_life_days': best_result['half_life_days'],
+                    'theta': best_result['theta'],
+                    'mu': best_result['mu'],
+                    'sigma': best_result['sigma'],
+                    'eq_std': best_result['eq_std'],
+                    'ar1_coef': best_result['ar1_coef'],
+                    'hedge_ratio': best_result['hedge_ratio'],
+                    'intercept': best_result['intercept'],
+                    'ou_valid': True,
+                    'passes_eg': True, 'passes_johansen': True,
+                    'passes_coint': True, 'passes_halflife': True,
+                    'passes_hurst': True, 'passes_kalman': True,
+                    'kalman_stability': best_result['kalman_stability'],
+                    'kalman_innovation_ratio': best_result['kalman_innovation_ratio'],
+                    'kalman_regime_score': best_result['kalman_regime_score'],
+                    'kalman_theta_significant': best_result['kalman_theta_significant'],
+                    'data_length': data_length,
+                    'is_viable': is_viable,
+                    'robustness_score': robustness_score,
+                    'windows_passed': windows_passed,
+                    'windows_tested': windows_tested,
+                    'passing_windows': passing_windows,
+                    'window_details': all_window_results,
+                }
+            else:
+                fail_result['data_length'] = data_length
+                fail_result['windows_tested'] = windows_tested
+                fail_result['robustness_score'] = 0.0
+                fail_result['window_details'] = all_window_results
+                return fail_result
+
+        except Exception as e:
+            fail_result['error'] = str(e)[:100]
+            return fail_result
+
     def _test_single_pair(self, pair_info: Tuple, data: pd.DataFrame, raw_data: pd.DataFrame) -> Dict:
         """
         Test a single pair for cointegration using Option B:
@@ -1962,16 +2264,18 @@ class PairsTradingEngine:
                     progress_callback('correlation', group_idx + 1, len(groups), 
                                     f"Group: {group_name} ({len(valid_tickers)} tickers, min_periods={min_obs_for_corr})")
                 
-                # Find pairs above correlation threshold
-                for i in range(len(corr_matrix.columns)):
-                    for j in range(i + 1, len(corr_matrix.columns)):
-                        ticker_a = corr_matrix.columns[i]
-                        ticker_b = corr_matrix.columns[j]
-                        # Always order alphabetically for consistency
-                        t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
-                        corr = corr_matrix.iloc[i, j]
-                        
-                        if not np.isnan(corr) and corr >= self.config['min_correlation']:
+                # Find pairs above correlation threshold (.values för snabb numpy-access)
+                corr_values = corr_matrix.values
+                corr_columns = corr_matrix.columns
+                min_corr = self.config['min_correlation']
+                for i in range(len(corr_columns)):
+                    for j in range(i + 1, len(corr_columns)):
+                        corr = corr_values[i, j]
+                        if not np.isnan(corr) and corr >= min_corr:
+                            ticker_a = corr_columns[i]
+                            ticker_b = corr_columns[j]
+                            # Always order alphabetically for consistency
+                            t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                             candidate_pairs.append((t1, t2, group_name, corr))
         else:
             # No correlation prefilter - generate all pairs within groups
@@ -1997,7 +2301,7 @@ class PairsTradingEngine:
             completed = 0
             with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
                 futures = {
-                    executor.submit(self._test_single_pair, pair_info, data, raw_data): pair_info 
+                    executor.submit(self._test_pair_multi_window, pair_info, data, raw_data): pair_info 
                     for pair_info in candidate_pairs
                 }
                 
@@ -2018,15 +2322,32 @@ class PairsTradingEngine:
                     progress_callback('screening', pair_idx + 1, len(candidate_pairs), 
                                     f"Testing {t1}/{t2}")
                 
-                result = self._test_single_pair(pair_info, data, raw_data)
+                result = self._test_pair_multi_window(pair_info, data, raw_data)
                 results.append(result)
-        
+
         results_df = pd.DataFrame(results)
-        
+
+        # Extract window_details into separate dict before sorting
+        self._window_details = {}
+        if len(results_df) > 0 and 'window_details' in results_df.columns:
+            for _, row in results_df.iterrows():
+                if row.get('pair') and isinstance(row.get('window_details'), list):
+                    self._window_details[row['pair']] = row['window_details']
+            results_df = results_df.drop(columns=['window_details'])
+
         if len(results_df) > 0:
-            results_df = results_df.sort_values('half_life_days')
-        
+            # Sort by robustness_score descending (most robust first)
+            if 'robustness_score' in results_df.columns:
+                results_df = results_df.sort_values('robustness_score', ascending=False)
+            else:
+                results_df = results_df.sort_values('half_life_days')
+
         self.pairs_stats = results_df
+        # O(1) lookup index: pair string → row dict
+        self._pair_index = {}
+        if len(results_df) > 0:
+            for row in results_df.itertuples():
+                self._pair_index[row.pair] = row
         self.viable_pairs = results_df[results_df['is_viable']].copy() if len(results_df) > 0 else pd.DataFrame()
         self._ou_params_cache = {}  # Invalidate OU cache on new scan
 
@@ -2081,10 +2402,12 @@ class PairsTradingEngine:
         
         if ou_model is None:
             ou_model = self.ou_models.get(pair)
-        
+
+        # Beräkna log_spread en gång och återanvänd
+        log_spread = np.log(pair_data[t1] / pair_data[t2])
+
         if ou_model is None:
             # Fit on the fly
-            log_spread = np.log(pair_data[t1] / pair_data[t2])
             ou_params = self.fit_ou_parameters(log_spread)
             if not ou_params.valid:
                 return TradeSignal(
@@ -2094,8 +2417,7 @@ class PairsTradingEngine:
                     risk_reward=0, avg_holding_days=0, confidence='LOW'
                 )
             ou_model = OUProcess(ou_params.theta, ou_params.mu, ou_params.sigma)
-        
-        log_spread = np.log(pair_data[t1] / pair_data[t2])
+
         current_spread = log_spread.iloc[-1]
         current_z = ou_model.zscore(current_spread)
         
@@ -2298,25 +2620,32 @@ class PairsTradingEngine:
     # LAYER 6: ANALYSIS & REPORTING
     # ------------------------------------------------------------------------
     
-    def get_pair_ou_params(self, pair: str, use_raw_data: bool = True, 
-                           method: str = 'kalman') -> Tuple[OUProcess, pd.Series, float]:
+    def get_window_details(self, pair: str) -> list:
+        """Return per-window test results for a pair."""
+        return self._window_details.get(pair, [])
+
+    def get_pair_ou_params(self, pair: str, use_raw_data: bool = True,
+                           method: str = 'kalman',
+                           window_size: int = None) -> Tuple[OUProcess, pd.Series, float]:
         """
         Get OU parameters for a specific pair using Engle-Granger spread.
-        
+
         Supports multiple estimation methods:
         - 'kalman': Kalman filter with adaptive Q and RTS smoother (default, most sophisticated)
         - 'adaptive_window': Two-pass half-life-based window selection
         - 'ols': Simple AR(1) OLS on full data (fastest, least adaptive)
-        
+
         IMPORTANT: This uses the EG spread (Y - β*X - α) with the hedge ratio
         from screening, NOT the simple log spread. This ensures consistency
         between scanner results and analytics display.
-        
+
         Args:
             pair: Pair string like "TICKER1/TICKER2"
             use_raw_data: If True, use raw_price_data (before global alignment)
             method: Estimation method ('kalman', 'adaptive_window', 'ols')
-        
+            window_size: If set, use exactly this many data points (overrides
+                         automatic shortest-window selection)
+
         Returns:
             Tuple of (OUProcess, eg_spread_series, current_zscore)
         """
@@ -2334,8 +2663,23 @@ class PairsTradingEngine:
         # Get pair-specific aligned data
         pair_data = data_source[[t1, t2]].dropna()
 
+        if window_size is not None:
+            # Explicit window size override
+            if len(pair_data) > window_size:
+                pair_data = pair_data.iloc[-window_size:]
+        else:
+            # Truncate to shortest passing robustness window for consistency
+            # with scanner results (scanner OU params come from shortest window)
+            pair_row = self._pair_index.get(pair)
+            if pair_row is not None:
+                pw = getattr(pair_row, 'passing_windows', None)
+                if pw and len(pw) > 0:
+                    shortest_window = min(pw)
+                    if len(pair_data) > shortest_window:
+                        pair_data = pair_data.iloc[-shortest_window:]
+
         # Check OU params cache (same data length = same result)
-        cache_key = (pair, method, use_raw_data)
+        cache_key = (pair, method, use_raw_data, window_size)
         if cache_key in self._ou_params_cache:
             cached = self._ou_params_cache[cache_key]
             if cached['data_len'] == len(pair_data):
@@ -2347,16 +2691,16 @@ class PairsTradingEngine:
         y = pair_data[t1]
         x = pair_data[t2]
         
-        # Get hedge ratio and intercept from stored screening results
+        # Get hedge ratio and intercept from stored screening results (O(1) lookup)
         hedge_ratio = 1.0
         intercept = 0.0
-        
-        if self.pairs_stats is not None and len(self.pairs_stats) > 0:
-            pair_row = self.pairs_stats[self.pairs_stats['pair'] == pair]
-            if len(pair_row) > 0:
-                hedge_ratio = float(pair_row['hedge_ratio'].iloc[0])
-                intercept = float(pair_row['intercept'].iloc[0])
-        
+
+        if pair_row is None:
+            pair_row = self._pair_index.get(pair)
+        if pair_row is not None:
+            hedge_ratio = float(pair_row.hedge_ratio)
+            intercept = float(pair_row.intercept)
+
         # If no stored hedge ratio, calculate fresh using OLS
         if hedge_ratio == 1.0 and intercept == 0.0:
             try:
@@ -2467,23 +2811,22 @@ class PairsTradingEngine:
         y = pair_data[t1]
         x = pair_data[t2]
         
-        # Get hedge ratio and intercept from stored results
+        # Get hedge ratio and intercept from stored results (O(1) lookup)
         hedge_ratio = 1.0
         intercept = 0.0
-        
-        if self.pairs_stats is not None and len(self.pairs_stats) > 0:
-            pair_row = self.pairs_stats[self.pairs_stats['pair'] == pair]
-            if len(pair_row) > 0:
-                hedge_ratio = float(pair_row['hedge_ratio'].iloc[0])
-                intercept = float(pair_row['intercept'].iloc[0])
-        
+
+        pair_row = self._pair_index.get(pair)
+        if pair_row is not None:
+            hedge_ratio = float(pair_row.hedge_ratio)
+            intercept = float(pair_row.intercept)
+
         # Calculate EG spread
         eg_spread = y - hedge_ratio * x - intercept
         
         # Get or create OU model using pair-specific data
         try:
             ou_model, _, _ = self.get_pair_ou_params(pair, use_raw_data=use_raw_data)
-        except:
+        except (ValueError, KeyError, Exception):
             ou_params = self.fit_ou_parameters(eg_spread)
             if not ou_params.valid:
                 return pd.DataFrame()

@@ -119,7 +119,7 @@ BONEX.ST;BoneSupport Holding
 BOOZT.ST;Boozt
 BRAV.ST;Bravida Holding
 BRK-B;Berkshire Hathaway B
-BTC-USD;Bitcoin Jul25
+BTC-USD;Bitcoin
 BTG;B2Gold
 BTI;British American Tobacco
 BTS-B.ST;BTS Group
@@ -592,3 +592,8 @@ ZION;Zions Bancorporation
 ZM;Zoom Communications
 ZN=F;US 10Y T-Note Sep25
 ZT=F;US 2Y T-Note Sep25
+XRP-USD;XRP
+ETH-USD;Ethereum
+USDT-USD;Tether
+BNB-USD;BND
+SOL-USD;Solana

@@ -1,43 +1,8 @@
 """
-Att göra:
-
-"""
-
-"""
-Pairs Trading Terminal - PyQt5 Version (Streamlit Layout)
-==========================================================
-
-Matches the Streamlit dashboard layout exactly.
-
-ASYNC FIX (2025-01-19):
-    Fixed GUI freeze during scheduled scans by moving blocking HTTP operations
-    to worker threads:
-    
-    1. DiscordWorker - Async Discord webhook notifications
-    2. PriceFetchWorker - Async mini futures price fetching
-    
-    Modified methods:
-    - send_discord_notification() - Now runs in background thread
-    - refresh_mf_prices() - Now runs in background thread  
-    - _take_daily_portfolio_snapshot() - No longer blocks on price fetch
-    - check_scheduled_scan() - Better async coordination
-    - send_scan_results_to_discord() - Now uses LIVE portfolio data (not stale snapshots)
-    
-    New methods:
-    - _on_mf_prices_received() - Callback for async price fetch
-    - _on_mf_prices_error() - Error handler for price fetch
-    - _run_scheduled_scan_after_prices() - Scheduled scan coordinator
-    - _calculate_live_portfolio_for_discord() - Live P&L calculation for Discord
-    
-    Bug fixes:
-    - Removed duplicate portfolio fields in Discord messages
-    - Discord now shows LIVE P&L matching dashboard (not snapshot data)
+Pairs Trading Terminal - PyQt5 Version
 
 Requirements:
     pip install pyqtgraph numpy pandas yfinance PyQtWebEngine beautifulsoup4 requests
-
-Run with:
-    python main_window.py
 """
 
 import sys
@@ -46,10 +11,14 @@ import re
 import math
 import socket
 import time
+import copy
+import logging
+import traceback
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 import json
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
@@ -233,6 +202,34 @@ def get_date_axis_item_class():
     return _DateAxisItem
 
 
+_EpochAxisItem = None
+
+def get_epoch_axis_item_class():
+    """Get EpochAxisItem class that formats epoch seconds as timestamps."""
+    global _EpochAxisItem
+    if _EpochAxisItem is not None:
+        return _EpochAxisItem
+
+    _pg = get_pyqtgraph()
+    if _pg is None:
+        return None
+
+    class EpochAxisItem(_pg.AxisItem):
+        """Axis item that converts epoch seconds to human-readable timestamps."""
+        def tickStrings(self, values, scale, spacing):
+            strings = []
+            for v in values:
+                try:
+                    dt = datetime.fromtimestamp(float(v))
+                    strings.append(dt.strftime('%m-%d %H:%M'))
+                except (ValueError, OSError):
+                    strings.append('')
+            return strings
+
+    _EpochAxisItem = EpochAxisItem
+    return _EpochAxisItem
+
+
 def get_crosshair_manager_class():
     """Get CrosshairManager class, creating it if needed (lazy load)."""
     global _CrosshairManager
@@ -315,7 +312,7 @@ def get_crosshair_manager_class():
                 try:
                     date_str = self.dates[x].strftime('%Y-%m-%d')
                     text_lines.append(date_str)
-                except:
+                except (IndexError, AttributeError, ValueError):
                     pass
         
             if self.data_series:
@@ -327,7 +324,7 @@ def get_crosshair_manager_class():
                             if not np.isnan(val):
                                 text_lines.append(f"{name}: {self.label_format.format(val)}")
                                 y_values.append(val)
-                        except:
+                        except (IndexError, ValueError, TypeError):
                             pass
                 # Use average of data values for Y position
                 if y_values:
@@ -437,7 +434,7 @@ def get_crosshair_manager_class():
                 self.plot.removeItem(self.vLine)
                 self.plot.removeItem(self.hLine)
                 self.plot.removeItem(self.label)
-            except:
+            except (RuntimeError, AttributeError):
                 pass
     
     _CrosshairManager = CrosshairManager
@@ -468,6 +465,8 @@ PORTFOLIO_FILE = Paths.portfolio_file()
 ENGINE_CACHE_FILE = Paths.engine_cache_file()
 # Portfolio history file
 PORTFOLIO_HISTORY_FILE = Paths.portfolio_history_file()
+# Volatility percentile cache (sorterade historiska serier för live-percentilberäkning)
+VOLATILITY_CACHE_FILE = Paths.volatility_cache_file()
 
 # ============================================================================
 # GOOGLE DRIVE SYNC - Override paths for multi-computer sync
@@ -478,7 +477,7 @@ _GDRIVE_TRADING_DIR = r"G:\Min enhet\Python\Aktieanalys\Python\Trading"
 if os.path.isdir(_GDRIVE_TRADING_DIR):
     _gdrive_portfolio = os.path.join(_GDRIVE_TRADING_DIR, "portfolio_positions.json")
     _gdrive_history = os.path.join(_GDRIVE_TRADING_DIR, "portfolio_history.json")
-    _gdrive_engine = os.path.join(_GDRIVE_TRADING_DIR, "pairs_engine_cache.pkl")
+    _gdrive_engine = os.path.join(_GDRIVE_TRADING_DIR, "engine_cache.pkl")
     
     if os.path.exists(_gdrive_portfolio) or not os.path.exists(PORTFOLIO_FILE):
         PORTFOLIO_FILE = _gdrive_portfolio
@@ -536,6 +535,52 @@ COLORS = {
     'border_default': '#2a2a2a',
     'border_strong': '#3a3a3a',
 }
+
+# ── Cachade QColor-objekt (undvik att skapa nya per cell-uppdatering) ──
+_QCOLOR_TEXT = QColor("#e8e8e8")
+_QCOLOR_MUTED = QColor("#666666")
+_QCOLOR_POSITIVE = QColor("#22c55e")
+_QCOLOR_NEGATIVE = QColor("#ff1744")
+_QCOLOR_AMBER = QColor("#ffaa00")
+
+# ── Cachade stylesheet-strängar för spinboxes i portfolio-tabellen ──
+_DSPINBOX_STYLESHEET = """
+    QDoubleSpinBox {
+        background: #1a1a1a;
+        color: #e8e8e8;
+        border: 1px solid #333;
+        border-radius: 3px;
+        padding: 4px 6px;
+        font-size: 13px;
+    }
+    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+        width: 18px;
+        background: #252525;
+        border: none;
+    }
+    QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+        background: #333;
+    }
+"""
+
+_SPINBOX_STYLESHEET = """
+    QSpinBox {
+        background: #1a1a1a;
+        color: #e8e8e8;
+        border: 1px solid #333;
+        border-radius: 3px;
+        padding: 4px 6px;
+        font-size: 13px;
+    }
+    QSpinBox::up-button, QSpinBox::down-button {
+        width: 18px;
+        background: #252525;
+        border: none;
+    }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+        background: #333;
+    }
+"""
 
 # ============================================================================
 # TYPOGRAPHY - Dynamically Scaled Based on Screen Size
@@ -1080,7 +1125,7 @@ def load_portfolio(filepath: str = PORTFOLIO_FILE) -> list:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return data.get("positions", [])
-        except:
+        except (json.JSONDecodeError, OSError, KeyError):
             return []
         
     except Exception as e:
@@ -1154,10 +1199,13 @@ def save_engine_cache(engine, filepath: str = ENGINE_CACHE_FILE) -> bool:
                         'half_life': getattr(row, 'half_life', 20),
                         'current_z': getattr(row, 'current_z', 0),
                     }
-                except:
+                except (AttributeError, TypeError):
                     pass
         cache_data['spread_cache'] = spread_cache
-        
+
+        # Save window_details for per-window dropdown analysis
+        cache_data['window_details'] = getattr(engine, '_window_details', {})
+
         # Ensure directory exists
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
@@ -1180,7 +1228,6 @@ def save_engine_cache(engine, filepath: str = ENGINE_CACHE_FILE) -> bool:
         
     except Exception as e:
         print(f"[Engine Cache] Error saving: {e}")
-        import traceback
         traceback.print_exc()
         return False
     finally:
@@ -1231,9 +1278,51 @@ def load_engine_cache(filepath: str = ENGINE_CACHE_FILE) -> dict:
         
     except Exception as e:
         print(f"[Engine Cache] Error loading: {e}")
-        import traceback
         traceback.print_exc()
         return None
+
+def save_volatility_cache(hist_cache: dict, median_cache: dict, mode_cache: dict,
+                          sparkline_cache: dict = None,
+                          filepath: str = VOLATILITY_CACHE_FILE) -> bool:
+    """Spara volatilitets-percentildata till disk (körs efter yf.download).
+
+    Sparar sorterade historiska serier + median/mode så att live-percentil
+    kan beräknas direkt vid uppstart utan yf.download.
+    """
+    try:
+        cache_data = {
+            'hist': {k: v.tolist() for k, v in hist_cache.items()},  # numpy → list
+            'median': median_cache,
+            'mode': mode_cache,
+            'sparkline': sparkline_cache or {},
+            'saved_at': datetime.now().isoformat(),
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[VolCache] Saved percentile cache for {list(hist_cache.keys())}")
+        return True
+    except Exception as e:
+        print(f"[VolCache] Save error: {e}")
+        return False
+
+
+def load_volatility_cache(filepath: str = VOLATILITY_CACHE_FILE) -> dict:
+    """Ladda volatilitets-percentildata från disk.
+
+    Returns dict med 'hist', 'median', 'mode', 'sparkline', 'saved_at' eller None.
+    """
+    try:
+        if not os.path.exists(filepath):
+            return None
+        with open(filepath, 'rb') as f:
+            cache_data = pickle.load(f)
+        saved = cache_data.get('saved_at', '')
+        print(f"[VolCache] Loaded percentile cache (saved: {saved})")
+        return cache_data
+    except Exception as e:
+        print(f"[VolCache] Load error: {e}")
+        return None
+
 
 # ============================================================================
 # TTL CACHE UTILITY (Fix #6 - Proper cache with TTL)
@@ -1251,7 +1340,6 @@ class TTLCache:
         """Get value if not expired, otherwise return None."""
         if key not in self._cache:
             return None
-        import time
         if time.time() - self._timestamps.get(key, 0) > self._ttl:
             del self._cache[key]
             del self._timestamps[key]
@@ -1260,7 +1348,6 @@ class TTLCache:
     
     def set(self, key: str, value):
         """Set value with current timestamp."""
-        import time
         self._cache[key] = value
         self._timestamps[key] = time.time()
     
@@ -1365,7 +1452,6 @@ def load_ticker_mapping(csv_path: str = None, force_reload: bool = False) -> tup
                 
     except Exception as e:
         print(f"Could not load ticker mapping: {e}")
-        import traceback
         traceback.print_exc()
     
     return {}, {}, {}
@@ -1412,206 +1498,176 @@ def fetch_ms_page(session, page: int) -> list:
         return []
 
 
-def fetch_minifutures_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
-    """
-    Fetch mini futures directly for a specific underlying asset using MS_Asset code.
-    
-    This is 10x faster than scraping all pages because it queries only the specific
-    underlying instead of all ~3000 products.
-    
-    Args:
-        ms_asset: MS asset code like 'ATT_SS_Equity', 'AAPL_US_Equity', etc.
-        session: Optional requests session (will create one if not provided)
-        
+def _scrape_ms_table_page(url: str, params: dict, session) -> tuple:
+    """Scrape en sida från Morgan Stanleys produkttabell.
+
     Returns:
-        DataFrame with mini futures for this specific underlying
+        (headers, rows, total_count) — headers är list[str], rows list[dict],
+        total_count totalt antal träffar (eller None om det inte går att läsa).
+    """
+    r = session.get(url, params=params, timeout=10)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        return [], [], None
+
+    trs = table.find_all("tr")
+    if len(trs) < 2:
+        return [], [], None
+
+    headers = [th.get_text(strip=True) for th in trs[0].find_all("th")]
+
+    rows = []
+    for tr in trs[1:]:
+        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(tds) == len(headers):
+            rows.append(dict(zip(headers, tds)))
+
+    # Försök läsa totalantal från paginering (t.ex. "Visar 1-100 av 237")
+    total_count = None
+    pag = soup.find(string=re.compile(r'av\s+\d+'))
+    if pag:
+        m = re.search(r'av\s+(\d+)', pag)
+        if m:
+            total_count = int(m.group(1))
+
+    return headers, rows, total_count
+
+
+def _fetch_ms_all_pages(product_type: str, ms_asset: str, session=None,
+                         page_size: int = 100) -> pd.DataFrame:
+    """Hämta ALLA sidor av en produkttyp från Morgan Stanley.
+
+    Args:
+        product_type: 'MiniFuture' eller 'ConstantLeverage'
+        ms_asset: MS asset code
+        session: requests session
+        page_size: antal per sida (max 100)
     """
     if not SCRAPING_AVAILABLE or not ms_asset:
         return pd.DataFrame()
-    
+
     if session is None:
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0"})
-    
-    BASE_URL = "https://etp.morganstanley.com/se/sv/produkter"
-    params = {
-        "f_pc": "LeverageProducts",
-        "f_pt": "MiniFuture",
-        "f_asset": ms_asset,  # Direct asset filter!
-        "p_s": 100,
-        "p_n": 1
-    }
-    
-    try:
-        r = session.get(BASE_URL, params=params, timeout=10)
-        r.raise_for_status()
-        
-        soup = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table")
-        if table is None:
-            return pd.DataFrame()
-        
-        trs = table.find_all("tr")
-        if len(trs) < 2:
-            return pd.DataFrame()
-            
-        headers = [th.get_text(strip=True) for th in trs[0].find_all("th")]
-        
-        rows = []
-        for tr in trs[1:]:
-            tds = []
-            for td in tr.find_all("td"):
-                tds.append(td.get_text(strip=True))
 
-            if len(tds) == len(headers):
-                rows.append(dict(zip(headers, tds)))
+    BASE_URL = "https://etp.morganstanley.com/se/sv/produkter"
+    all_rows = []
+    page = 1
+
+    while True:
+        params = {
+            "f_pc": "LeverageProducts",
+            "f_pt": product_type,
+            "f_asset": ms_asset,
+            "p_s": page_size,
+            "p_n": page
+        }
+        try:
+            headers, rows, total_count = _scrape_ms_table_page(BASE_URL, params, session)
+        except Exception as e:
+            print(f"Error fetching {product_type} page {page} for {ms_asset}: {e}")
+            break
 
         if not rows:
-            return pd.DataFrame()
+            break
 
-        df = pd.DataFrame(rows)
+        all_rows.extend(rows)
 
-        # Parse financing level
-        def parse_number(x):
-            if not isinstance(x, str):
-                return None
-            clean = re.sub(r"[^\d,\.]", "", x)
-            clean = clean.replace(",", ".")
-            try:
-                return float(clean)
-            except ValueError:
-                return None
+        # Kolla om det finns fler sidor
+        if total_count is not None and len(all_rows) >= total_count:
+            break
+        if len(rows) < page_size:
+            break  # Sista sidan
 
-        if 'Finansieringsnivå' in df.columns:
-            df['FinansieringsnivåNum'] = df['Finansieringsnivå'].apply(parse_number)
+        page += 1
+        if page > 10:  # Säkerhetsgräns
+            break
 
-        return df
-        
-    except Exception as e:
-        print(f"Error fetching minifutures for {ms_asset}: {e}")
+    if not all_rows:
         return pd.DataFrame()
+
+    return pd.DataFrame(all_rows)
+
+
+def fetch_minifutures_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
+    """
+    Fetch ALL mini futures for a specific underlying asset (alla sidor).
+    """
+    df = _fetch_ms_all_pages('MiniFuture', ms_asset, session)
+    if df.empty:
+        return df
+
+    def parse_number(x):
+        if not isinstance(x, str):
+            return None
+        clean = re.sub(r"[^\d,\.]", "", x)
+        clean = clean.replace(",", ".")
+        try:
+            return float(clean)
+        except ValueError:
+            return None
+
+    if 'Finansieringsnivå' in df.columns:
+        df['FinansieringsnivåNum'] = df['Finansieringsnivå'].apply(parse_number)
+
+    return df
 
 
 def fetch_certificates_for_asset(ms_asset: str, session=None) -> pd.DataFrame:
-    """
-    Fetch Bull/Bear certificates (ConstantLeverage) for a specific underlying asset.
-    
-    Similar to fetch_minifutures_for_asset but for constant leverage products.
-    URL: f_pt=ConstantLeverage instead of f_pt=MiniFuture
-    
-    Args:
-        ms_asset: MS asset code like 'ASML_US_Equity', 'ATT_SS_Equity', etc.
-        session: Optional requests session (will create one if not provided)
-        
-    Returns:
-        DataFrame with Bull/Bear certificates for this specific underlying
-    """
-    if not SCRAPING_AVAILABLE or not ms_asset:
-        return pd.DataFrame()
-    
-    if session is None:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0"})
-    
-    BASE_URL = "https://etp.morganstanley.com/se/sv/produkter"
-    params = {
-        "f_pc": "LeverageProducts",
-        "f_pt": "ConstantLeverage",  # Bull/Bear certificates!
-        "f_asset": ms_asset,
-        "p_s": 100,
-        "p_n": 1
-    }
-    
-    try:
-        r = session.get(BASE_URL, params=params, timeout=10)
-        r.raise_for_status()
-        
-        soup = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table")
-        if table is None:
-            return pd.DataFrame()
-        
-        trs = table.find_all("tr")
-        if len(trs) < 2:
-            return pd.DataFrame()
-            
-        headers = [th.get_text(strip=True) for th in trs[0].find_all("th")]
-        
-        rows = []
-        for tr in trs[1:]:
-            tds = []
-            for td in tr.find_all("td"):
-                tds.append(td.get_text(strip=True))
-
-            if len(tds) == len(headers):
-                rows.append(dict(zip(headers, tds)))
-
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-        
-        # Parse daily leverage ("Daglig hävstång")
-        def parse_leverage(x):
-            """Parse leverage like '2x', '3x', '-2x', '-3x' etc."""
-            if not isinstance(x, str):
-                return None
-            # Remove 'x' and parse
-            clean = x.replace('x', '').replace('X', '').strip()
-            try:
-                return float(clean)
-            except ValueError:
-                return None
-        
-        # Try different column names for leverage
-        leverage_cols = ['Daglig hävstång', 'Hävstång', 'Leverage']
-        for col in leverage_cols:
-            if col in df.columns:
-                df['DailyLeverage'] = df[col].apply(parse_leverage)
-                break
-        
-        # Parse financing level ("Finansieringsnivå") if present
-        def parse_number(x):
-            """Parse Swedish number format like '693,6187 SEK' or '5,688899' to float."""
-            if not isinstance(x, str):
-                return None
-            try:
-                # Remove SEK, spaces, and other non-numeric characters (except comma, dot, minus)
-                import re
-                clean = re.sub(r'[^\d,.\-]', '', x)
-                # Replace comma with dot for decimal
-                clean = clean.replace(',', '.')
-                return float(clean) if clean else None
-            except ValueError:
-                return None
-        
-        fin_cols = ['Finansieringsnivå', 'FinansieringsnivåNum', 'Financing Level']
-        for col in fin_cols:
-            if col in df.columns:
-                df['FinansieringsnivåNum'] = df[col].apply(parse_number) if col != 'FinansieringsnivåNum' else df[col]
-                break
-        
-        # Parse multiplier ("Multiplikator" or "Ratio")
-        mult_cols = ['Multiplikator', 'Multiplier']
-        for col in mult_cols:
-            if col in df.columns:
-                df['MultiplikatorNum'] = df[col].apply(parse_number)
-                break
-        
-        ratio_cols = ['Ratio', 'Kvot']
-        for col in ratio_cols:
-            if col in df.columns:
-                df['RatioNum'] = df[col].apply(parse_number)
-                # Calculate multiplier from ratio if not already set
-                if 'MultiplikatorNum' not in df.columns:
-                    df['MultiplikatorNum'] = 1.0 / df['RatioNum'].replace(0, float('nan'))
-                break
-        
+    """Fetch ALL Bull/Bear certificates for a specific underlying (alla sidor)."""
+    df = _fetch_ms_all_pages('ConstantLeverage', ms_asset, session)
+    if df.empty:
         return df
-        
-    except Exception as e:
-        print(f"Error fetching certificates for {ms_asset}: {e}")
-        return pd.DataFrame()
+
+    def parse_leverage(x):
+        if not isinstance(x, str):
+            return None
+        clean = x.replace('x', '').replace('X', '').strip()
+        try:
+            return float(clean)
+        except ValueError:
+            return None
+
+    leverage_cols = ['Daglig hävstång', 'Hävstång', 'Leverage']
+    for col in leverage_cols:
+        if col in df.columns:
+            df['DailyLeverage'] = df[col].apply(parse_leverage)
+            break
+
+    def parse_number(x):
+        if not isinstance(x, str):
+            return None
+        try:
+            clean = re.sub(r'[^\d,.\-]', '', x)
+            clean = clean.replace(',', '.')
+            return float(clean) if clean else None
+        except ValueError:
+            return None
+
+    fin_cols = ['Finansieringsnivå', 'FinansieringsnivåNum', 'Financing Level']
+    for col in fin_cols:
+        if col in df.columns:
+            df['FinansieringsnivåNum'] = df[col].apply(parse_number) if col != 'FinansieringsnivåNum' else df[col]
+            break
+
+    mult_cols = ['Multiplikator', 'Multiplier']
+    for col in mult_cols:
+        if col in df.columns:
+            df['MultiplikatorNum'] = df[col].apply(parse_number)
+            break
+
+    ratio_cols = ['Ratio', 'Kvot']
+    for col in ratio_cols:
+        if col in df.columns:
+            df['RatioNum'] = df[col].apply(parse_number)
+            if 'MultiplikatorNum' not in df.columns:
+                df['MultiplikatorNum'] = 1.0 / df['RatioNum'].replace(0, float('nan'))
+            break
+
+    return df
 
 
 def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
@@ -1748,6 +1804,190 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     }
 
 
+def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: dict,
+                                      ticker_to_ms_asset: dict = None) -> list:
+    """
+    Hämta ALLA tillgängliga instrument (mini futures + certifikat) för en ticker och riktning.
+
+    Returnerar en lista av dicts sorterade efter hävstång (lägst först).
+    Varje dict har samma format som find_best_minifuture() returnerar.
+    """
+    instruments = []
+
+    # Slå upp MS-namn och asset-kod
+    ms_name = ticker_to_ms.get(ticker)
+    if not ms_name:
+        base_ticker = ticker.split('.')[0]
+        ms_name = ticker_to_ms.get(base_ticker)
+
+    ms_asset = None
+    if ticker_to_ms_asset:
+        ms_asset = ticker_to_ms_asset.get(ticker)
+        if not ms_asset:
+            base_ticker = ticker.split('.')[0]
+            ms_asset = ticker_to_ms_asset.get(base_ticker)
+
+    if not ms_asset:
+        return instruments
+
+    spot_price = get_spot_price(ticker)
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    # ── Mini Futures ──
+    df_mf = fetch_minifutures_for_asset(ms_asset, session)
+    if not df_mf.empty and ms_name:
+        # Verifiera underliggande
+        underlying_col = None
+        for col in df_mf.columns:
+            if 'underliggande' in col.lower():
+                underlying_col = col
+                break
+        if underlying_col:
+            mask = df_mf[underlying_col].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
+            df_mf = df_mf[mask]
+
+        # Filtrera riktning
+        riktning_col = None
+        for col in df_mf.columns:
+            if 'riktning' in col.lower():
+                riktning_col = col
+                break
+        if riktning_col and not df_mf.empty:
+            df_mf = df_mf[df_mf[riktning_col].str.contains(direction, case=False, na=False)]
+
+        # Beräkna hävstång för varje mini future
+        if not df_mf.empty and spot_price is not None:
+            fin_col = None
+            for col in df_mf.columns:
+                if 'finansieringsnivånum' in col.lower() or col == 'FinansieringsnivåNum':
+                    fin_col = col
+                    break
+
+            if fin_col:
+                for _, row in df_mf.iterrows():
+                    fin_level = row.get(fin_col)
+                    if fin_level is None or pd.isna(fin_level):
+                        continue
+
+                    # Filtrera ogiltiga finansieringsnivåer
+                    if direction.lower() == 'long' and fin_level >= spot_price:
+                        continue
+                    if direction.lower() == 'short' and fin_level <= spot_price:
+                        continue
+
+                    # Beräkna teoretisk hävstång
+                    if direction.lower() == 'long':
+                        leverage = spot_price / (spot_price - fin_level)
+                    else:
+                        leverage = spot_price / (fin_level - spot_price)
+
+                    if leverage <= 1:
+                        continue
+
+                    # Hitta ISIN
+                    isin_col = None
+                    for col in df_mf.columns:
+                        if 'isin' in col.lower():
+                            isin_col = col
+                            break
+                    name_col = None
+                    for col in df_mf.columns:
+                        if col.lower() == 'namn' or 'name' in col.lower():
+                            name_col = col
+                            break
+                    ul_col = underlying_col
+
+                    isin_url = row.get(isin_col, '') if isin_col else ''
+                    isin = extract_isin_from_url(isin_url)
+                    avanza_link = create_avanza_link(isin)
+
+                    instruments.append({
+                        'name': row.get(name_col, 'N/A') if name_col else 'N/A',
+                        'underlying': row.get(ul_col, ms_name) if ul_col else ms_name,
+                        'direction': direction,
+                        'financing_level': fin_level,
+                        'leverage': leverage,
+                        'spot_price': spot_price,
+                        'isin': isin or 'N/A',
+                        'avanza_link': avanza_link,
+                        'ticker': ticker,
+                        'product_type': 'Mini Future'
+                    })
+
+    # ── Certifikat ──
+    df_cert = fetch_certificates_for_asset(ms_asset, session)
+    if not df_cert.empty and ms_name:
+        # Verifiera underliggande
+        if 'Underliggande tillgång' in df_cert.columns:
+            mask = df_cert['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
+            df_cert = df_cert[mask]
+
+        # Filtrera riktning
+        if not df_cert.empty:
+            if 'Riktning' in df_cert.columns:
+                df_cert = df_cert[df_cert['Riktning'].str.contains(direction, case=False, na=False)]
+            elif 'DailyLeverage' in df_cert.columns:
+                if direction.lower() == 'long':
+                    df_cert = df_cert[df_cert['DailyLeverage'] > 0]
+                else:
+                    df_cert = df_cert[df_cert['DailyLeverage'] < 0]
+
+        if not df_cert.empty and 'DailyLeverage' in df_cert.columns:
+            df_cert = df_cert[df_cert['DailyLeverage'].notna()]
+
+            for _, row in df_cert.iterrows():
+                leverage_abs = abs(row['DailyLeverage'])
+
+                # Beräkna instrumentpris om möjligt
+                instrument_price = None
+                financing_level = row.get('FinansieringsnivåNum', None)
+                multiplier = row.get('MultiplikatorNum', None)
+                ratio = row.get('RatioNum', None)
+                if multiplier is None and ratio is not None and ratio > 0:
+                    multiplier = 1.0 / ratio
+
+                if financing_level is not None and spot_price is not None and multiplier is not None:
+                    if direction.lower() == 'long':
+                        instrument_price = multiplier * (spot_price - financing_level)
+                    else:
+                        instrument_price = multiplier * (financing_level - spot_price)
+                    instrument_price = max(0.01, abs(instrument_price))
+
+                isin_url = row.get('ISIN', '')
+                isin = extract_isin_from_url(isin_url)
+                avanza_link = create_avanza_link(isin)
+
+                name_col = None
+                for col in df_cert.columns:
+                    if col.lower() == 'namn' or 'name' in col.lower():
+                        name_col = col
+                        break
+
+                instruments.append({
+                    'name': row.get(name_col, 'N/A') if name_col else row.get('Namn', 'N/A'),
+                    'underlying': row.get('Underliggande tillgång', ms_name),
+                    'direction': direction,
+                    'financing_level': financing_level,
+                    'leverage': leverage_abs,
+                    'daily_leverage': row['DailyLeverage'],
+                    'spot_price': spot_price,
+                    'multiplier': multiplier,
+                    'ratio': ratio,
+                    'instrument_price': instrument_price,
+                    'isin': isin or 'N/A',
+                    'avanza_link': avanza_link,
+                    'ticker': ticker,
+                    'product_type': 'Certificate'
+                })
+
+    # Sortera efter hävstång (lägst först)
+    instruments.sort(key=lambda x: x['leverage'])
+
+    return instruments
+
+
 def scrape_ms_minifutures() -> pd.DataFrame:
     """Scrape all Morgan Stanley mini futures with parallel requests."""
     global _minifutures_cache
@@ -1816,6 +2056,11 @@ def create_avanza_link(isin: str) -> str:
     return f"https://www.avanza.se/sok.html?query=&q={isin}&p=0"
 
 
+def display_ticker(ticker: str) -> str:
+    """Strip ^, =X, =F from ticker for display (e.g. '^OMX' → 'OMX')."""
+    return ticker.lstrip('^').replace('=X', '').replace('=F', '')
+
+
 def get_spot_price(ticker: str) -> float:
     """Get current spot price for a ticker."""
     try:
@@ -1824,7 +2069,7 @@ def get_spot_price(ticker: str) -> float:
         hist = t.history(period="2d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
-    except:
+    except Exception:
         pass
     return None
 
@@ -2149,11 +2394,16 @@ def calculate_minifuture_position(notional: float, hedge_ratio: float, mf_y: dic
 def calculate_minifuture_minimum_units(hedge_ratio: float, mf_y: dict, mf_x: dict,
                                        dir_y: str, dir_x: str) -> Optional[dict]:
     """
-    Calculate the minimum number of instrument units per leg so that each leg
-    has at least 1000 SEK capital invested, while respecting the hedge ratio.
+    Beräkna antal instrumentenheter per ben med korrekt EXPONERING baserat på
+    hedge ratio, hävstång och instrumentpris.
 
-    Returns dict with units_y, units_x, instrument prices, capital per leg,
-    and the total minimum capital required.  Returns None if data is missing.
+    Hedge ratio β gäller underliggande aktier: shares_x = β × shares_y.
+    Eftersom varje instrumentenhet ger exponering = pris × hävstång,
+    måste vi matcha exponeringar, inte enhetsantal direkt:
+
+        units_x × price_x × lev_x = β × units_y × price_y × lev_y
+
+    Returns dict med units, priser, kapital, exponering per ben, eller None.
     """
     MIN_CAPITAL_PER_LEG = 1000  # SEK
 
@@ -2190,38 +2440,61 @@ def calculate_minifuture_minimum_units(hedge_ratio: float, mf_y: dict, mf_x: dic
 
     price_y = _instrument_price(mf_y, dir_y)
     price_x = _instrument_price(mf_x, dir_x)
+    leverage_y = mf_y.get('leverage', 1)
+    leverage_x = mf_x.get('leverage', 1)
     beta = abs(hedge_ratio)
 
-    # Step 1: minimum units for Y leg (at least 1000 SEK)
-    units_y = math.ceil(MIN_CAPITAL_PER_LEG / price_y)
+    # Exponering per instrumentenhet
+    exp_per_unit_y = price_y * leverage_y
+    exp_per_unit_x = price_x * leverage_x
 
-    # Step 2: derive X units from hedge ratio
-    units_x = math.ceil(units_y * beta)
+    # Minimum enheter per ben från kapitalvillkor (1000 SEK)
+    min_units_y = max(1, math.ceil(MIN_CAPITAL_PER_LEG / price_y))
+    min_units_x = max(1, math.ceil(MIN_CAPITAL_PER_LEG / price_x))
 
-    # Step 3: check X leg meets minimum
-    if units_x * price_x < MIN_CAPITAL_PER_LEG:
-        units_x = math.ceil(MIN_CAPITAL_PER_LEG / price_x)
-        # Recalculate Y from X to maintain ratio
-        if beta > 0:
-            units_y = math.ceil(units_x / beta)
+    # Alternativ A: Utgå från min X-enheter, beräkna Y från hedge ratio
+    units_x_a = min_units_x
+    # units_x * exp_x = β * units_y * exp_y  →  units_y = units_x * exp_x / (β * exp_y)
+    units_y_a = max(min_units_y, math.ceil(
+        units_x_a * exp_per_unit_x / (beta * exp_per_unit_y)
+    )) if beta > 0 else min_units_y
+    total_a = units_y_a * price_y + units_x_a * price_x
 
-    # Step 4: verify Y still meets minimum after possible recalc
-    if units_y * price_y < MIN_CAPITAL_PER_LEG:
-        units_y = math.ceil(MIN_CAPITAL_PER_LEG / price_y)
-        units_x = math.ceil(units_y * beta)
+    # Alternativ B: Utgå från min Y-enheter, beräkna X, sedan justera Y tillbaka
+    units_y_b = min_units_y
+    units_x_b = max(min_units_x, math.ceil(
+        beta * units_y_b * exp_per_unit_y / exp_per_unit_x
+    ))
+    # Efter avrundning av X uppåt — beräkna om Y för att bibehålla hedge ratio
+    units_y_b = max(min_units_y, math.ceil(
+        units_x_b * exp_per_unit_x / (beta * exp_per_unit_y)
+    )) if beta > 0 else units_y_b
+    total_b = units_y_b * price_y + units_x_b * price_x
+
+    # Välj kombinationen med lägst totalt kapital
+    if total_a <= total_b:
+        units_y, units_x = units_y_a, units_x_a
+    else:
+        units_y, units_x = units_y_b, units_x_b
 
     capital_y = units_y * price_y
     capital_x = units_x * price_x
-    total_capital = capital_y + capital_x
+    exposure_y = units_y * exp_per_unit_y
+    exposure_x = units_x * exp_per_unit_x
 
     return {
         'units_y': units_y,
         'units_x': units_x,
         'price_y': price_y,
         'price_x': price_x,
+        'leverage_y': leverage_y,
+        'leverage_x': leverage_x,
         'capital_y': capital_y,
         'capital_x': capital_x,
-        'total_capital': total_capital,
+        'total_capital': capital_y + capital_x,
+        'exposure_y': exposure_y,
+        'exposure_x': exposure_x,
+        'total_exposure': exposure_y + exposure_x,
     }
 
 
@@ -2386,7 +2659,7 @@ class AnalysisWorker(QObject):
             engine = PairsTradingEngine(self.config)
             
             self.progress.emit(15, f"Fetching data for {len(self.tickers)} tickers...")
-            engine.fetch_data(self.tickers, self.lookback)
+            engine.fetch_data(self.tickers, 'max')
             
             if engine.price_data is None or len(engine.price_data.columns) == 0:
                 self.error.emit("No price data loaded")
@@ -2489,15 +2762,15 @@ class MarketWatchWorker(QObject):
             print(f"[MarketWatch] Starting yf.download for {len(self.tickers)} instruments...")
 
             try:
-                data = yf.download(self.tickers, period='5d', interval="15m", progress=False, threads=False, ignore_tz=True)
+                data = yf.download(self.tickers, period='5d', interval="15m", progress=False, threads=True, ignore_tz=True)
             except (TypeError, RuntimeError) as e:
                 print(f"[MarketWatch] First attempt failed ({e}), retrying in batches...")
                 all_data = []
-                batch_size = 50
+                batch_size = 100
                 for i in range(0, len(self.tickers), batch_size):
                     batch = self.tickers[i:i+batch_size]
                     try:
-                        batch_data = yf.download(batch, period='5d', interval="15m", progress=False, threads=False, ignore_tz=True)
+                        batch_data = yf.download(batch, period='5d', interval="15m", progress=False, threads=True, ignore_tz=True)
                         if not batch_data.empty:
                             all_data.append(batch_data)
                     except Exception as batch_e:
@@ -2598,7 +2871,6 @@ class MarketWatchWorker(QObject):
             self.result.emit(all_items)
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
@@ -2624,10 +2896,11 @@ class IntradayOHLCWorker(QObject):
     def run(self):
         try:
             import yfinance as yf
-            print(f"[Intraday] Fetching 1d/5m OHLC for {len(self.tickers)} tickers...")
+            print(f"[Intraday] Fetching 5d/15m OHLC for {len(self.tickers)} tickers...")
 
+            # period='5d' ger data även för stängda marknader (senaste handelsdagar)
             data = yf.download(
-                self.tickers, period='1d', interval='5m',
+                self.tickers, period='5d', interval='15m',
                 progress=False, threads=True, ignore_tz=True,
             )
             if data.empty:
@@ -2636,7 +2909,7 @@ class IntradayOHLCWorker(QObject):
 
             is_multi = isinstance(data.columns, pd.MultiIndex)
 
-            # Extract metric DataFrames (same pattern as MarketWatchWorker)
+            # Extract metric DataFrames
             if is_multi:
                 close_df = data['Close']
                 open_df = data['Open'] if 'Open' in data.columns.get_level_values(0) else None
@@ -2666,7 +2939,6 @@ class IntradayOHLCWorker(QObject):
                             odf['V'] = vol_df[ticker]
                         odf = odf.dropna(subset=['C'])
                     else:
-                        # Single ticker
                         odf = pd.DataFrame({
                             'C': data['Close'], 'O': data['Open'],
                             'H': data['High'], 'L': data['Low'],
@@ -2678,9 +2950,16 @@ class IntradayOHLCWorker(QObject):
                     if odf.empty:
                         continue
 
-                    # Build OHLC bar list (5-min candles)
+                    # Gruppera per dag för att separera senaste handelsdag vs föregående
+                    odf['_date'] = odf.index.date
+                    unique_dates = sorted(odf['_date'].unique())
+
+                    # Senaste handelsdagens bars (för candle chart)
+                    last_date = unique_dates[-1]
+                    last_day_df = odf[odf['_date'] == last_date]
+
                     bars = []
-                    for dt_idx, row in odf.iterrows():
+                    for dt_idx, row in last_day_df.iterrows():
                         bars.append([
                             float(dt_idx.timestamp()),
                             round(float(row.get('O', row['C'])), 4),
@@ -2689,12 +2968,28 @@ class IntradayOHLCWorker(QObject):
                             round(float(row['C']), 4),
                         ])
 
-                    # Extract day-level stats
+                    # Beräkna previous_close från föregående handelsdag
+                    prev_close = 0.0
+                    if len(unique_dates) >= 2:
+                        prev_date = unique_dates[-2]
+                        prev_day_df = odf[odf['_date'] == prev_date]
+                        if not prev_day_df.empty:
+                            prev_close = float(prev_day_df['C'].iloc[-1])
+
+                    last_close = float(last_day_df['C'].iloc[-1])
+                    # Daglig change% (senaste close vs föregående close)
+                    change_pct = 0.0
+                    if prev_close > 0:
+                        change_pct = round((last_close - prev_close) / prev_close * 100, 2)
+
                     info = {
-                        'open_price': round(float(odf['O'].iloc[0]), 4) if 'O' in odf.columns else 0,
-                        'day_high': round(float(odf['H'].max()), 4) if 'H' in odf.columns else 0,
-                        'day_low': round(float(odf['L'].min()), 4) if 'L' in odf.columns else 0,
-                        'day_volume': int(odf['V'].sum()) if 'V' in odf.columns else 0,
+                        'open_price': round(float(last_day_df['O'].iloc[0]), 4) if 'O' in last_day_df.columns else 0,
+                        'day_high': round(float(last_day_df['H'].max()), 4) if 'H' in last_day_df.columns else 0,
+                        'day_low': round(float(last_day_df['L'].min()), 4) if 'L' in last_day_df.columns else 0,
+                        'day_volume': int(last_day_df['V'].sum()) if 'V' in last_day_df.columns else 0,
+                        'close_price': last_close,
+                        'previous_close': prev_close,
+                        'change_pct': change_pct,
                     }
                     out[ticker] = {'ohlc': bars, 'info': info}
 
@@ -2705,7 +3000,6 @@ class IntradayOHLCWorker(QObject):
             self.result.emit(out)
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
@@ -2713,9 +3007,10 @@ class IntradayOHLCWorker(QObject):
 
 
 class MarketWatchWebSocket(QObject):
-    """Persistent WebSocket thread for live market price updates via yfinance.
+    """Persistent AsyncWebSocket thread for live market price updates via yfinance.
 
-    Auto-reconnects when Yahoo closes the connection (typically every ~60s).
+    Använder yfinance AsyncWebSocket med inbyggd auto-reconnect (3s backoff)
+    och heartbeat (re-subscribe var 15:e sekund).
     """
     price_update = Signal(dict)  # {symbol, price, change, change_pct}
     status_message = Signal(str)
@@ -2725,75 +3020,122 @@ class MarketWatchWebSocket(QObject):
     def __init__(self, tickers: list):
         super().__init__()
         self.tickers = tickers
-        self._ws = None  # WebSocket instance ref for stop()
+        self._ws = None
         self._stopped = False
+        self._loop = None
 
     @Slot()
     def run(self):
         try:
-            from yfinance import WebSocket
+            from yfinance import AsyncWebSocket
         except ImportError:
-            self.error.emit("yfinance WebSocket not available (upgrade yfinance)")
+            self.error.emit("yfinance AsyncWebSocket not available (upgrade yfinance)")
             return
 
-        def on_message(msg):
+        # Tysta yfinance/websockets loggers — reconnect-tracebacks är brus, inte fel
+        for logger_name in ('yfinance', 'websockets'):
+            logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+
+        async def on_message(msg):
             symbol = msg.get('id', '')
-            price = msg.get('price', 0)
-            change = msg.get('change', 0)
-            change_pct = msg.get('change_percent', 0)
-            if symbol and price:
+            price = float(msg.get('price', 0))
+            prev_close = float(msg.get('previous_close', 0))
+            # Använd previous_close som fallback när price=0 (stängda marknader)
+            display_price = price if price else prev_close
+            if symbol and (price or prev_close):
                 self.price_update.emit({
                     'symbol': symbol,
-                    'price': float(price),
-                    'change': float(change),
-                    'change_pct': round(float(change_pct), 2),
+                    'price': display_price,
+                    'change': float(msg.get('change', 0)),
+                    'change_pct': round(float(msg.get('change_percent', 0)), 2),
                     'day_high': float(msg.get('day_high', 0)),
                     'day_low': float(msg.get('day_low', 0)),
                     'day_volume': int(msg.get('day_volume', 0)),
-                    'previous_close': float(msg.get('previous_close', 0)),
+                    'previous_close': prev_close,
                     'open_price': float(msg.get('open_price', 0)),
                     'short_name': msg.get('short_name', ''),
                     'market_hours': msg.get('market_hours', 0),
                     'timestamp': time.time(),
                 })
 
-        # Auto-reconnect loop — Yahoo stänger WS efter ~60s
-        while not self._stopped:
-            try:
-                self._ws = WebSocket()
-                self._ws.subscribe(self.tickers)
-                self.connected.emit()
-                self.status_message.emit(f"WebSocket connected: {len(self.tickers)} tickers")
-                print(f"[WS] Connected, subscribed to {len(self.tickers)} tickers")
-                self._ws.listen(on_message)  # Blocks until closed
-            except Exception as e:
+        async def _run_ws():
+            # Egen reconnect-loop för att hantera anslutningsfel (t.ex. "Too many open files")
+            # AsyncWebSocket har inbyggd reconnect när den väl är ansluten,
+            # men om initial connect misslyckas behöver vi retry.
+            while not self._stopped:
+                try:
+                    async with AsyncWebSocket(verbose=False) as ws:
+                        self._ws = ws
+                        await ws.subscribe(self.tickers)
+                        self.connected.emit()
+                        self.status_message.emit(f"AsyncWebSocket connected: {len(self.tickers)} tickers")
+                        print(f"[WS] AsyncWebSocket connected, subscribed to {len(self.tickers)} tickers")
+                        await ws.listen(on_message)
+                except Exception as e:
+                    if self._stopped:
+                        break
+                    print(f"[WS] Connection error: {e}, reconnecting in 5s...")
+                finally:
+                    self._ws = None
                 if self._stopped:
                     break
-                print(f"[WS] Disconnected: {e}")
+                await asyncio.sleep(5)
 
-            if self._stopped:
-                break
-            # Vänta kort innan reconnect
-            print("[WS] Reconnecting in 2s...")
-            time.sleep(2)
-
-        print("[WS] Stopped")
-
-    def stop(self):
-        """Close the WebSocket connection and exit reconnect loop."""
-        self._stopped = True
-        if self._ws is not None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(_run_ws())
+        except Exception as e:
+            if not self._stopped:
+                print(f"[WS] AsyncWebSocket error: {e}")
+                self.error.emit(str(e))
+        finally:
+            # Rensa pågående asyncio tasks (t.ex. websockets keepalive) före stängning
             try:
-                self._ws.close()
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
             except Exception:
                 pass
+            self._loop.close()
+            self._loop = None
+            print("[WS] Stopped")
+
+    def stop(self):
+        """Stäng AsyncWebSocket-anslutningen."""
+        self._stopped = True
+        if self._ws is not None and self._loop is not None and self._loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+            except Exception:
+                pass
+
+    def add_tickers(self, new_tickers: list):
+        """Dynamically subscribe additional tickers to the active WebSocket."""
+        added = [t for t in new_tickers if t not in self.tickers]
+        if not added:
+            return
+        self.tickers.extend(added)
+        if self._ws is not None and self._loop is not None and self._loop.is_running():
+            async def _subscribe():
+                try:
+                    if self._ws is not None:
+                        await self._ws.subscribe(added)
+                        print(f"[WS] Subscribed {len(added)} portfolio tickers: {added}")
+                except Exception as e:
+                    print(f"[WS] add_tickers error: {e}")
+            asyncio.run_coroutine_threadsafe(_subscribe(), self._loop)
+        else:
+            print(f"[WS] add_tickers: not connected, {len(added)} tickers queued for next connect")
 
 
 class VolatilityDataWorker(QObject):
     """Worker thread for fetching volatility/market data (async yfinance to prevent GUI freeze).
 
     OPTIMERING: Flyttar tung yfinance.download från main thread till bakgrund.
-    First load uses period='max'; subsequent refreshes use period='1y'.
     """
     finished = Signal()
     result = Signal(object)  # DataFrame with close prices
@@ -2811,24 +3153,54 @@ class VolatilityDataWorker(QObject):
             import yfinance as yf
             self.status_message.emit(f"Fetching volatility data for {len(self.tickers)} tickers (period={self.period})...")
 
-            data = yf.download(self.tickers, period=self.period, interval="1d", progress=False, threads=False, ignore_tz=True)['Close']
-            
+            # Ladda ner alla tickers i ett anrop
+            data = yf.download(self.tickers, period=self.period, interval="1d",
+                               progress=False, threads=False, ignore_tz=True)
+
             if data.empty:
                 self.error.emit("No volatility data returned")
                 return
-            
-            # Handle both single and multi-column results
-            if 'Close' in data.columns:
-                close = data['Close']
-            elif isinstance(data.columns, pd.MultiIndex):
-                close = data['Close']
+
+            # Extrahera Close-priser (hanterar olika yfinance-versioner)
+            if isinstance(data.columns, pd.MultiIndex):
+                # Multi-ticker: kolumner = ('Close', ticker) eller ('Price', ticker)
+                top_levels = data.columns.get_level_values(0).unique()
+                if 'Close' in top_levels:
+                    close = data['Close']
+                elif 'Price' in top_levels:
+                    close = data['Price']
+                else:
+                    close = data[top_levels[0]]
             else:
-                close = data
-            
+                close = data if 'Close' not in data.columns else data[['Close']].rename(columns={'Close': self.tickers[0]})
+
+            # Gör till DataFrame om det är en Series
+            if isinstance(close, pd.Series):
+                close = close.to_frame(name=self.tickers[0])
+
+            print(f"[Volatility] Combined download returned columns: {list(close.columns)}")
+
+            # Fallback: ladda ner saknade tickers individuellt
+            missing = [t for t in self.tickers if t not in close.columns]
+            if missing:
+                print(f"[Volatility] Missing from combined download: {missing}, trying individually...")
+                for ticker in missing:
+                    try:
+                        self.status_message.emit(f"Fetching {ticker} individually...")
+                        t = yf.Ticker(ticker)
+                        hist = t.history(period=self.period, interval="1d")
+                        if hist is not None and not hist.empty and 'Close' in hist.columns:
+                            close[ticker] = hist['Close']
+                            print(f"[Volatility] {ticker}: got {len(hist)} rows via individual download")
+                        else:
+                            print(f"[Volatility] {ticker}: no data from individual download")
+                    except Exception as e:
+                        print(f"[Volatility] {ticker}: individual download failed: {e}")
+
+            print(f"[Volatility] Final columns: {list(close.columns)}")
             self.result.emit(close)
-            
+
         except Exception as e:
-            import traceback
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
@@ -2853,7 +3225,6 @@ class MarkovChainWorker(QObject):
             res = analyzer.analyze(self.ticker, progress_callback=self.progress.emit)
             self.result.emit(res)
         except Exception as e:
-            import traceback
             traceback.print_exc()
             self.error.emit(str(e))
         finally:
@@ -2873,7 +3244,6 @@ class PortfolioRefreshWorker(QObject):
     def __init__(self, portfolio: list, engine, mf_scraping_available: bool):
         super().__init__()
         # Deep copy portfolio to avoid threading issues
-        import copy
         self.portfolio = copy.deepcopy(portfolio)
         self.engine = engine
         self.mf_scraping_available = mf_scraping_available
@@ -3453,6 +3823,71 @@ class MetricCard(QFrame):
         self.label_widget.setText(title)
 
 
+class WindowResultRow(QFrame):
+    """Compact per-window result row for OU analytics panel."""
+
+    def __init__(self, window_data: dict, parent=None):
+        super().__init__(parent)
+        self.setMaximumHeight(48)
+        passed = window_data.get('passed', False)
+        border_color = COLORS['positive'] if passed else COLORS['negative']
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_card']};
+                border-left: 3px solid {border_color};
+                border-radius: 3px;
+                margin: 1px 0;
+            }}
+        """)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(10)
+
+        ws = str(window_data.get('window_size', '?'))
+        ws_label = QLabel(ws)
+        ws_label.setFixedWidth(42)
+        ws_label.setStyleSheet(
+            f"color: {COLORS['text_primary']}; font-weight: 700; font-size: 12px; "
+            f"background: transparent; border: none;")
+        layout.addWidget(ws_label)
+
+        status_text = "PASS" if passed else "FAIL"
+        status_color = COLORS['positive'] if passed else COLORS['negative']
+        status_label = QLabel(status_text)
+        status_label.setFixedWidth(36)
+        status_label.setStyleSheet(
+            f"color: {status_color}; font-weight: 600; font-size: 11px; "
+            f"background: transparent; border: none;")
+        layout.addWidget(status_label)
+
+        # Compact metrics
+        parts = []
+        hl = window_data.get('half_life_days')
+        if hl is not None:
+            parts.append(f"HL:{hl:.0f}d")
+        eg = window_data.get('eg_pvalue')
+        if eg is not None:
+            parts.append(f"EG:{eg:.3f}")
+        h = window_data.get('hurst_exponent')
+        if h is not None:
+            parts.append(f"H:{h:.2f}")
+        metrics_text = "  ".join(parts) if parts else "-"
+        metrics_label = QLabel(metrics_text)
+        metrics_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 11px; "
+            f"font-family: 'JetBrains Mono', 'Consolas', monospace; "
+            f"background: transparent; border: none;")
+        layout.addWidget(metrics_label, 1)
+
+        failed_at = window_data.get('failed_at', '')
+        if failed_at:
+            fa_label = QLabel(f"[{failed_at}]")
+            fa_label.setStyleSheet(
+                f"color: {COLORS['warning']}; font-size: 10px; "
+                f"background: transparent; border: none;")
+            layout.addWidget(fa_label)
+
+
 class CompactMetricCard(QFrame):
     """Compact metric display card for dense layouts."""
     
@@ -4022,7 +4457,6 @@ def load_news_cache() -> list:
                 cached = json.load(f)
             
             # Filter to last 24 hours
-            from datetime import datetime, timedelta
             cutoff = datetime.now() - timedelta(hours=24)
             cutoff_ts = cutoff.timestamp()
             
@@ -4037,7 +4471,6 @@ def save_news_cache(news_items: list):
     """Save news items to cache file."""
     try:
         # Filter to last 24 hours before saving
-        from datetime import datetime, timedelta
         cutoff = datetime.now() - timedelta(hours=24)
         cutoff_ts = cutoff.timestamp()
         
@@ -4068,8 +4501,7 @@ class NewsFeedWorker(QObject):
     def _fetch_ticker_news(self, ticker_symbol: str, cutoff_ts: float) -> list:
         """Fetch news for a single ticker. Returns list of news items."""
         import yfinance as yf
-        from datetime import datetime
-        
+
         news_items = []
         try:
             ticker = yf.Ticker(ticker_symbol)
@@ -4101,7 +4533,7 @@ class NewsFeedWorker(QObject):
                         try:
                             dt = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00'))
                             timestamp = dt.timestamp()
-                        except:
+                        except (ValueError, OSError):
                             timestamp = 0
                     else:
                         timestamp = 0
@@ -4149,9 +4581,6 @@ class NewsFeedWorker(QObject):
     def run(self):
         """Fetch news for all tickers from CSV file using parallel execution."""
         try:
-            from datetime import datetime, timedelta
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            
             # Load existing cache
             cached_news = load_news_cache()
             cached_ids = {n.get('id') for n in cached_news if n.get('id')}
@@ -4222,7 +4651,6 @@ class NewsFeedWorker(QObject):
             self.result.emit(all_news)
             
         except Exception as e:
-            import traceback
             print(f"[NewsFeed] ERROR: {e}")
             traceback.print_exc()
             self.error.emit(str(e))
@@ -4438,7 +4866,7 @@ class NewsFeedWidget(QWidget):
 class PairsTradingTerminal(QMainWindow):
     """Main application window matching Streamlit layout."""
 
-    # All 72 market instruments for treemap (used by WS startup + treemap rendering)
+    # All market instruments for treemap (used by WS startup + treemap rendering)
     MARKET_INSTRUMENTS = {
         # America
         '^GSPC': ('S&P 500', 'AMERICA'),
@@ -4446,78 +4874,50 @@ class PairsTradingTerminal(QMainWindow):
         '^DJI': ('Dow Jones', 'AMERICA'),
         '^RUT': ('Russell 2000', 'AMERICA'),
         '^GSPTSE': ('Toronto', 'AMERICA'),
-        '^MXX': ('Mexico City', 'AMERICA'),
         '^BVSP': ('São Paulo', 'AMERICA'),
-        '^MERV': ('Buenos Aires', 'AMERICA'),
-        '^IPSA': ('Santiago', 'AMERICA'),
-        '^COLO-IV': ('Bogotá', 'AMERICA'),
         # Europe
         '^FTSE': ('London', 'EUROPE'),
         '^FCHI': ('Paris', 'EUROPE'),
-        '^STOXX': ('Europe 600', 'EUROPE'),
-        '^AEX': ('Amsterdam', 'EUROPE'),
+        '^STOXX50E': ('Europe 50', 'EUROPE'),
+        '^N100': ('Euronext 100', 'EUROPE'),
         '^GDAXI': ('Frankfurt', 'EUROPE'),
-        '^SSMI': ('Zürich', 'EUROPE'),
-        '^ATX': ('Vienna', 'EUROPE'),
-        '^IBEX': ('Madrid', 'EUROPE'),
-        'FTSEMIB.MI': ('Milano', 'EUROPE'),
-        'PSI20.LS': ('Lisbon', 'EUROPE'),
-        '^BFX': ('Brussels', 'EUROPE'),
-        '^ISEQ': ('Dublin', 'EUROPE'),
-        'XU100.IS': ('Istanbul', 'EUROPE'),
         '^OMX': ('Stockholm', 'EUROPE'),
         'OBX.OL': ('Oslo', 'EUROPE'),
         '^OMXC25': ('Copenhagen', 'EUROPE'),
         '^OMXH25': ('Helsinki', 'EUROPE'),
-        'WIG20.WA': ('Warsaw', 'EUROPE'),
-        # Middle East
-        '^TA125.TA': ('Tel Aviv', 'MIDDLE EAST'),
-        '^TASI.SR': ('Riyadh', 'MIDDLE EAST'),
-        'DFMGI.AE': ('Dubai', 'MIDDLE EAST'),
-        'FADGI.FGI': ('Abu Dhabi', 'MIDDLE EAST'),
-        '^GNRI.QA': ('Qatar', 'MIDDLE EAST'),
-        # Africa
-        '^JN0U.JO': ('Johannesburg', 'AFRICA'),
-        '^CASE30': ('Cairo', 'AFRICA'),
         # Asia
         '^N225': ('Tokyo', 'ASIA'),
         '^HSI': ('Hong Kong', 'ASIA'),
         '000001.SS': ('Shanghai', 'ASIA'),
         '^KS11': ('Seoul', 'ASIA'),
         '^TWII': ('Taipei', 'ASIA'),
-        '^NSEI': ('Nifty 50', 'ASIA'),
-        '^BSESN': ('Mumbai', 'ASIA'),
-        '^STI': ('Singapore', 'ASIA'),
-        '^JKSE': ('Jakarta', 'ASIA'),
-        '^KLSE': ('Kuala Lumpur', 'ASIA'),
-        '^SET50.BK': ('Bangkok', 'ASIA'),
-        '^VNINDEX.VN': ('Ho Chi Minh City', 'ASIA'),
-        'PSEI.PS': ('Manila', 'ASIA'),
-        '000300.SS': ('Shanghai', 'ASIA'),
         '399106.SZ': ('Shenzen', 'ASIA'),
+        '^BSESN': ('India', 'ASIA'),
         # Oceania
         '^AXJO': ('Sydney', 'OCEANIA'),
-        '^NZ50': ('Wellington', 'OCEANIA'),
         # Currencies
         'EURUSD=X': ('EUR/USD', 'CURRENCIES'),
         'EURSEK=X': ('EUR/SEK', 'CURRENCIES'),
         'GBPUSD=X': ('GBP/USD', 'CURRENCIES'),
         'USDJPY=X': ('USD/JPY', 'CURRENCIES'),
-        'USDCHF=X': ('USD/CHF', 'CURRENCIES'),
-        'AUDUSD=X': ('AUD/USD', 'CURRENCIES'),
-        'USDCAD=X': ('USD/CAD', 'CURRENCIES'),
         'USDSEK=X': ('USD/SEK', 'CURRENCIES'),
         # Commodities
         'GC=F': ('Gold', 'COMMODITIES'),
         'SI=F': ('Silver', 'COMMODITIES'),
         'CL=F': ('Crude Oil', 'COMMODITIES'),
+        'BZ=F': ('Brent Crude Oil', 'COMMODITIES'),
         'NG=F': ('Natural Gas', 'COMMODITIES'),
         'HG=F': ('Copper', 'COMMODITIES'),
         # Yields
         '^TNX': ('10Y Yield', 'YIELDS'),
+        '^IRX': ('13W T-bill', 'YIELDS'),
         '^FVX': ('5Y Yield', 'YIELDS'),
         '^TYX': ('30Y Yield', 'YIELDS'),
-        '^IRX': ('3M Yield', 'YIELDS'),
+        # Cryptocurrencies
+        'BTC-USD': ('Bitcoin', 'CRYPTO'),
+        'SOL-USD': ('Solana', 'CRYPTO'),
+        'XRP-USD': ('XRP', 'CRYPTO'),
+        'ETH-USD': ('Ethereum', 'CRYPTO'),
     }
 
     def __init__(self):
@@ -4579,10 +4979,20 @@ class PairsTradingTerminal(QMainWindow):
         self._intraday_ohlc_seed = {}       # symbol → [[ts, O, H, L, C], ...] from yf.download
         self._intraday_worker = None
         self._intraday_thread = None
+        self._intraday_retry_count = 0     # Retry-räknare för ofullständig OHLC-data
+        self._intraday_max_retries = 3     # Max antal retries
+
+        # Per-pair z-score chart widgets in positions table (uses historical data)
+        self._lm_pairs: Dict[str, dict] = {}   # pair -> {plot_widget, z_curve, entry_line}
 
         self._volatility_worker: Optional[VolatilityDataWorker] = None
         self._volatility_thread: Optional[QThread] = None
         self._volatility_running = False  # Säker flagga
+        # Cachade historiska serier för live-percentilberäkning (sparas vid yf.download)
+        self._vol_hist_cache: Dict[str, np.ndarray] = {}  # ticker → sorterad numpy-array
+        self._vol_median_cache: Dict[str, float] = {}     # ticker → median
+        self._vol_mode_cache: Dict[str, float] = {}       # ticker → mode
+        self._vol_sparkline_cache: Dict[str, list] = {}   # ticker → sparkline-värden
         self._portfolio_refresh_worker: Optional[PortfolioRefreshWorker] = None
         self._portfolio_refresh_thread: Optional[QThread] = None
         self._portfolio_refresh_running = False  # Säker flagga
@@ -4617,10 +5027,10 @@ class PairsTradingTerminal(QMainWindow):
         # Watchdog: force-resets stuck thread flags, 30s check interval
         # =====================================================================
 
-        # Portfolio refresh: every 60 minutes (treemap handled by WS)
+        # Portfolio refresh: every 5 minutes (z-scores + MF prices)
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_data)
-        self.auto_refresh_timer.start(3600000)  # 60 minutes
+        self.auto_refresh_timer.start(300000)  # 5 minutes
         
         # Portfolio & engine cache sync timer (90 seconds) - for Google Drive sync
         self.sync_timer = QTimer(self)
@@ -4871,7 +5281,6 @@ class PairsTradingTerminal(QMainWindow):
                 
         except Exception as e:
             print(f"[Layout] Error applying dynamic layout: {e}")
-            import traceback
             traceback.print_exc()
     
     def _apply_table_scaling(self, table: QTableWidget, params: dict):
@@ -5274,17 +5683,19 @@ class PairsTradingTerminal(QMainWindow):
             
             # Update the tickers input field
             self.tickers_input.setText(', '.join(tickers))
-            print(f"[SCHEDULED SCAN] Tickers set in input field, starting analysis...")
-            
+
+            # Force Extended preset for scheduled scans (max data points)
+            self.lookback_combo.setCurrentText("Extended (500-2500)")
+            print(f"[SCHEDULED SCAN] Tickers set in input field, using Extended preset, starting analysis...")
+
             # Store that this is a scheduled scan so we can send Discord after completion
             self._is_scheduled_scan = True
-            
+
             # Run analysis (will call on_analysis_complete when done)
             self.run_analysis()
             print(f"[SCHEDULED SCAN] Analysis started successfully")
             
         except Exception as e:
-            import traceback
             error_details = traceback.format_exc()
             print(f"[SCHEDULED SCAN ERROR] {error_details}")
             self.statusBar().showMessage(f"Scheduled scan error: {e}")
@@ -5416,7 +5827,6 @@ class PairsTradingTerminal(QMainWindow):
             
         except Exception as e:
             print(f"Error sending scan results to Discord: {e}")
-            import traceback
             traceback.print_exc()
     
     def _calculate_live_portfolio_for_discord(self) -> list:
@@ -6052,14 +6462,14 @@ class PairsTradingTerminal(QMainWindow):
         ticker_group.addWidget(self.tickers_input)
         config_layout.addLayout(ticker_group)
         
-        # Lookback
+        # Windows preset
         lookback_group = QVBoxLayout()
-        lookback_label = QLabel("LOOKBACK:")
+        lookback_label = QLabel("WINDOWS:")
         lookback_label.setStyleSheet("color: #d4a574; font-size: 11px; font-weight: 600; letter-spacing: 1px; padding: 6px; border: none;")
         lookback_group.addWidget(lookback_label)
         self.lookback_combo = QComboBox()
-        self.lookback_combo.addItems(["1y", "2y", "5y"])
-        self.lookback_combo.setCurrentText("2y")
+        self.lookback_combo.addItems(["Standard (500-2000)", "Quick (750-1500)", "Extended (500-2500)"])
+        self.lookback_combo.setCurrentIndex(0)
         self.lookback_combo.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333; padding: 6px; min-width: 80px;")
         lookback_group.addWidget(self.lookback_combo)
         config_layout.addLayout(lookback_group)
@@ -6207,20 +6617,22 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.verticalHeader().setVisible(False)
         self.viable_table.verticalHeader().setDefaultSectionSize(44)  # Öka radhöjd ytterligare
 
-        self.viable_table.setColumnCount(10)
+        self.viable_table.setColumnCount(12)
         self.viable_table.setHorizontalHeaderLabels([
-            "Pair", "Half-life (days)", "EG p-value", "Johansen trace",
-            "Hurst", "Correlation",
+            "Pair", "Z-Score", "Half-life (days)", "EG p-value", "Johansen trace",
+            "Hurst", "Correlation", "Robustness",
             "Kalman Stab.", "Innov. Ratio", "Regime Score", "\u03b8 Sig."
         ])
         # Tooltips for scanner columns
         _scanner_tips = [
             "Stock pair Y/X. Spread = Y - \u03b2\u00b7X - \u03b1",
+            "Current Z-score of the spread.\n|Z| > 2.0 = signal (highlighted).\nComputed from shortest passing window.",
             "Days for spread to move halfway to equilibrium.\nln(2)/\u03b8 \u00d7 252. Ideal: 5-60 days.",
             "Engle-Granger cointegration p-value.\np < 0.05 = significant mean reversion.",
             "Johansen trace statistic.\nHigher = stronger cointegration evidence.",
             "Hurst exponent. H < 0.5 = mean-reverting (good).\nH \u2248 0.5 = random walk. H > 0.5 = trending.",
             "Pearson correlation between Y and X.\nHigher = more stable hedge. > 0.8 desirable.",
+            "Windows passed / windows tested.\nHigher = more robust across time periods.",
             "Kalman parameter stability [0-1].\n1 = perfectly stable \u03b8. > 0.5 required.",
             "Normalized innovation ratio.\nShould be \u22481.0 (valid range [0.5, 2.0]).",
             "CUSUM regime change score.\n< 4.0 = no structural break detected.",
@@ -6266,9 +6678,67 @@ class PairsTradingTerminal(QMainWindow):
                 letter-spacing: 0.5px;
             }}
         """)
-        self.viable_table.itemSelectionChanged.connect(self.on_viable_pair_selected)
+        self.viable_table.itemSelectionChanged.connect(self._on_scanner_pair_clicked)
+        self.viable_table.doubleClicked.connect(self._on_scanner_pair_double_clicked)
         results_layout.addWidget(self.viable_table)
-        
+
+        # Window breakdown panel (hidden by default)
+        self.window_detail_frame = QFrame()
+        self.window_detail_frame.setVisible(False)
+        self.window_detail_frame.setMaximumHeight(280)
+        self.window_detail_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_elevated']};
+                border: 1px solid {COLORS['border_default']};
+                border-radius: 6px;
+            }}
+        """)
+        wd_layout = QVBoxLayout(self.window_detail_frame)
+        wd_layout.setContentsMargins(10, 8, 10, 8)
+        wd_layout.setSpacing(4)
+
+        self.window_detail_header = QLabel("WINDOW BREAKDOWN")
+        self.window_detail_header.setStyleSheet(
+            f"color: {COLORS['accent']}; font-size: 12px; font-weight: 600; "
+            f"letter-spacing: 1px; background: transparent; border: none;")
+        wd_layout.addWidget(self.window_detail_header)
+
+        self.window_detail_table = QTableWidget()
+        self.window_detail_table.setColumnCount(9)
+        self.window_detail_table.setHorizontalHeaderLabels([
+            "Window", "Status", "Half-life", "EG p-val", "Johansen",
+            "Hurst", "Corr", "Kalman Stab", "Failed At"
+        ])
+        self.window_detail_table.verticalHeader().setVisible(False)
+        self.window_detail_table.verticalHeader().setDefaultSectionSize(28)
+        self.window_detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.window_detail_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.window_detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.window_detail_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['bg_card']};
+                gridline-color: {COLORS['border_subtle']};
+                border: none;
+                font-family: 'JetBrains Mono', 'Consolas', monospace;
+                font-size: 11px;
+            }}
+            QTableWidget::item {{
+                padding: 4px 6px;
+                border-bottom: 1px solid {COLORS['border_subtle']};
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_secondary']};
+                padding: 6px 4px;
+                border: none;
+                border-bottom: 1px solid {COLORS['border_default']};
+                font-weight: 600;
+                font-size: 10px;
+            }}
+        """)
+        wd_layout.addWidget(self.window_detail_table)
+        results_layout.addWidget(self.window_detail_frame)
+
         # All Pairs expandable
         self.all_pairs_btn = QPushButton("▼ View All Analyzed Pairs")
         self.all_pairs_btn.setStyleSheet(f"""
@@ -6452,18 +6922,26 @@ class PairsTradingTerminal(QMainWindow):
             tooltip="Y price move if Y absorbs 100% of convergence.")
         self.exp_x_only_card = MetricCard("X (100%)", "-",
             tooltip="X price move if X absorbs 100% of convergence.")
-        self.exp_y_half_card = MetricCard("Y (50%)", "-",
-            tooltip="Y price move if convergence split 50/50 between legs.")
-        self.exp_x_half_card = MetricCard("X (50%)", "-",
-            tooltip="X price move if convergence split 50/50 between legs.")
         
         left_layout.addWidget(self.exp_spread_change_card)
         left_layout.addWidget(self.exp_y_only_card)
         left_layout.addWidget(self.exp_x_only_card)
-        left_layout.addWidget(self.exp_y_half_card)
-        left_layout.addWidget(self.exp_x_half_card)
-        
-        
+
+        # =========================
+        # Window Robustness
+        # =========================
+        left_layout.addWidget(SectionHeader("WINDOW ROBUSTNESS"))
+
+        self.ou_robustness_card = MetricCard("ROBUSTNESS SCORE", "-",
+            tooltip="Windows passed / windows tested.\nGreen ≥70%, Yellow ≥50%, Red <50%.")
+        left_layout.addWidget(self.ou_robustness_card)
+
+        self.ou_window_container = QWidget()
+        self.ou_window_container_layout = QVBoxLayout(self.ou_window_container)
+        self.ou_window_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.ou_window_container_layout.setSpacing(2)
+        left_layout.addWidget(self.ou_window_container)
+
         # Push content to top
         left_layout.addStretch()
                 
@@ -6856,10 +7334,31 @@ class PairsTradingTerminal(QMainWindow):
         left_layout.addWidget(divider2)
         
         # Derivatives header
-        deriv_header = QLabel("AVAILABLE DERIVATIVES FROM MORGAN STANLEY")
+        deriv_header = QLabel("DERIVATIVES")
         deriv_header.setStyleSheet(f"color: {COLORS['accent']}; font-size: 13px; font-weight: 600; letter-spacing: 1px; border: none;")
         left_layout.addWidget(deriv_header)
-        
+
+        # Knapp-stilar för produkttyp-toggle (per ben)
+        self._deriv_btn_style_active = f"""
+            QPushButton {{
+                background: {COLORS['accent']}; color: #000000;
+                border: none; border-radius: 3px; padding: 2px 8px;
+                font-size: 10px; font-weight: 600;
+            }}
+        """
+        self._deriv_btn_style_inactive = f"""
+            QPushButton {{
+                background: {COLORS['bg_elevated']}; color: {COLORS['text_muted']};
+                border: 1px solid {COLORS['border_subtle']}; border-radius: 3px; padding: 2px 8px;
+                font-size: 10px; font-weight: 500;
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_dark']}; color: {COLORS['text_primary']}; }}
+        """
+
+        # Per-ben produkttyp: 'mini' eller 'cert'
+        self._active_product_type_y = 'mini'
+        self._active_product_type_x = 'mini'
+
         # Y ticker mini future
         self.mini_y_frame = QFrame()
         self.mini_y_frame.setStyleSheet(f"""
@@ -6877,10 +7376,43 @@ class PairsTradingTerminal(QMainWindow):
         self.mini_y_ticker = QLabel("POSITION IN Y - MINI LONG")
         self.mini_y_ticker.setStyleSheet(f"color: {COLORS['positive']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
         mini_y_layout.addWidget(self.mini_y_ticker)
-        
-        self.mini_y_name = QLabel("No mini future found")
-        self.mini_y_name.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px; font-weight: 500; background: transparent; border: none;")
-        mini_y_layout.addWidget(self.mini_y_name)
+
+        # Produkttyp-knappar för Y
+        y_btn_row = QHBoxLayout()
+        y_btn_row.setSpacing(4)
+        y_btn_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_mini_y = QPushButton("Mini (0)")
+        self.btn_mini_y.setStyleSheet(self._deriv_btn_style_active)
+        self.btn_mini_y.setCursor(Qt.PointingHandCursor)
+        self.btn_mini_y.clicked.connect(lambda: self._switch_product_type('mini', 'y'))
+        y_btn_row.addWidget(self.btn_mini_y)
+        self.btn_cert_y = QPushButton("Cert (0)")
+        self.btn_cert_y.setStyleSheet(self._deriv_btn_style_inactive)
+        self.btn_cert_y.setCursor(Qt.PointingHandCursor)
+        self.btn_cert_y.clicked.connect(lambda: self._switch_product_type('cert', 'y'))
+        y_btn_row.addWidget(self.btn_cert_y)
+        y_btn_row.addStretch()
+        mini_y_layout.addLayout(y_btn_row)
+
+        self._instruments_y = []  # Filtrerade instrument för Y
+        self.mini_y_combo = QComboBox()
+        self.mini_y_combo.addItem("No instruments found")
+        self.mini_y_combo.setStyleSheet(f"""
+            QComboBox {{
+                color: {COLORS['text_primary']}; font-size: 12px; font-weight: 500;
+                background: {COLORS['bg_dark']}; border: 1px solid {COLORS['border_subtle']};
+                border-radius: 3px; padding: 3px 6px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox::down-arrow {{ image: none; border: none; width: 12px; }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS['bg_dark']}; color: {COLORS['text_primary']};
+                selection-background-color: {COLORS['accent']}; border: 1px solid {COLORS['border_subtle']};
+                font-size: 11px;
+            }}
+        """)
+        self.mini_y_combo.currentIndexChanged.connect(lambda idx: self._on_instrument_changed(idx, 'y'))
+        mini_y_layout.addWidget(self.mini_y_combo)
         
         self.mini_y_info = QLabel("")
         self.mini_y_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
@@ -6906,10 +7438,43 @@ class PairsTradingTerminal(QMainWindow):
         self.mini_x_ticker = QLabel("POSITION IN X - MINI SHORT")
         self.mini_x_ticker.setStyleSheet(f"color: {COLORS['negative']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
         mini_x_layout.addWidget(self.mini_x_ticker)
-        
-        self.mini_x_name = QLabel("No mini future found")
-        self.mini_x_name.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px; font-weight: 500; background: transparent; border: none;")
-        mini_x_layout.addWidget(self.mini_x_name)
+
+        # Produkttyp-knappar för X
+        x_btn_row = QHBoxLayout()
+        x_btn_row.setSpacing(4)
+        x_btn_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_mini_x = QPushButton("Mini (0)")
+        self.btn_mini_x.setStyleSheet(self._deriv_btn_style_active)
+        self.btn_mini_x.setCursor(Qt.PointingHandCursor)
+        self.btn_mini_x.clicked.connect(lambda: self._switch_product_type('mini', 'x'))
+        x_btn_row.addWidget(self.btn_mini_x)
+        self.btn_cert_x = QPushButton("Cert (0)")
+        self.btn_cert_x.setStyleSheet(self._deriv_btn_style_inactive)
+        self.btn_cert_x.setCursor(Qt.PointingHandCursor)
+        self.btn_cert_x.clicked.connect(lambda: self._switch_product_type('cert', 'x'))
+        x_btn_row.addWidget(self.btn_cert_x)
+        x_btn_row.addStretch()
+        mini_x_layout.addLayout(x_btn_row)
+
+        self._instruments_x = []  # Filtrerade instrument för X
+        self.mini_x_combo = QComboBox()
+        self.mini_x_combo.addItem("No instruments found")
+        self.mini_x_combo.setStyleSheet(f"""
+            QComboBox {{
+                color: {COLORS['text_primary']}; font-size: 12px; font-weight: 500;
+                background: {COLORS['bg_dark']}; border: 1px solid {COLORS['border_subtle']};
+                border-radius: 3px; padding: 3px 6px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox::down-arrow {{ image: none; border: none; width: 12px; }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS['bg_dark']}; color: {COLORS['text_primary']};
+                selection-background-color: {COLORS['accent']}; border: 1px solid {COLORS['border_subtle']};
+                font-size: 11px;
+            }}
+        """)
+        self.mini_x_combo.currentIndexChanged.connect(lambda idx: self._on_instrument_changed(idx, 'x'))
+        mini_x_layout.addWidget(self.mini_x_combo)
         
         self.mini_x_info = QLabel("")
         self.mini_x_info.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
@@ -6926,7 +7491,7 @@ class PairsTradingTerminal(QMainWindow):
         left_layout.addWidget(divider3)
         
         # Mini Futures Position Sizing header
-        mf_header = QLabel("MINI FUTURES POSITION SIZING")
+        mf_header = QLabel("POSITION SIZING")
         mf_header.setStyleSheet(f"color: {COLORS['accent']}; font-size: 13px; font-weight: 600; letter-spacing: 1px; border: none;")
         left_layout.addWidget(mf_header)
         
@@ -7217,43 +7782,43 @@ class PairsTradingTerminal(QMainWindow):
         
         current_layout.addWidget(summary_frame)
         
-        # Positions table with dynamic columns
+        # Positions table with dynamic columns + inline z-chart
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(13)
+        self.positions_table.setColumnCount(14)
         self.positions_table.setHorizontalHeaderLabels([
             "PAIR", "DIRECTION", "Z-SCORE", "STATUS",
             "Y LEG", "ENTRY PRICE", "QUANTITY", "P/L",
             "X LEG", "ENTRY PRICE", "QUANTITY", "P/L",
-            "CLOSE POSITION"
+            "CLOSE", "Z-CHART"
         ])
-        
-        # Set row height
-        self.positions_table.verticalHeader().setDefaultSectionSize(55)  # Ökat från 50
+
+        # Row height 3x for inline chart visibility
+        self.positions_table.verticalHeader().setDefaultSectionSize(110)
         self.positions_table.verticalHeader().setVisible(False)
-        
-        # Dynamic column widths - larger defaults
+
+        # Dynamic column widths
         header = self.positions_table.horizontalHeader()
-        header.setStretchLastSection(False)
-        
-        # Set fixed widths for specific columns
-        self.positions_table.setColumnWidth(0, 110)   # PAIR
-        self.positions_table.setColumnWidth(1, 110)    # DIR
-        self.positions_table.setColumnWidth(2, 110)    # Z
-        self.positions_table.setColumnWidth(3, 110)    # STATUS
-        self.positions_table.setColumnWidth(4, 250)   # MINI Y (namn)
-        self.positions_table.setColumnWidth(5, 110)   # ENTRY Y
-        self.positions_table.setColumnWidth(6, 110)    # QTY Y
-        self.positions_table.setColumnWidth(7, 130)   # P/L Y
-        self.positions_table.setColumnWidth(8, 250)   # MINI X (namn)
-        self.positions_table.setColumnWidth(9, 110)  # ENTRY X
-        self.positions_table.setColumnWidth(10, 110)   # QTY X
-        self.positions_table.setColumnWidth(11, 130)  # P/L X
-        self.positions_table.setColumnWidth(12, 150)   # CLOSE
-        
-        # Allow horizontal scrolling if needed
+        header.setStretchLastSection(True)  # Z-CHART stretches to fill
+
+        self.positions_table.setColumnWidth(0, 140)   # PAIR
+        self.positions_table.setColumnWidth(1, 100)    # DIR
+        self.positions_table.setColumnWidth(2, 90)     # Z
+        self.positions_table.setColumnWidth(3, 90)     # STATUS
+        self.positions_table.setColumnWidth(4, 220)   # MINI Y
+        self.positions_table.setColumnWidth(5, 100)   # ENTRY Y
+        self.positions_table.setColumnWidth(6, 90)     # QTY Y
+        self.positions_table.setColumnWidth(7, 110)   # P/L Y
+        self.positions_table.setColumnWidth(8, 220)   # MINI X
+        self.positions_table.setColumnWidth(9, 100)   # ENTRY X
+        self.positions_table.setColumnWidth(10, 90)    # QTY X
+        self.positions_table.setColumnWidth(11, 110)   # P/L X
+        self.positions_table.setColumnWidth(12, 70)    # CLOSE
+        # col 13 (Z-CHART) stretches via setStretchLastSection
+
         header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(13, QHeaderView.Stretch)
         header.setMinimumSectionSize(45)
-        
+
         self.positions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.positions_table.setAlternatingRowColors(True)
         self.positions_table.setStyleSheet(f"""
@@ -7278,8 +7843,8 @@ class PairsTradingTerminal(QMainWindow):
             }}
         """)
         current_layout.addWidget(self.positions_table)
-        
-        # Clear all button (smaller)
+
+        # Clear all button
         btn_layout = QHBoxLayout()
         self.clear_all_btn = QPushButton("🗑 Clear All")
         self.clear_all_btn.setStyleSheet(f"""
@@ -7311,7 +7876,7 @@ class PairsTradingTerminal(QMainWindow):
         # Benchmark Analysis sub-tab
         benchmark_tab = self._create_benchmark_analysis_subtab()
         self.portfolio_subtabs.addTab(benchmark_tab, "📈 BENCHMARK ANALYSIS")
-        
+
         # Auto-load benchmark when switching to that tab
         self.portfolio_subtabs.currentChanged.connect(self._on_portfolio_subtab_changed)
         self._benchmark_loaded = False  # Track if benchmark data has been loaded
@@ -7327,6 +7892,128 @@ class PairsTradingTerminal(QMainWindow):
         elif index == 2:
             self._load_or_update_benchmark()
     
+    # -----------------------------------------------------------------------
+    # Z-CHART — per-pair z-score sparklines in positions table
+    # -----------------------------------------------------------------------
+
+    def _lm_get_or_create_plot(self, pair: str) -> Optional[dict]:
+        """Return cached {plot_widget, z_curve, entry_line} or create a new one."""
+        if pair in self._lm_pairs:
+            return self._lm_pairs[pair]
+
+        pg_mod = get_pyqtgraph()
+        EpochAxis = get_epoch_axis_item_class()
+        if pg_mod is None or EpochAxis is None:
+            return None
+
+        bottom_axis = EpochAxis(orientation='bottom')
+        pw = pg_mod.PlotWidget(axisItems={'bottom': bottom_axis})
+        pw.setBackground('#0a0a0a')
+        pw.showGrid(x=False, y=True, alpha=0.15)
+        pw.setLabel('left', 'Z', color='#888888', size='8pt')
+        pw.getAxis('left').setWidth(30)
+        pw.getAxis('bottom').setHeight(20)
+        pw.setContentsMargins(0, 0, 0, 0)
+        pw.getPlotItem().setContentsMargins(0, 0, 0, 0)
+
+        # Reference lines
+        pw.addLine(y=0,  pen=pg_mod.mkPen('#ffffff', width=1, style=Qt.DashLine))
+        pw.addLine(y=2,  pen=pg_mod.mkPen('#22c55e', width=1, style=Qt.DashLine))
+        pw.addLine(y=-2, pen=pg_mod.mkPen('#22c55e', width=1, style=Qt.DashLine))
+
+        z_curve = pw.plot([], [], pen=pg_mod.mkPen('#d4a574', width=2))
+        entry_line = None  # created dynamically
+
+        self._lm_pairs[pair] = {
+            'plot_widget': pw,
+            'z_curve': z_curve,
+            'entry_line': entry_line,
+        }
+        return self._lm_pairs[pair]
+
+    def _lm_update_chart(self, pair: str, entry_z: float = 0.0,
+                         entry_date: str = None, window_size: int = None):
+        """Fetch spread from engine and refresh the z-score chart for *pair*."""
+        if self.engine is None:
+            return
+        pd_data = self._lm_get_or_create_plot(pair)
+        if pd_data is None:
+            return
+
+        try:
+            ou, spread_series, current_z = self.engine.get_pair_ou_params(
+                pair, use_raw_data=True, window_size=window_size)
+        except Exception:
+            return
+
+        eq_std = ou.eq_std if ou.eq_std > 0 else 1.0
+        spread = spread_series.dropna()
+
+        # Filter from entry_date - 1 trading day to present
+        if entry_date and len(spread) > 5:
+            try:
+                entry_ts = pd.Timestamp(entry_date)
+                # Go back 1 trading day from entry
+                mask = spread.index >= (entry_ts - pd.tseries.offsets.BDay(1))
+                if mask.any() and mask.sum() >= 5:
+                    spread = spread[mask]
+            except Exception:
+                spread = spread.iloc[-60:]
+        else:
+            spread = spread.iloc[-60:]
+
+        if spread.empty:
+            return
+
+        epochs = [pd.Timestamp(ts).timestamp() for ts in spread.index]
+        zvals  = [(s - ou.mu) / eq_std for s in spread.values]
+
+        pd_data['z_curve'].setData(epochs, zvals)
+
+        pg_mod = get_pyqtgraph()
+        pw = pd_data['plot_widget']
+
+        # Update entry-date vertical line
+        if entry_date:
+            try:
+                entry_epoch = pd.Timestamp(entry_date).timestamp()
+                if pd_data.get('entry_date_line') is not None:
+                    try:
+                        pw.removeItem(pd_data['entry_date_line'])
+                    except Exception:
+                        pass
+                pd_data['entry_date_line'] = pg_mod.InfiniteLine(
+                    pos=entry_epoch, angle=90, movable=False,
+                    pen=pg_mod.mkPen('#555555', width=1, style=Qt.DashLine))
+                pw.addItem(pd_data['entry_date_line'])
+            except Exception:
+                pass
+
+        # Update entry-z horizontal line
+        ez = entry_z if entry_z else current_z
+        if pd_data['entry_line'] is not None:
+            try:
+                pw.removeItem(pd_data['entry_line'])
+            except Exception:
+                pass
+        pd_data['entry_line'] = pg_mod.InfiniteLine(
+            pos=ez, angle=0, movable=False,
+            pen=pg_mod.mkPen('#f59e0b', width=1, style=Qt.DotLine),
+            label=f'Entry {ez:.2f}',
+            labelOpts={'color': '#f59e0b', 'position': 0.05})
+        pw.addItem(pd_data['entry_line'])
+
+    def _lm_cleanup_stale_pairs(self):
+        """Remove chart data for pairs no longer in portfolio."""
+        active = {pos['pair'] for pos in self.portfolio}
+        stale = [p for p in self._lm_pairs if p not in active]
+        for p in stale:
+            pw = self._lm_pairs[p].get('plot_widget')
+            if pw is not None:
+                pw.setParent(None)
+                pw.deleteLater()
+            del self._lm_pairs[p]
+
     def _create_trade_history_subtab(self) -> QWidget:
         """Create Trade History sub-tab showing closed positions."""
         tab = QWidget()
@@ -7775,7 +8462,7 @@ class PairsTradingTerminal(QMainWindow):
                         entry_dt = datetime.strptime(entry_str, '%Y-%m-%d %H:%M')
                         if earliest_entry is None or entry_dt < earliest_entry:
                             earliest_entry = entry_dt
-                    except:
+                    except (ValueError, TypeError):
                         pass
         
         return {
@@ -8261,7 +8948,7 @@ class PairsTradingTerminal(QMainWindow):
                 # Parse entry date (format: 'YYYY-MM-DD HH:MM')
                 entry_dt = datetime.strptime(entry_date_str, '%Y-%m-%d %H:%M')
                 entry_date = pd.Timestamp(entry_dt.date())
-            except:
+            except (ValueError, TypeError):
                 continue
             
             pair = pos['pair']
@@ -8613,7 +9300,6 @@ class PairsTradingTerminal(QMainWindow):
             
         except Exception as e:
             print(f"Error calculating metrics: {e}")
-            import traceback
             traceback.print_exc()
             return self._empty_metrics()
     
@@ -8728,7 +9414,7 @@ class PairsTradingTerminal(QMainWindow):
                             text = "∞"
                         else:
                             text = fmt % value
-                    except:
+                    except (TypeError, ValueError):
                         text = str(value)
                     
                     item = QTableWidgetItem(text)
@@ -8922,7 +9608,7 @@ class PairsTradingTerminal(QMainWindow):
                                 # Parse value and apply color
                                 val_str = value_text.replace('%', '').replace('+', '')
                                 val = float(val_str)
-                                if metric_name in ['Portfolio Return', 'Excess Return (Alpha)', 
+                                if metric_name in ['Portfolio Return', 'Excess Return (Alpha)',
                                                    'Sharpe Ratio (Portfolio)', 'Sortino Ratio']:
                                     if val > 0:
                                         item.setForeground(QColor(COLORS['positive']))
@@ -8933,7 +9619,7 @@ class PairsTradingTerminal(QMainWindow):
                                         item.setForeground(QColor(COLORS['positive']))
                                     elif val < 0:
                                         item.setForeground(QColor(COLORS['negative']))
-                            except:
+                            except (ValueError, TypeError):
                                 pass
                         else:
                             item.setForeground(QColor(COLORS['text_muted']))
@@ -9729,45 +10415,38 @@ class PairsTradingTerminal(QMainWindow):
         MARKET_WEIGHTS = {
             # America
             '^GSPC': 50, '^NDX': 25, '^DJI': 15, '^RUT': 3,
-            '^GSPTSE': 3, '^MXX': 0.8, '^BVSP': 1, '^MERV': 0.1,
-            '^IPSA': 0.15, '^COLCAP': 0.1,
+            '^GSPTSE': 3, '^BVSP': 1,
             # Europe
-            '^FTSE': 3, '^FCHI': 3.5, '^STOXX': 12, '^AEX': 1.5,
-            '^GDAXI': 2.5, '^SSMI': 2, '^ATX': 0.15, '^IBEX': 1,
-            'FTSEMIB.MI': 0.8, 'PSI20.LS': 0.1, '^BFX': 0.3,
-            '^ISEQ': 0.15, 'XU100.IS': 0.4, '^OMX': 1,
-            'OBX.OL': 0.4, '^OMXC25': 0.6, '^OMXH25': 0.3, 'WIG20.WA': 0.2,
-            # Middle East
-            '^TA125.TA': 0.3, '^TASI.SR': 2.5, 'DFMGI.AE': 0.8,
-            'FADGI.FGI': 0.6, '^GNRI.QA': 0.15,
-            # Africa
-            '^JN0U.JO': 1, '^CASE30': 0.08,
+            '^FTSE': 3, '^FCHI': 3.5, '^STOXX50E': 10, '^N100': 5,
+            '^GDAXI': 2.5, '^OMX': 1,
+            'OBX.OL': 0.4, '^OMXC25': 0.6, '^OMXH25': 0.3,
             # Asia
             '^N225': 6, '^HSI': 4, '000001.SS': 8, '^KS11': 2,
-            '^TWII': 2, '^NSEI': 4, '^BSESN': 4, '^STI': 0.6,
-            '^JKSE': 0.6, '^KLSE': 0.3, '^SET.BK': 0.5,
-            '^VNINDEX': 0.2, 'PSEI.PS': 0.15,
-            '000300.SS': 5, '399106.SZ': 2,
+            '^TWII': 2, '399106.SZ': 2, '^BSESN': 4,
             # Oceania
-            '^AXJO': 1.5, '^NZ50': 0.12,
-            # Currencies (daily volume approximation)
+            '^AXJO': 1.5,
+            # Currencies
             'EURUSD=X': 2, 'EURSEK=X': 0.5, 'GBPUSD=X': 1,
-            'USDJPY=X': 1, 'USDCHF=X': 0.5, 'AUDUSD=X': 0.5,
-            'USDCAD=X': 0.5, 'USDSEK=X': 0.3,
+            'USDJPY=X': 1, 'USDSEK=X': 0.3,
             # Commodities
-            'GC=F': 5, 'SI=F': 1, 'CL=F': 4, 'NG=F': 1.5, 'HG=F': 1.5,
+            'GC=F': 5, 'SI=F': 1, 'CL=F': 4, 'BZ=F': 3, 'NG=F': 1.5, 'HG=F': 1.5,
             # Yields
             '^TNX': 3, '^FVX': 2, '^TYX': 2, '^IRX': 1,
+            # Crypto
+            'BTC-USD': 3, 'SOL-USD': 1, 'XRP-USD': 1, 'ETH-USD': 1,
         }
 
         # Build treemap arrays with unique IDs (no root node - regions are top-level)
         ids = []
         labels = []
+        names_arr = []  # Rena namn för JS-uppdatering av labels
         parents = []
         values = []
         text = []
         colors = []
         font_sizes = []
+        line_widths = []   # Per-tile border width (tjockare för regioner)
+        line_colors = []   # Per-tile border color
 
         # Extra data for overlay & tooltip
         histories = {}       # symbol → [[date, close], ...]
@@ -9792,12 +10471,15 @@ class PairsTradingTerminal(QMainWindow):
             # Placeholder for region - value will be set to sum of children
             region_idx = len(ids)
             ids.append(region_id)
-            labels.append(display_name.upper())
+            labels.append(f'<br>{display_name.upper()}')
+            names_arr.append('')  # Regioner har inga individuella namn
             parents.append('')
             values.append(0)  # Updated below
             text.append('')
             colors.append(0)
             font_sizes.append(16)
+            line_widths.append(2)
+            line_colors.append('#444444')
 
             # Add individual instruments
             region_total = 0
@@ -9806,6 +10488,7 @@ class PairsTradingTerminal(QMainWindow):
                 symbol = item.get('symbol', '')
                 price = item.get('price', 0)
                 change_pct = item.get('change_pct', 0)
+                change_price = item.get('change', 0)
                 weight = MARKET_WEIGHTS.get(symbol, 0.5)
                 region_total += weight
 
@@ -9819,16 +10502,26 @@ class PairsTradingTerminal(QMainWindow):
 
                 change_sign = '+' if change_pct >= 0 else ''
                 display_ticker = symbol.lstrip('^').replace('=X', '').replace('=F', '')
-                # Compact tile text: just change% (like finviz)
-                tile_text = f'{change_sign}{change_pct:.2f}%'
+                # Rad 3: prisförändring + %
+                change_str = f'{change_price:+.2f}' if change_price != 0 else ''
+                tile_text = f'{change_str} ({change_sign}{change_pct:.2f}%)'
 
                 ids.append(f'item:{symbol}')
-                labels.append(display_ticker)
+
+                # Rad 1: Namn | Rad 2: Pris (via label) | Rad 3: Förändring (via text)
+                label_text = f"<b>{name}</b><br>{price_str}<br>"
+                labels.append(label_text)
+                names_arr.append(name)
+
                 parents.append(region_id)
                 values.append(weight)
                 text.append(tile_text)
                 colors.append(change_pct)
-                font_sizes.append(11)
+                # Fontstorlek proportionell mot market cap-vikt (log-skala)
+                fs = max(7, min(22, round(10 + 2.5 * math.log2(max(weight, 0.1)))))
+                font_sizes.append(fs)
+                line_widths.append(0.5)
+                line_colors.append('#0a0a0a')
 
                 # Collect history for sparklines & candlestick charts
                 hist = item.get('history', [])
@@ -9863,11 +10556,14 @@ class PairsTradingTerminal(QMainWindow):
             data_json = json.dumps({
                 'ids': ids,
                 'labels': labels,
+                'names': names_arr,
                 'parents': parents,
                 'values': values,
                 'text': text,
                 'colors': colors,
                 'font_sizes': font_sizes,
+                'line_widths': line_widths,
+                'line_colors': line_colors,
                 'histories': histories,
                 'ohlc_histories': ohlc_histories,
                 'region_items': region_items,
@@ -9876,9 +10572,12 @@ class PairsTradingTerminal(QMainWindow):
         except (ValueError, TypeError) as e:
             print(f"[MarketWatch] JSON serialization error: {e}, falling back without OHLC")
             data_json = json.dumps({
-                'ids': ids, 'labels': labels, 'parents': parents,
+                'ids': ids, 'labels': labels, 'names': names_arr,
+                'parents': parents,
                 'values': values, 'text': text, 'colors': colors,
-                'font_sizes': font_sizes, 'histories': {},
+                'font_sizes': font_sizes,
+                'line_widths': line_widths, 'line_colors': line_colors,
+                'histories': {},
                 'ohlc_histories': {}, 'region_items': region_items,
                 'item_regions': item_regions,
             }, default=str)
@@ -10236,7 +10935,8 @@ class PairsTradingTerminal(QMainWindow):
                     cmid: 0,
                     cmin: -3,
                     cmax: 3,
-                    line: {{ width: 0.5, color: '#0a0a0a' }}
+                    line: {{ width: d.line_widths, color: d.line_colors }},
+                    pad: {{ t: 25, l: 3, r: 3, b: 3 }}
                 }},
                 textinfo: 'label+text',
                 textposition: 'middle center',
@@ -10331,9 +11031,21 @@ class PairsTradingTerminal(QMainWindow):
                 var oldPct = d.colors[idx];
                 var newPct = upd.change_pct;
 
+                var p = upd.price || 0;
+                var c = upd.change || 0;
                 var sign = newPct >= 0 ? '+' : '';
-                d.text[idx] = sign + newPct.toFixed(2) + '%';
+                var cStr = c !== 0 ? (c >= 0 ? '+' : '') + c.toFixed(2) : '';
+                d.text[idx] = cStr + ' (' + sign + newPct.toFixed(2) + '%)';
                 d.colors[idx] = newPct;
+
+                /* Uppdatera label: rad 1 = namn, rad 2 = pris */
+                var nm = d.names[idx] || '';
+                if (nm && p > 0) {{
+                    var pStr = p >= 100
+                        ? p.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})
+                        : (p >= 1 ? p.toFixed(2) : p.toFixed(4));
+                    d.labels[idx] = '<b>' + nm + '</b><br>' + pStr + '<br>';
+                }}
 
                 /* Update region data for tooltips/overlays */
                 var info = d.item_regions[symbol];
@@ -10351,7 +11063,7 @@ class PairsTradingTerminal(QMainWindow):
                     }}
                 }}
 
-                var dt = symbol.replace(/^\^/, '').replace(/=X$/, '').replace(/=F$/, '');
+                var dt = symbol.replace(/^\\^/, '').replace(/=X$/, '').replace(/=F$/, '');
                 changedTickers.push(dt);
                 changedDirs[dt] = newPct > oldPct ? 'up' : (newPct < oldPct ? 'down' : 'same');
             }}
@@ -10369,7 +11081,8 @@ class PairsTradingTerminal(QMainWindow):
                     colors: d.colors,
                     colorscale: [[0,'#ff3333'],[0.35,'#8b0000'],[0.5,'#262626'],[0.65,'#006400'],[1,'#33ff33']],
                     cmid: 0, cmin: -3, cmax: 3,
-                    line: {{ width: 0.5, color: '#0a0a0a' }}
+                    line: {{ width: d.line_widths, color: d.line_colors }},
+                    pad: {{ t: 25, l: 3, r: 3, b: 3 }}
                 }},
                 textinfo: 'label+text',
                 textposition: 'middle center',
@@ -10594,13 +11307,10 @@ class PairsTradingTerminal(QMainWindow):
                 self.statusBar().showMessage(f"Loaded engine cache from {scanned_by} at {scan_time[:16]}")
         except Exception as e:
             print(f"Error loading saved engine cache: {e}")
-            import traceback
             traceback.print_exc()
     
     def _apply_engine_cache(self, cache_data: dict):
         """Apply loaded engine cache to restore full functionality."""
-        import pandas as pd
-        
         price_data = cache_data.get('price_data')
         raw_price_data = cache_data.get('raw_price_data')
         viable_pairs = cache_data.get('viable_pairs')
@@ -10635,7 +11345,18 @@ class PairsTradingTerminal(QMainWindow):
             engine.viable_pairs = viable_pairs
             engine.pairs_stats = pairs_stats if pairs_stats is not None else []
             engine.ou_models = ou_models
-            
+            engine._window_details = cache_data.get('window_details', {})
+
+            # Rebuild _pair_index from pairs_stats for O(1) lookups
+            # CRITICAL: Without this, get_pair_ou_params falls back to fresh OLS
+            # which gives different β/α than the cached screening, causing
+            # spread/z-score to be inconsistent with the price comparison chart.
+            engine._pair_index = {}
+            if pairs_stats is not None and hasattr(pairs_stats, 'itertuples'):
+                for row in pairs_stats.itertuples():
+                    if hasattr(row, 'pair'):
+                        engine._pair_index[row.pair] = row
+
             self.engine = engine
             
             # Uppdatera metrics
@@ -10663,7 +11384,6 @@ class PairsTradingTerminal(QMainWindow):
             
         except Exception as e:
             print(f"[Engine Cache] Error applying cache: {e}")
-            import traceback
             traceback.print_exc()
     
     # Legacy compatibility
@@ -10853,17 +11573,156 @@ class PairsTradingTerminal(QMainWindow):
             self.refresh_market_data()
         except Exception as e:
             print(f"[Volatility] Error starting refresh: {e}")
-            import traceback
             traceback.print_exc()
-    
+
+    def _load_or_fetch_volatility(self):
+        """Ladda percentilcache från disk om <24h gammal, annars yf.download."""
+        cache = load_volatility_cache()
+        if cache is not None:
+            try:
+                # Ladda alltid in cachad data i minne (fallback för SKEW/MOVE)
+                for ticker, values in cache.get('hist', {}).items():
+                    self._vol_hist_cache[ticker] = np.array(values)
+                self._vol_median_cache = cache.get('median', {})
+                self._vol_mode_cache = cache.get('mode', {})
+                self._vol_sparkline_cache = cache.get('sparkline', {})
+
+                saved_str = cache.get('saved_at', '')
+                saved_dt = datetime.fromisoformat(saved_str)
+                age_hours = (datetime.now() - saved_dt).total_seconds() / 3600
+                if age_hours < 24:
+                    # Cache är färsk — visa cachad data och skippa yf.download
+                    self._apply_cached_volatility_cards()
+                    print(f"[VolCache] Using disk cache ({age_hours:.1f}h old) — skipping yf.download")
+                    self.statusBar().showMessage("Volatility percentiles loaded from cache")
+                    return
+                else:
+                    # Visa cachad data direkt, sedan uppdatera med yf.download
+                    self._apply_cached_volatility_cards()
+                    print(f"[VolCache] Cache is {age_hours:.1f}h old — showing cached, then refreshing via yf.download")
+            except Exception as e:
+                print(f"[VolCache] Could not parse cache: {e}")
+
+        # Hämta färsk data via yf.download (cachad data visas som fallback)
+        self._start_volatility_refresh_safe()
+
+    def _apply_cached_volatility_cards(self):
+        """Uppdatera volatility cards med cachad percentildata (utan yf.download)."""
+        vol_descs = {
+            '^VIX': [
+                (10, "Extreme complacency in markets"), (25, "Low fear - calm markets"),
+                (50, "Relatively calm conditions"), (75, "Slightly elevated uncertainty"),
+                (90, "Elevated fear & uncertainty"), (95, "Significant market stress"),
+                (100, "Extreme fear - crisis levels"),
+            ],
+            '^VVIX': [
+                (10, "Very stable VIX expectations"), (25, "Stable VIX outlook"),
+                (50, "Below median uncertainty about VIX"), (75, "Somewhat uncertain VIX outlook"),
+                (90, "Potential for volatility spikes"), (95, "VIX itself highly volatile"),
+                (100, "Crisis-level VIX uncertainty"),
+            ],
+            '^SKEW': [
+                (10, "Very low tail risk pricing"), (25, "Limited crash protection demand"),
+                (50, "Below median tail risk perception"), (75, "Modest downside protection demand"),
+                (90, "Increased put demand"), (95, "Significant crash hedging"),
+                (100, "Major crash protection demand"),
+            ],
+            '^MOVE': [
+                (10, "Low rate volatility"), (25, "Stable rate environment"),
+                (50, "Relatively stable rates"), (75, "Some rate uncertainty"),
+                (90, "Significant rate uncertainty"), (95, "Major rate movements expected"),
+                (100, "Crisis-level rate uncertainty"),
+            ],
+        }
+        card_map = {'^VIX': 'vix_card', '^VVIX': 'vvix_card',
+                    '^SKEW': 'skew_card', '^MOVE': 'move_card'}
+
+        for ticker, attr in card_map.items():
+            card = getattr(self, attr, None)
+            if card is None or ticker not in self._vol_hist_cache:
+                continue
+            hist = self._vol_hist_cache[ticker]
+            median = self._vol_median_cache.get(ticker, 0)
+            mode = self._vol_mode_cache.get(ticker, 0)
+            sparkline = self._vol_sparkline_cache.get(ticker)
+
+            # Använd senaste värdet från sparkline som "current value"
+            if sparkline and len(sparkline) > 0:
+                val = sparkline[-1]
+                prev = sparkline[-2] if len(sparkline) > 1 else val
+                chg = ((val / prev) - 1) * 100 if prev != 0 else 0
+                pct = np.searchsorted(hist, val) / len(hist) * 100
+
+                desc = ""
+                for threshold, text in vol_descs.get(ticker, []):
+                    if pct < threshold:
+                        desc = text
+                        break
+
+                card.update_data(val, chg, pct, median, mode, desc, history=sparkline)
+
+    def _apply_vol_card_fallback(self, ticker: str, card):
+        """Fallback: visa senaste cachade data när yfinance inte returnerar ticker.
+
+        Används för SKEW/MOVE som ofta uppdateras med fördröjning (efter midnatt).
+        Visar senaste kända pris med percentil och sparkline från cachen.
+        """
+        vol_descs = {
+            '^VIX': [
+                (10, "Extreme complacency in markets"), (25, "Low fear - calm markets"),
+                (50, "Relatively calm conditions"), (75, "Slightly elevated uncertainty"),
+                (90, "Elevated fear & uncertainty"), (95, "Significant market stress"),
+                (100, "Extreme fear - crisis levels"),
+            ],
+            '^VVIX': [
+                (10, "Very stable VIX expectations"), (25, "Stable VIX outlook"),
+                (50, "Below median uncertainty about VIX"), (75, "Somewhat uncertain VIX outlook"),
+                (90, "Potential for volatility spikes"), (95, "VIX itself highly volatile"),
+                (100, "Crisis-level VIX uncertainty"),
+            ],
+            '^SKEW': [
+                (10, "Very low tail risk pricing"), (25, "Limited crash protection demand"),
+                (50, "Below median tail risk perception"), (75, "Modest downside protection demand"),
+                (90, "Increased put demand"), (95, "Significant crash hedging"),
+                (100, "Major crash protection demand"),
+            ],
+            '^MOVE': [
+                (10, "Low rate volatility"), (25, "Stable rate environment"),
+                (50, "Relatively stable rates"), (75, "Some rate uncertainty"),
+                (90, "Significant rate uncertainty"), (95, "Major rate movements expected"),
+                (100, "Crisis-level rate uncertainty"),
+            ],
+        }
+        sparkline = self._vol_sparkline_cache.get(ticker)
+        hist = self._vol_hist_cache.get(ticker)
+        if sparkline and len(sparkline) > 0 and hist is not None and len(hist) > 0:
+            val = sparkline[-1]
+            prev = sparkline[-2] if len(sparkline) > 1 else val
+            chg = ((val / prev) - 1) * 100 if prev != 0 else 0
+            pct = np.searchsorted(hist, val) / len(hist) * 100
+            median = self._vol_median_cache.get(ticker, 0)
+            mode = self._vol_mode_cache.get(ticker, 0)
+
+            desc = ""
+            for threshold, text in vol_descs.get(ticker, []):
+                if pct < threshold:
+                    desc = text
+                    break
+
+            card.update_data(val, chg, pct, median, mode, desc, history=sparkline)
+            print(f"[Volatility] {ticker}: yfinance data unavailable, using cached fallback (last: {val:.2f})")
+        else:
+            card.value_label.setText("N/A")
+            card.desc_label.setText(f"No {ticker.replace('^', '')} data available")
+            print(f"[Volatility] {ticker}: no data from yfinance and no cache available")
+
     def _start_ws_market_feed(self, trigger_volatility=True):
         """Start WebSocket for all market instruments (replaces yf.download for treemap)."""
         tickers = list(self.MARKET_INSTRUMENTS.keys())
-        # Add VIX/VVIX for live volatility card updates
+        # Add VIX/VVIX for live volatility card updates (SKEW/MOVE via yf.download only)
         for extra in ['^VIX', '^VVIX']:
             if extra not in tickers:
                 tickers.append(extra)
-
         # Clean up old refs
         self._stop_market_websocket()
 
@@ -10878,9 +11737,9 @@ class PairsTradingTerminal(QMainWindow):
         self._ws_thread.start()
         print(f"[WS] Starting WebSocket feed for {len(tickers)} tickers (WS-first mode)")
 
-        # Start volatility yf.download independently (for percentiles only, once at startup)
+        # Volatilitetspercentiler: ladda från disk-cache om <24h gammal, annars yf.download
         if trigger_volatility:
-            QTimer.singleShot(2000, self._start_volatility_refresh_safe)
+            QTimer.singleShot(2000, self._load_or_fetch_volatility)
 
         # Fetch intraday OHLC (1d/5m) to seed overlay candlestick charts
         QTimer.singleShot(5000, self._fetch_intraday_ohlc)
@@ -10943,30 +11802,32 @@ class PairsTradingTerminal(QMainWindow):
         self._intraday_thread.started.connect(self._intraday_worker.run)
         self._intraday_worker.finished.connect(self._intraday_thread.quit)
         self._intraday_worker.result.connect(self._on_intraday_ohlc_received)
-        self._intraday_worker.error.connect(lambda e: print(f"[Intraday] Error: {e}"))
+        self._intraday_worker.error.connect(self._on_intraday_ohlc_error)
         self._intraday_thread.start()
 
     def _on_intraday_ohlc_received(self, data: dict):
-        """Handle intraday OHLC data — seed charts and extra info for overlays."""
+        """Handle intraday OHLC data — seed charts, extra info, och uppdatera tiles."""
         count = 0
+        updates_js = {}  # pris/change-uppdateringar för tiles utan WS-data
+
         for symbol, payload in data.items():
             ohlc = payload.get('ohlc', [])
             info = payload.get('info', {})
             if ohlc:
                 self._intraday_ohlc_seed[symbol] = ohlc
                 count += 1
-            # Seed ws_extra_info if WS hasn't provided real values yet
+
+            # Fyll i ws_extra_info med nedladdad data
             if info and symbol not in self._ws_extra_info:
                 self._ws_extra_info[symbol] = {
                     'day_high': info.get('day_high', 0),
                     'day_low': info.get('day_low', 0),
                     'day_volume': info.get('day_volume', 0),
                     'open_price': info.get('open_price', 0),
-                    'previous_close': 0,
+                    'previous_close': info.get('previous_close', 0),
                     'short_name': '',
                 }
             elif info:
-                # Fill in zeros from WS with download data
                 ws = self._ws_extra_info[symbol]
                 if not ws.get('day_high'):
                     ws['day_high'] = info.get('day_high', 0)
@@ -10976,11 +11837,36 @@ class PairsTradingTerminal(QMainWindow):
                     ws['day_volume'] = info.get('day_volume', 0)
                 if not ws.get('open_price'):
                     ws['open_price'] = info.get('open_price', 0)
+                if not ws.get('previous_close'):
+                    ws['previous_close'] = info.get('previous_close', 0)
 
-        print(f"[Intraday] Seeded OHLC charts for {count} instruments")
+            # Uppdatera treemap-tiles för instrument utan WS-data
+            if info and symbol in self.MARKET_INSTRUMENTS:
+                close_price = info.get('close_price', 0)
+                change_pct = info.get('change_pct', 0)
+                cached = self._market_data_cache.get(symbol, {})
+                # Bara uppdatera om WS inte redan gett oss riktiga värden
+                if close_price > 0 and not cached.get('price'):
+                    name, market = self.MARKET_INSTRUMENTS[symbol]
+                    prev_close = info.get('previous_close', 0)
+                    change = close_price - prev_close if prev_close > 0 else 0
+                    self._market_data_cache[symbol] = {
+                        'symbol': symbol, 'name': name, 'market': market,
+                        'price': close_price,
+                        'change': round(change, 4),
+                        'change_pct': change_pct,
+                    }
+                    updates_js[symbol] = {
+                        'price': close_price,
+                        'change': round(change, 4),
+                        'change_pct': change_pct,
+                    }
 
-        # Push all intraday data to JS immediately
-        if count > 0 and hasattr(self, 'map_widget'):
+        print(f"[Intraday] Seeded OHLC charts for {count} instruments, "
+              f"tile updates for {len(updates_js)} (closed/no-WS)")
+
+        # Skicka allt till JS: OHLC-charts + ws_info + tile-uppdateringar
+        if (count > 0 or updates_js) and hasattr(self, 'map_widget'):
             intraday_js = {}
             ws_info_js = {}
             for symbol in data:
@@ -10989,9 +11875,30 @@ class PairsTradingTerminal(QMainWindow):
                     intraday_js[symbol] = ohlc
                 if symbol in self._ws_extra_info:
                     ws_info_js[symbol] = self._ws_extra_info[symbol]
-            payload = json.dumps({'updates': {}, 'intraday': intraday_js, 'ws_info': ws_info_js})
+            payload = json.dumps({
+                'updates': updates_js,
+                'intraday': intraday_js,
+                'ws_info': ws_info_js,
+            })
             js = f'if(window.updatePrices)window.updatePrices({payload});'
             self.map_widget.page().runJavaScript(js)
+
+        # Retry om vi fick data för mindre än 50% av tickrarna
+        total_tickers = len(self.MARKET_INSTRUMENTS)
+        if count < total_tickers * 0.5 and self._intraday_retry_count < self._intraday_max_retries:
+            self._intraday_retry_count += 1
+            delay = self._intraday_retry_count * 15000  # 15s, 30s, 45s
+            print(f"[Intraday] Only {count}/{total_tickers} tickers — retry {self._intraday_retry_count}/{self._intraday_max_retries} in {delay//1000}s")
+            QTimer.singleShot(delay, self._fetch_intraday_ohlc)
+
+    def _on_intraday_ohlc_error(self, error_msg: str):
+        """Handle intraday OHLC error — retry med backoff."""
+        print(f"[Intraday] Error: {error_msg}")
+        if self._intraday_retry_count < self._intraday_max_retries:
+            self._intraday_retry_count += 1
+            delay = self._intraday_retry_count * 15000
+            print(f"[Intraday] Retry {self._intraday_retry_count}/{self._intraday_max_retries} in {delay//1000}s")
+            QTimer.singleShot(delay, self._fetch_intraday_ohlc)
 
     def _on_treemap_click(self, ticker: str):
         """Handle treemap tile click — now handled by JS overlay in treemap."""
@@ -10999,6 +11906,13 @@ class PairsTradingTerminal(QMainWindow):
 
     def _on_ws_price_update(self, update: dict):
         """Handle a single live price update from WebSocket."""
+        try:
+            self._on_ws_price_update_inner(update)
+        except Exception as e:
+            print(f"[WS] Price update error for {update.get('symbol', '?')}: {e}")
+
+    def _on_ws_price_update_inner(self, update: dict):
+        """Inner handler — all WS price update logic."""
         symbol = update['symbol']
 
         # Accumulate tick history for intraday charts
@@ -11017,8 +11931,49 @@ class PairsTradingTerminal(QMainWindow):
             'short_name': update.get('short_name', ''),
         }
 
-        # VIX/VVIX live updates to volatility cards
-        if symbol == '^VIX' and hasattr(self, 'vix_card'):
+        # VIX/VVIX live updates med percentilberäkning från cachad historik
+        # (SKEW/MOVE uppdateras enbart via yf.download — inte WebSocket)
+        if symbol in ('^VIX', '^VVIX') and symbol in self._vol_hist_cache:
+            price = update['price']
+            hist = self._vol_hist_cache[symbol]
+            pct = np.searchsorted(hist, price) / len(hist) * 100
+            median = self._vol_median_cache.get(symbol, 0)
+            mode = self._vol_mode_cache.get(symbol, 0)
+            change_pct = update.get('change_pct', 0)
+
+            if symbol == '^VIX':
+                if pct < 10:
+                    desc = "Extreme complacency in markets"
+                elif pct < 25:
+                    desc = "Low fear - calm markets"
+                elif pct < 50:
+                    desc = "Relatively calm conditions"
+                elif pct < 75:
+                    desc = "Slightly elevated uncertainty"
+                elif pct < 90:
+                    desc = "Elevated fear & uncertainty"
+                elif pct < 95:
+                    desc = "Significant market stress"
+                else:
+                    desc = "Extreme fear - crisis levels"
+                self.vix_card.update_data(price, change_pct, pct, median, mode, desc)
+            elif symbol == '^VVIX':
+                if pct < 10:
+                    desc = "Very stable VIX expectations"
+                elif pct < 25:
+                    desc = "Stable VIX outlook"
+                elif pct < 50:
+                    desc = "Below median uncertainty about VIX"
+                elif pct < 75:
+                    desc = "Somewhat uncertain VIX outlook"
+                elif pct < 90:
+                    desc = "Potential for volatility spikes"
+                elif pct < 95:
+                    desc = "VIX itself highly volatile"
+                else:
+                    desc = "Crisis-level VIX uncertainty"
+                self.vvix_card.update_data(price, change_pct, pct, median, mode, desc)
+        elif symbol == '^VIX' and hasattr(self, 'vix_card'):
             self.vix_card.value_label.setText(f"{update['price']:.2f}")
         elif symbol == '^VVIX' and hasattr(self, 'vvix_card'):
             self.vvix_card.value_label.setText(f"{update['price']:.2f}")
@@ -11036,6 +11991,7 @@ class PairsTradingTerminal(QMainWindow):
             cached['change_pct'] = update['change_pct']
             self._ws_cache_dirty = True
             self._ws_changed_symbols.add(symbol)
+
 
     def _render_ws_updates(self):
         """Batch update treemap via JS injection if WebSocket updated prices (every 5s)."""
@@ -11055,9 +12011,9 @@ class PairsTradingTerminal(QMainWindow):
             if symbol in self._market_data_cache:
                 c = self._market_data_cache[symbol]
                 updates[symbol] = {
-                    'price': c.get('price', 0),
-                    'change': c.get('change', 0),
-                    'change_pct': c.get('change_pct', 0),
+                    'price': round(c.get('price', 0), 4),
+                    'change': round(c.get('change', 0), 4),
+                    'change_pct': round(c.get('change_pct', 0), 2),
                 }
             if symbol in self._ws_tick_history:
                 intraday[symbol] = self._build_intraday_ohlc(symbol)
@@ -11161,7 +12117,6 @@ class PairsTradingTerminal(QMainWindow):
             print("[Volatility] Thread started successfully")
         except Exception as e:
             print(f"[Volatility] ERROR creating/starting thread: {e}")
-            import traceback
             traceback.print_exc()
             self._volatility_running = False
     
@@ -11231,11 +12186,16 @@ class PairsTradingTerminal(QMainWindow):
                         
                         # Hämta senaste dagarna för sparkline
                         history = vix_series.tail(SPARKLINE_DAYS).tolist()
-                        
+
                         self.vix_card.update_data(vix_val, vix_chg, vix_pct, median, mode, desc, history=history)
+                        # Cacha sorterad serie för live-percentilberäkning via WebSocket
+                        self._vol_hist_cache['^VIX'] = np.sort(vix_series.values)
+                        self._vol_median_cache['^VIX'] = median
+                        self._vol_mode_cache['^VIX'] = mode
+                        self._vol_sparkline_cache['^VIX'] = history
             except Exception as e:
                 print(f"VIX error: {e}")
-            
+
             # VVIX
             try:
                 if '^VVIX' in close.columns:
@@ -11266,8 +12226,13 @@ class PairsTradingTerminal(QMainWindow):
                         
                         # Hämta senaste dagarna för sparkline
                         history = vvix_series.tail(SPARKLINE_DAYS).tolist()
-         
+
                         self.vvix_card.update_data(vvix_val, vvix_chg, vvix_pct, median, mode, desc, history=history)
+                        # Cacha sorterad serie för live-percentilberäkning via WebSocket
+                        self._vol_hist_cache['^VVIX'] = np.sort(vvix_series.values)
+                        self._vol_median_cache['^VVIX'] = median
+                        self._vol_mode_cache['^VVIX'] = mode
+                        self._vol_sparkline_cache['^VVIX'] = history
                     else:
                         self.vvix_card.value_label.setText("N/A")
                         self.vvix_card.desc_label.setText("No VVIX data available")
@@ -11277,6 +12242,7 @@ class PairsTradingTerminal(QMainWindow):
             
             # SKEW
             try:
+                skew_ok = False
                 if '^SKEW' in close.columns:
                     skew_series = close['^SKEW'].dropna()
                     if len(skew_series) > 0:
@@ -11287,7 +12253,7 @@ class PairsTradingTerminal(QMainWindow):
                         median = skew_series.median()
                         mode_series = skew_series.mode()
                         mode = mode_series.iloc[0] if len(mode_series) > 0 else median
-                        
+
                         if skew_pct < 10:
                             desc = "Very low tail risk pricing"
                         elif skew_pct < 25:
@@ -11302,20 +12268,27 @@ class PairsTradingTerminal(QMainWindow):
                             desc = "Significant crash hedging"
                         else:
                             desc = "Major crash protection demand"
-                        
+
                         # Hämta senaste dagarna för sparkline
                         history = skew_series.tail(SPARKLINE_DAYS).tolist()
 
                         self.skew_card.update_data(skew_val, skew_chg, skew_pct, median, mode, desc, history=history)
-                    else:
-                        self.skew_card.value_label.setText("N/A")
-                        self.skew_card.desc_label.setText("No SKEW data available")
+                        # Cacha sorterad serie för live-percentilberäkning via WebSocket
+                        self._vol_hist_cache['^SKEW'] = np.sort(skew_series.values)
+                        self._vol_median_cache['^SKEW'] = median
+                        self._vol_mode_cache['^SKEW'] = mode
+                        self._vol_sparkline_cache['^SKEW'] = history
+                        skew_ok = True
+                # Fallback: använd cachad data om yfinance inte returnerade SKEW
+                if not skew_ok:
+                    self._apply_vol_card_fallback('^SKEW', self.skew_card)
             except Exception as e:
                 print(f"SKEW error: {e}")
-                self.skew_card.value_label.setText("Error")
+                self._apply_vol_card_fallback('^SKEW', self.skew_card)
             
             # MOVE (Bond Market Volatility)
             try:
+                move_ok = False
                 if '^MOVE' in close.columns:
                     move_series = close['^MOVE'].dropna()
                     if len(move_series) > 0:
@@ -11326,7 +12299,7 @@ class PairsTradingTerminal(QMainWindow):
                         median = move_series.median()
                         mode_series = move_series.mode()
                         mode = mode_series.iloc[0] if len(mode_series) > 0 else median
-                        
+
                         if move_pct < 10:
                             desc = "Low rate volatility"
                         elif move_pct < 25:
@@ -11341,24 +12314,35 @@ class PairsTradingTerminal(QMainWindow):
                             desc = "Major rate movements expected"
                         else:
                             desc = "Crisis-level rate uncertainty"
-                        
+
                         # Hämta senaste dagarna för sparkline
                         history = move_series.tail(SPARKLINE_DAYS).tolist()
 
                         self.move_card.update_data(move_val, move_chg, move_pct, median, mode, desc, history=history)
-                    else:
-                        self.move_card.value_label.setText("N/A")
-                        self.move_card.desc_label.setText("No MOVE data available")
+                        # Cacha sorterad serie för live-percentilberäkning via WebSocket
+                        self._vol_hist_cache['^MOVE'] = np.sort(move_series.values)
+                        self._vol_median_cache['^MOVE'] = median
+                        self._vol_mode_cache['^MOVE'] = mode
+                        self._vol_sparkline_cache['^MOVE'] = history
+                        move_ok = True
+                # Fallback: använd cachad data om yfinance inte returnerade MOVE
+                if not move_ok:
+                    self._apply_vol_card_fallback('^MOVE', self.move_card)
             except Exception as e:
                 print(f"MOVE error: {e}")
-                self.move_card.value_label.setText("Error")
+                self._apply_vol_card_fallback('^MOVE', self.move_card)
             
+            # Spara percentildata till disk (laddas vid nästa uppstart istället för yf.download)
+            if self._vol_hist_cache:
+                save_volatility_cache(
+                    self._vol_hist_cache, self._vol_median_cache,
+                    self._vol_mode_cache, self._vol_sparkline_cache)
+
             self.last_updated_label.setText(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             self.statusBar().showMessage("Volatility data updated")
-                
+
         except Exception as e:
             print(f"Volatility data UI error: {e}")
-            import traceback
             traceback.print_exc()
     
     def _on_volatility_data_error(self, error: str):
@@ -11394,16 +12378,29 @@ class PairsTradingTerminal(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
+        # Map window preset to robustness_windows list
+        window_presets = {
+            "Standard (500-2000)": [500, 750, 1000, 1250, 1500, 1750, 2000],
+            "Quick (750-1500)": [750, 1000, 1250, 1500],
+            "Extended (500-2500)": [500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500],
+        }
+        preset = self.lookback_combo.currentText()
+        windows = window_presets.get(preset, [500, 750, 1000, 1250, 1500, 1750, 2000])
+        max_pts = max(windows) + 500 if windows else 2500
+
         config = {
-            'lookback_period': self.lookback_combo.currentText(),
+            'lookback_period': 'max',
             'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
             'min_correlation': 0.70,
+            'robustness_windows': windows,
+            'min_windows_passed': 4,
+            'max_data_points': max_pts,
         }
-        
+
         self.worker_thread = QThread()
-        self.worker = AnalysisWorker(tickers, config['lookback_period'], config)
+        self.worker = AnalysisWorker(tickers, 'max', config)
         self.worker.moveToThread(self.worker_thread)
         
         self.worker_thread.started.connect(self.worker.run)
@@ -11476,11 +12473,13 @@ class PairsTradingTerminal(QMainWindow):
         
         self.statusBar().showMessage(f"Analysis complete: {n_viable} viable pairs found")
         
-        # If this was a scheduled scan, send Discord and reset
+        # If this was a scheduled scan, send Discord and refresh volatility cache
         if self._is_scheduled_scan:
             self._is_scheduled_scan = False
             self._scheduled_scan_running = False
             self.send_scan_results_to_discord()
+            # Uppdatera volatilitets-percentilcache (daglig refresh)
+            QTimer.singleShot(5000, self._start_volatility_refresh_safe)
             self.statusBar().showMessage("Scheduled scan complete - results sent to Discord")
     
     def _update_metric_value(self, frame: Optional[QFrame], value: str):
@@ -11525,9 +12524,12 @@ class PairsTradingTerminal(QMainWindow):
             return
         
         df = self.engine.viable_pairs
+        # Sort by robustness_score descending
+        if 'robustness_score' in df.columns:
+            df = df.sort_values('robustness_score', ascending=False)
         if hasattr(self, 'viable_count_label'):
             self.viable_count_label.setText(f"({len(df)})")
-        
+
         # Fix #1: Disable updates during batch operations
         self.viable_table.setUpdatesEnabled(False)
         try:
@@ -11535,23 +12537,65 @@ class PairsTradingTerminal(QMainWindow):
             # Fix #5: Use itertuples instead of iterrows (10-100x faster)
             for i, row in enumerate(df.itertuples()):
                 self.viable_table.setItem(i, 0, QTableWidgetItem(row.pair))
-                self.viable_table.setItem(i, 1, QTableWidgetItem(f"{row.half_life_days:.2f}"))
-                self.viable_table.setItem(i, 2, QTableWidgetItem(f"{row.eg_pvalue:.4f}"))
-                self.viable_table.setItem(i, 3, QTableWidgetItem(f"{row.johansen_trace:.2f}"))
-                self.viable_table.setItem(i, 4, QTableWidgetItem(f"{row.hurst_exponent:.2f}"))
-                self.viable_table.setItem(i, 5, QTableWidgetItem(f"{row.correlation:.2f}"))
+                # Z-Score from shortest passing window
+                try:
+                    _, _, z_val = self.engine.get_pair_ou_params(row.pair, use_raw_data=True)
+                    z_item = QTableWidgetItem(f"{z_val:+.2f}")
+                    if abs(z_val) >= SIGNAL_TAB_THRESHOLD:
+                        z_item.setForeground(QColor(COLORS['positive'] if z_val < 0 else COLORS['negative']))
+                        z_item.setBackground(QColor(COLORS['positive_bg'] if z_val < 0 else COLORS['negative_bg']))
+                    self.viable_table.setItem(i, 1, z_item)
+                except Exception:
+                    self.viable_table.setItem(i, 1, QTableWidgetItem("-"))
+                self.viable_table.setItem(i, 2, QTableWidgetItem(f"{row.half_life_days:.2f}"))
+                self.viable_table.setItem(i, 3, QTableWidgetItem(f"{row.eg_pvalue:.4f}"))
+                self.viable_table.setItem(i, 4, QTableWidgetItem(f"{row.johansen_trace:.2f}"))
+                self.viable_table.setItem(i, 5, QTableWidgetItem(f"{row.hurst_exponent:.2f}"))
+                self.viable_table.setItem(i, 6, QTableWidgetItem(f"{row.correlation:.2f}"))
+                # Robustness score — colored dots + text
+                wp = getattr(row, 'windows_passed', 0)
+                wt = getattr(row, 'windows_tested', 0)
+                pair_name = row.pair
+                window_details = self.engine.get_window_details(pair_name) if self.engine else []
+                rob_widget = QWidget()
+                rob_layout = QHBoxLayout(rob_widget)
+                rob_layout.setContentsMargins(6, 0, 6, 0)
+                rob_layout.setSpacing(3)
+                if window_details:
+                    for wd in window_details:
+                        dot = QLabel()
+                        dot.setFixedSize(10, 10)
+                        passed = wd.get('passed', False)
+                        color = COLORS['positive'] if passed else COLORS['negative']
+                        dot.setStyleSheet(
+                            f"background-color: {color}; border-radius: 5px; border: none;")
+                        ws = wd.get('window_size', '?')
+                        status = "PASS" if passed else "FAIL"
+                        failed_at = wd.get('failed_at', '')
+                        tip = f"Window {ws}: {status}"
+                        if failed_at:
+                            tip += f" (failed at {failed_at})"
+                        dot.setToolTip(tip)
+                        rob_layout.addWidget(dot)
+                rob_label = QLabel(f"{wp}/{wt}" if wt > 0 else "N/A")
+                rob_label.setStyleSheet(
+                    f"color: {COLORS['text_secondary']}; font-size: 11px; "
+                    f"background: transparent; border: none; margin-left: 4px;")
+                rob_layout.addWidget(rob_label)
+                rob_layout.addStretch()
+                self.viable_table.setCellWidget(i, 7, rob_widget)
                 # Kalman diagnostics
                 ks = getattr(row, 'kalman_stability', None)
-                self.viable_table.setItem(i, 6, QTableWidgetItem(
+                self.viable_table.setItem(i, 8, QTableWidgetItem(
                     f"{ks:.2f}" if ks is not None else "N/A"))
                 ir = getattr(row, 'kalman_innovation_ratio', None)
-                self.viable_table.setItem(i, 7, QTableWidgetItem(
+                self.viable_table.setItem(i, 9, QTableWidgetItem(
                     f"{ir:.2f}" if ir is not None else "N/A"))
                 rs = getattr(row, 'kalman_regime_score', None)
-                self.viable_table.setItem(i, 8, QTableWidgetItem(
+                self.viable_table.setItem(i, 10, QTableWidgetItem(
                     f"{rs:.2f}" if rs is not None else "N/A"))
                 ts = getattr(row, 'kalman_theta_significant', None)
-                self.viable_table.setItem(i, 9, QTableWidgetItem(
+                self.viable_table.setItem(i, 11, QTableWidgetItem(
                     "Yes" if ts else ("No" if ts is not None else "N/A")))
         finally:
             self.viable_table.setUpdatesEnabled(True)
@@ -11595,15 +12639,78 @@ class PairsTradingTerminal(QMainWindow):
             self.all_pairs_btn.setText(self.all_pairs_btn.text().replace("▲", "▼"))
     
     def on_viable_pair_selected(self):
-        """Handle viable pair selection."""
-        selected = self.viable_table.selectedItems()
-        if selected:
-            pair = self.viable_table.item(selected[0].row(), 0).text()
-            self.selected_pair = pair
+        """Legacy — redirects to single-click handler."""
+        self._on_scanner_pair_clicked()
 
-            # Switch to OU tab first (triggers lazy load if needed), then select pair
-            self.tabs.setCurrentIndex(2)
-            self.ou_pair_combo.setCurrentText(pair)
+    def _on_scanner_pair_clicked(self):
+        """Single-click: show window breakdown panel inline."""
+        selected = self.viable_table.selectedItems()
+        if not selected:
+            self.window_detail_frame.setVisible(False)
+            return
+        row_idx = selected[0].row()
+        pair_item = self.viable_table.item(row_idx, 0)
+        if pair_item is None:
+            return
+        pair = pair_item.text()
+        self.selected_pair = pair
+
+        # Populate window breakdown panel
+        details = self.engine.get_window_details(pair) if self.engine else []
+        self.window_detail_header.setText(f"WINDOW BREAKDOWN — {pair}")
+        self.window_detail_table.setRowCount(len(details))
+        for i, wd in enumerate(details):
+            passed = wd.get('passed', False)
+            bg = "rgba(34, 197, 94, 0.10)" if passed else "rgba(239, 68, 68, 0.10)"
+            status_color = COLORS['positive'] if passed else COLORS['negative']
+
+            def _item(text, color=None):
+                item = QTableWidgetItem(str(text))
+                if color:
+                    item.setForeground(QColor(color))
+                item.setBackground(QColor(bg))
+                return item
+
+            self.window_detail_table.setItem(i, 0, _item(wd.get('window_size', '?')))
+            self.window_detail_table.setItem(i, 1, _item(
+                "PASS" if passed else "FAIL", status_color))
+            hl = wd.get('half_life_days')
+            self.window_detail_table.setItem(i, 2, _item(
+                f"{hl:.1f}" if hl is not None else "-"))
+            eg = wd.get('eg_pvalue')
+            self.window_detail_table.setItem(i, 3, _item(
+                f"{eg:.4f}" if eg is not None else "-"))
+            jt = wd.get('johansen_trace')
+            self.window_detail_table.setItem(i, 4, _item(
+                f"{jt:.1f}" if jt is not None else "-"))
+            h = wd.get('hurst_exponent')
+            self.window_detail_table.setItem(i, 5, _item(
+                f"{h:.3f}" if h is not None else "-"))
+            c = wd.get('correlation')
+            self.window_detail_table.setItem(i, 6, _item(
+                f"{c:.3f}" if c is not None else "-"))
+            ks = wd.get('kalman_stability')
+            self.window_detail_table.setItem(i, 7, _item(
+                f"{ks:.3f}" if ks is not None else "-"))
+            fa = wd.get('failed_at', '')
+            self.window_detail_table.setItem(i, 8, _item(
+                fa if fa else "", COLORS['warning'] if fa else None))
+
+        self.window_detail_frame.setVisible(len(details) > 0)
+
+    def _on_scanner_pair_double_clicked(self):
+        """Double-click: navigate to OU Analytics tab."""
+        selected = self.viable_table.selectedItems()
+        if not selected:
+            return
+        pair_item = self.viable_table.item(selected[0].row(), 0)
+        if pair_item is None:
+            return
+        pair = pair_item.text()
+        self.selected_pair = pair
+        # Switch to OU tab first (triggers lazy load if needed), then select pair
+        self.tabs.setCurrentIndex(2)
+        self.ou_pair_combo.setCurrentText(pair)
     
     def update_ou_pair_list(self):
         """Update OU analytics pair dropdown.
@@ -11643,15 +12750,15 @@ class PairsTradingTerminal(QMainWindow):
         """Handle OU pair selection change."""
         if not pair or self.engine is None:
             return
-        
+
         self.selected_pair = pair
         self.update_ou_display(pair)
-    
+
     def update_ou_display(self, pair: str):
         """Update OU analytics display for selected pair."""
         if self.engine is None:
             return
-        
+
         try:
             ou, spread, z = self.engine.get_pair_ou_params(pair, use_raw_data=True)
             
@@ -11754,70 +12861,105 @@ class PairsTradingTerminal(QMainWindow):
             
             # Y only (100%)
             y_color = "#00c853" if delta_y_full > 0 else "#ff1744"
-            self.exp_y_only_card.set_title(f"{y_ticker} (100% of the move)")
+            self.exp_y_only_card.set_title(f"{display_ticker(y_ticker)} (100% of the move)")
             self.exp_y_only_card.set_value(f"{delta_y_full:+.2f} ({delta_y_full_pct:+.2f}%)", y_color)
-            
+
             # X only (100%)
             x_color = "#00c853" if delta_x_full > 0 else "#ff1744"
-            self.exp_x_only_card.set_title(f"{x_ticker} (100% of the move)")
+            self.exp_x_only_card.set_title(f"{display_ticker(x_ticker)} (100% of the move)")
             self.exp_x_only_card.set_value(f"{delta_x_full:+.2f} ({delta_x_full_pct:+.2f}%)", x_color)
-            
-            # Y half (50%)
-            y_half_color = "#00c853" if delta_y_half > 0 else "#ff1744"
-            self.exp_y_half_card.set_title(f"{y_ticker} (50% of the move)")
-            self.exp_y_half_card.set_value(f"{delta_y_half:+.2f} ({delta_y_half_pct:+.2f}%)", y_half_color)
-            
-            # X half (50%)
-            x_half_color = "#00c853" if delta_x_half > 0 else "#ff1744"
-            self.exp_x_half_card.set_title(f"{x_ticker} (50% of the move)")
-            self.exp_x_half_card.set_value(f"{delta_x_half:+.2f} ({delta_x_half_pct:+.2f}%)", x_half_color)
-            
+           
+            # Update window robustness section
+            self._update_window_robustness(pair, pair_stats)
+
             # Update charts
             if ensure_pyqtgraph():
                 self.update_ou_charts(pair, ou, spread, z, pair_stats)
-                
+
         except Exception as e:
             print(f"OU display error: {e}")
-    
+
+    def _update_window_robustness(self, pair: str, pair_stats):
+        """Update the WINDOW ROBUSTNESS section in the OU analytics left panel."""
+        try:
+            # Update robustness score card
+            wp = pair_stats.get('windows_passed', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'windows_passed', 0)
+            wt = pair_stats.get('windows_tested', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'windows_tested', 0)
+            if wt > 0:
+                pct = wp / wt * 100
+                score_text = f"{wp}/{wt} ({pct:.0f}%)"
+                if pct >= 70:
+                    score_color = "#00c853"
+                elif pct >= 50:
+                    score_color = "#ffc107"
+                else:
+                    score_color = "#ff1744"
+            else:
+                score_text = "N/A"
+                score_color = COLORS['text_muted']
+            self.ou_robustness_card.set_value(score_text, score_color)
+
+            details = self.engine.get_window_details(pair) if self.engine else []
+
+            # Clear old window rows
+            while self.ou_window_container_layout.count():
+                child = self.ou_window_container_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+            # Add new window rows
+            for wd in details:
+                row = WindowResultRow(wd)
+                self.ou_window_container_layout.addWidget(row)
+        except Exception as e:
+            print(f"Window robustness update error: {e}")
+
     def update_ou_charts(self, pair: str, ou, spread: pd.Series, z: float, pair_stats):
         """Update OU analytics charts with dates, crosshairs, and synchronized zoom."""
         tickers = pair.split('/')
         if len(tickers) != 2:
             return
-        
+
         y_ticker, x_ticker = tickers
         hedge_ratio = pair_stats['hedge_ratio']
         intercept = pair_stats.get('intercept', 0)
-        
+
+        # Align price data to spread's date range so both charts use same x-axis
         prices = self.engine.price_data[[y_ticker, x_ticker]].dropna()
+        common_dates = prices.index.intersection(spread.index)
+        if len(common_dates) == 0:
+            return
+        prices = prices.loc[common_dates]
+        spread = spread.loc[common_dates]
+
         x_axis = np.arange(len(prices))
         dates = prices.index  # DatetimeIndex for display
-        
+
         # ===== UPDATE DATE AXES =====
         if hasattr(self, 'ou_price_date_axis'):
             self.ou_price_date_axis.set_dates(dates)
         if hasattr(self, 'ou_zscore_date_axis'):
             self.ou_zscore_date_axis.set_dates(dates)
-        
+
         # ===== PRICE COMPARISON =====
         self.ou_price_plot.clear()
         self.ou_price_plot.addLegend()
         y_series = prices[y_ticker].values
         x_adjusted = (hedge_ratio * prices[x_ticker] + intercept).values
-        self.ou_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{y_ticker} (Y)")
-        self.ou_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{x_ticker} + α")
-        
+        self.ou_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{display_ticker(y_ticker)} (Y)")
+        self.ou_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{display_ticker(x_ticker)} + α")
+
         # ===== SPREAD with μ and ±2σ BANDS =====
         self.ou_zscore_plot.clear()
-        
+
         spread_values = spread.values
-        
+
         # Use Kalman time-varying μ and σ if available
         kalman = getattr(ou, '_kalman', None)
         if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
             mu_hist = kalman.mu_history
             std_hist = kalman.eq_std_history
-            
+
             # Pad front to align with x_axis (Kalman history has n-1 points)
             n_pad = len(x_axis) - len(mu_hist)
             if n_pad > 0:
@@ -11826,10 +12968,10 @@ class PairsTradingTerminal(QMainWindow):
             else:
                 mu_vals = mu_hist[-len(x_axis):]
                 std_vals = std_hist[-len(x_axis):]
-            
+
             upper_2 = mu_vals + 2 * std_vals
             lower_2 = mu_vals - 2 * std_vals
-            
+
             # Plot ±2σ band as fill
             try:
                 upper_curve = self.ou_zscore_plot.plot(x_axis, upper_2, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
@@ -11838,7 +12980,7 @@ class PairsTradingTerminal(QMainWindow):
                 self.ou_zscore_plot.addItem(fill)
             except Exception:
                 pass
-            
+
             # Plot μ line
             self.ou_zscore_plot.plot(x_axis, mu_vals, pen=pg.mkPen('#ffffff', width=1), name='μ')
         else:
@@ -11848,10 +12990,10 @@ class PairsTradingTerminal(QMainWindow):
             self.ou_zscore_plot.addLine(y=mu_val, pen=pg.mkPen('#ffffff', width=1))
             self.ou_zscore_plot.addLine(y=mu_val + 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
             self.ou_zscore_plot.addLine(y=mu_val - 2*eq_std_val, pen=pg.mkPen('#ffffff', width=1, style=Qt.DashLine))
-        
+
         # Plot the raw spread
         self.ou_zscore_plot.plot(x_axis, spread_values, pen=pg.mkPen('#00e5ff', width=2), name='Spread')
-        
+
         # Keep zscore Series for crosshair (show spread value on hover)
         zscore = spread
         
@@ -11875,7 +13017,7 @@ class PairsTradingTerminal(QMainWindow):
             self.price_crosshair = CrosshairManager(
                 self.ou_price_plot, 
                 dates=dates,
-                data_series={y_ticker: y_series, f"β·{x_ticker}+α": x_adjusted},
+                data_series={display_ticker(y_ticker): y_series, f"β·{display_ticker(x_ticker)}+α": x_adjusted},
                 label_format="{:.2f}"
             )
             
@@ -11943,15 +13085,15 @@ class PairsTradingTerminal(QMainWindow):
         for row in self.engine.viable_pairs.itertuples():
             try:
                 ou, spread, z = self.engine.get_pair_ou_params(row.pair, use_raw_data=True)
-                
+
                 # Re-check viability with CURRENT Kalman half-life
                 current_hl = ou.half_life_days()
                 if not (min_hl <= current_hl <= max_hl):
                     continue
-                
+
                 if abs(z) >= SIGNAL_TAB_THRESHOLD:
                     signals.append((row.pair, z))
-            except:
+            except (ValueError, KeyError, Exception):
                 pass
         
         self.signal_count_label.setText(f"⚡ {len(signals)} viable pairs with |Z| ≥ {SIGNAL_TAB_THRESHOLD}")
@@ -11995,9 +13137,9 @@ class PairsTradingTerminal(QMainWindow):
             if len(tickers) == 2:
                 y_ticker, x_ticker = tickers
                 if hasattr(self, 'lev_y_label'):
-                    self.lev_y_label.setText(f"Leverage {y_ticker}")
+                    self.lev_y_label.setText(f"Leverage {display_ticker(y_ticker)}")
                 if hasattr(self, 'lev_x_label'):
-                    self.lev_x_label.setText(f"Leverage {x_ticker}")
+                    self.lev_x_label.setText(f"Leverage {display_ticker(x_ticker)}")
             
             # Update mini-futures FIRST (this sets current_mini_futures)
             self.update_mini_futures(pair, z)
@@ -12028,30 +13170,38 @@ class PairsTradingTerminal(QMainWindow):
             y_ticker, x_ticker = tickers
             hedge_ratio = pair_stats['hedge_ratio']
             intercept = pair_stats.get('intercept', 0)
-            
+
+            # Align price data to spread's date range so both charts
+            # use the same x-axis (consistent with OU Analytics tab)
             prices = self.engine.price_data[[y_ticker, x_ticker]].dropna()
+            common_dates = prices.index.intersection(spread.index)
+            if len(common_dates) == 0:
+                return
+            prices = prices.loc[common_dates]
+            spread = spread.loc[common_dates]
+
             x_axis = np.arange(len(prices))
             dates = prices.index
-            
+
             # Update date axes
             if hasattr(self, 'signal_price_date_axis'):
                 self.signal_price_date_axis.set_dates(dates)
             if hasattr(self, 'signal_zscore_date_axis'):
                 self.signal_zscore_date_axis.set_dates(dates)
-            
+
             # ===== PRICE COMPARISON =====
             self.signal_price_plot.clear()
             self.signal_price_plot.addLegend()
             y_series = prices[y_ticker].values
             x_adjusted = (hedge_ratio * prices[x_ticker] + intercept).values
-            self.signal_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{y_ticker} (Y)")
-            self.signal_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{x_ticker} + α")
-            
+            self.signal_price_plot.plot(x_axis, y_series, pen=pg.mkPen('#d4a574', width=2), name=f"{display_ticker(y_ticker)} (Y)")
+            self.signal_price_plot.plot(x_axis, x_adjusted, pen=pg.mkPen('#2196f3', width=2), name=f"β·{display_ticker(x_ticker)} + α")
+
             # ===== SPREAD with μ and ±2σ BANDS =====
             self.signal_zscore_plot.clear()
-            
+
             spread_values = spread.values
-            
+
             # Use Kalman time-varying μ and σ if available
             kalman = getattr(ou, '_kalman', None)
             if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
@@ -12110,7 +13260,7 @@ class PairsTradingTerminal(QMainWindow):
                 self.signal_price_crosshair = CrosshairManager(
                     self.signal_price_plot, 
                     dates=dates,
-                    data_series={y_ticker: y_series, f"β·{x_ticker}+α": x_adjusted},
+                    data_series={display_ticker(y_ticker): y_series, f"β·{display_ticker(x_ticker)}+α": x_adjusted},
                     label_format="{:.2f}"
                 )
                 
@@ -12129,13 +13279,17 @@ class PairsTradingTerminal(QMainWindow):
             print(f"Signal plot update error: {e}")
     
     def update_mini_futures(self, pair: str, z: float):
-        """Update mini-futures suggestions by scraping Morgan Stanley."""
+        """Update mini-futures suggestions by scraping Morgan Stanley.
+
+        Hämtar ALLA tillgängliga instrument (mini futures + certifikat) och
+        populerar dropdown-menyer så att användaren kan välja instrument.
+        """
         tickers = pair.split('/')
         if len(tickers) != 2:
             return
-        
+
         y_ticker, x_ticker = tickers
-        
+
         # Determine direction for each leg
         # LONG SPREAD = Long Y, Short X
         # SHORT SPREAD = Short Y, Long X
@@ -12145,216 +13299,231 @@ class PairsTradingTerminal(QMainWindow):
         else:  # Short spread
             dir_y, dir_x = 'Short', 'Long'
             direction = 'SHORT'
-        
+
+        # Spara riktningar för _recalculate_mf_position_sizing
+        self._current_dir_y = dir_y
+        self._current_dir_x = dir_x
+        self._current_direction = direction
+
         # VIKTIGT: Rensa BÅDA korten FÖRST innan vi hämtar nya produkter
-        # Detta förhindrar att gamla produkter visas om sökningen misslyckas
         self._clear_mini_future_card('y', y_ticker, dir_y)
         self._clear_mini_future_card('x', x_ticker, dir_x)
         self._clear_mf_position_sizing()
         self.current_mini_futures = {'y': None, 'x': None}
         QApplication.processEvents()
-        
+
         # Load ticker mapping
         ticker_to_ms, ms_to_ticker, ticker_to_ms_asset = load_ticker_mapping(force_reload=True)
-        
+
         if not ticker_to_ms:
-            self.mini_y_ticker.setText(f"{y_ticker} - MAPPING UNAVAILABLE")
-            self.mini_y_name.setText("Ticker mapping file not found")
-            self.mini_y_name.setStyleSheet("color: #888888; font-size: 11px; font-weight: 500; background: transparent;")
+            self.mini_y_ticker.setText(f"{display_ticker(y_ticker)} - MAPPING UNAVAILABLE")
+            self.mini_y_combo.blockSignals(True)
+            self.mini_y_combo.clear()
+            self.mini_y_combo.addItem("Ticker mapping file not found")
+            self.mini_y_combo.blockSignals(False)
             self.mini_y_info.setText("")
-            
-            self.mini_x_ticker.setText(f"{x_ticker} - MAPPING UNAVAILABLE")
-            self.mini_x_name.setText("Ticker mapping file not found")
-            self.mini_x_name.setStyleSheet("color: #888888; font-size: 11px; font-weight: 500; background: transparent;")
+
+            self.mini_x_ticker.setText(f"{display_ticker(x_ticker)} - MAPPING UNAVAILABLE")
+            self.mini_x_combo.blockSignals(True)
+            self.mini_x_combo.clear()
+            self.mini_x_combo.addItem("Ticker mapping file not found")
+            self.mini_x_combo.blockSignals(False)
             self.mini_x_info.setText("")
             self._clear_mf_position_sizing()
             return
-        
-        # Fetch mini futures using DIRECT URL method (10x faster!)
-        # If MS_Asset mapping is available, we fetch directly for each ticker
-        # instead of scraping all ~3000 products
-        self.statusBar().showMessage("Fetching mini futures data from Morgan Stanley...")
+
+        self.statusBar().showMessage("Fetching all instruments from Morgan Stanley...")
         QApplication.processEvents()
-        
-        # Try direct fetch first (fast), fallback to full scrape if needed
-        minifutures_df = None
-        if not ticker_to_ms_asset:
-            # No MS_Asset mapping - fall back to old slow method
-            minifutures_df = scrape_ms_minifutures()
-            if minifutures_df.empty:
-                self.statusBar().showMessage("Could not fetch mini futures data")
-                self._update_mini_future_card_not_found(y_ticker, dir_y, ticker_to_ms, 'y')
-                self._update_mini_future_card_not_found(x_ticker, dir_x, ticker_to_ms, 'x')
-                self._clear_mf_position_sizing()
-                return
-        
-        # Find best mini futures for each leg
-        # Uses direct fetch via MS_Asset if available (fast!) or falls back to minifutures_df
-        mf_y = find_best_minifuture(y_ticker, dir_y, ticker_to_ms, minifutures_df, ticker_to_ms_asset)
-        mf_x = find_best_minifuture(x_ticker, dir_x, ticker_to_ms, minifutures_df, ticker_to_ms_asset)
-        
-        # Store for position sizing
-        self.current_mini_futures = {'y': mf_y, 'x': mf_x}
-        
-        # Update Y ticker card
-        self._update_mini_future_card(y_ticker, dir_y, mf_y, ticker_to_ms, 'y')
-        
-        # Update X ticker card
-        self._update_mini_future_card(x_ticker, dir_x, mf_x, ticker_to_ms, 'x')
-        
-        # Calculate and display position sizing
-        self._update_mf_position_sizing(pair, y_ticker, x_ticker, dir_y, dir_x, mf_y, mf_x, direction)
-        
-        self.statusBar().showMessage("Mini futures data loaded")
+
+        # Hämta ALLA instrument för varje ben (alla typer)
+        all_instruments_y = fetch_all_instruments_for_ticker(y_ticker, dir_y, ticker_to_ms, ticker_to_ms_asset)
+        all_instruments_x = fetch_all_instruments_for_ticker(x_ticker, dir_x, ticker_to_ms, ticker_to_ms_asset)
+
+        # Spara ofiltrerade listor + mapping för produkttyp-toggle
+        self._all_instruments_y = all_instruments_y
+        self._all_instruments_x = all_instruments_x
+        self._last_ticker_to_ms = ticker_to_ms
+
+        # Räkna antal per typ och uppdatera knappar per ben
+        n_mini_y = sum(1 for i in all_instruments_y if i.get('product_type') != 'Certificate')
+        n_cert_y = sum(1 for i in all_instruments_y if i.get('product_type') == 'Certificate')
+        n_mini_x = sum(1 for i in all_instruments_x if i.get('product_type') != 'Certificate')
+        n_cert_x = sum(1 for i in all_instruments_x if i.get('product_type') == 'Certificate')
+        self.btn_mini_y.setText(f"Mini ({n_mini_y})")
+        self.btn_cert_y.setText(f"Cert ({n_cert_y})")
+        self.btn_mini_x.setText(f"Mini ({n_mini_x})")
+        self.btn_cert_x.setText(f"Cert ({n_cert_x})")
+
+        # Auto-välj produkttyp per ben: om inga mini futures finns, välj cert automatiskt
+        if n_mini_y == 0 and n_cert_y > 0:
+            self._active_product_type_y = 'cert'
+            self.btn_mini_y.setStyleSheet(self._deriv_btn_style_inactive)
+            self.btn_cert_y.setStyleSheet(self._deriv_btn_style_active)
+        else:
+            self._active_product_type_y = 'mini'
+            self.btn_mini_y.setStyleSheet(self._deriv_btn_style_active)
+            self.btn_cert_y.setStyleSheet(self._deriv_btn_style_inactive)
+
+        if n_mini_x == 0 and n_cert_x > 0:
+            self._active_product_type_x = 'cert'
+            self.btn_mini_x.setStyleSheet(self._deriv_btn_style_inactive)
+            self.btn_cert_x.setStyleSheet(self._deriv_btn_style_active)
+        else:
+            self._active_product_type_x = 'mini'
+            self.btn_mini_x.setStyleSheet(self._deriv_btn_style_active)
+            self.btn_cert_x.setStyleSheet(self._deriv_btn_style_inactive)
+
+        # Filtrera per ben baserat på aktiv produkttyp
+        target_y = 'Certificate' if self._active_product_type_y == 'cert' else 'Mini Future'
+        target_x = 'Certificate' if self._active_product_type_x == 'cert' else 'Mini Future'
+        instruments_y = [i for i in all_instruments_y if i.get('product_type', 'Mini Future') == target_y]
+        instruments_x = [i for i in all_instruments_x if i.get('product_type', 'Mini Future') == target_x]
+
+        self._instruments_y = instruments_y
+        self._instruments_x = instruments_x
+
+        # Populera Y-dropdown (utan position sizing-beräkning)
+        self._populate_instrument_combo('y', y_ticker, dir_y, instruments_y, ticker_to_ms)
+
+        # Populera X-dropdown (utan position sizing-beräkning)
+        self._populate_instrument_combo('x', x_ticker, dir_x, instruments_x, ticker_to_ms)
+
+        # Räkna om position sizing EFTER att båda benen är klara
+        self._recalculate_mf_position_sizing()
+
+        self.statusBar().showMessage(
+            f"Loaded {len(all_instruments_y)} instruments for {display_ticker(y_ticker)}, "
+            f"{len(all_instruments_x)} for {display_ticker(x_ticker)}"
+        )
     
-    def _update_mf_position_sizing(self, pair: str, y_ticker: str, x_ticker: str, 
+    def _update_mf_position_sizing(self, pair: str, y_ticker: str, x_ticker: str,
                                     dir_y: str, dir_x: str, mf_y: dict, mf_x: dict, direction: str):
-        """Calculate and display mini futures position sizing with actual allocation tracking."""
+        """Beräkna och visa mini futures position sizing med korrekt exponering."""
         try:
-            # Get hedge ratio
+            # Hämta hedge ratio
             pair_stats = self.engine.viable_pairs[self.engine.viable_pairs['pair'] == pair].iloc[0]
             hedge_ratio = pair_stats['hedge_ratio']
-            
-            # Calculate minimum units via the new auto-minimum function
+            beta = abs(hedge_ratio)
+
+            # Beräkna minimum-enheter via exponeringsbaserad funktion
             min_result = calculate_minifuture_minimum_units(hedge_ratio, mf_y, mf_x, dir_y, dir_x)
 
-            if min_result:
-                # Auto-update notional to match minimum capital requirement
-                min_capital = math.ceil(min_result['total_capital'])
-                self.notional_spin.blockSignals(True)
-                self.notional_spin.setValue(max(min_capital, self.notional_spin.value()))
-                self.notional_spin.blockSignals(False)
+            if not min_result:
+                self._clear_mf_position_sizing()
+                return
+
+            # Hämta priser och hävstång
+            inst_price_y = min_result['price_y']
+            inst_price_x = min_result['price_x']
+            leverage_y = min_result['leverage_y']
+            leverage_x = min_result['leverage_x']
+            exp_per_unit_y = inst_price_y * leverage_y
+            exp_per_unit_x = inst_price_x * leverage_x
+
+            # Auto-uppdatera notional till minst minimum
+            min_capital = math.ceil(min_result['total_capital'])
+            self.notional_spin.blockSignals(True)
+            self.notional_spin.setValue(max(min_capital, self.notional_spin.value()))
+            self.notional_spin.blockSignals(False)
 
             notional = self.notional_spin.value()
 
-            # Calculate position sizing
-            mf_positions = calculate_minifuture_position(notional, hedge_ratio, mf_y, mf_x, direction)
+            # Skala: hitta största X-enheter som ryms inom notional
+            units_y = min_result['units_y']
+            units_x = min_result['units_x']
+            if notional > min_result['total_capital']:
+                ux = units_x
+                while True:
+                    next_x = ux + 1
+                    next_y = max(1, math.ceil(
+                        next_x * exp_per_unit_x / (beta * exp_per_unit_y)
+                    )) if beta > 0 else 1
+                    if next_y * inst_price_y + next_x * inst_price_x > notional:
+                        break
+                    units_x = next_x
+                    units_y = next_y
+                    ux = next_x
 
-            # Store for later use
-            self.current_mf_positions = mf_positions
+            # Beräkna verkliga värden
+            capital_y = units_y * inst_price_y
+            capital_x = units_x * inst_price_x
+            total_capital = capital_y + capital_x
+            exposure_y = units_y * exp_per_unit_y
+            exposure_x = units_x * exp_per_unit_x
+            total_exposure = exposure_y + exposure_x
+            effective_leverage = total_exposure / total_capital if total_capital > 0 else 1.0
 
-            # Use auto-minimum units if available, otherwise fall back
-            if min_result:
-                inst_price_y = min_result['price_y']
-                inst_price_x = min_result['price_x']
-                # Scale units proportionally if notional is above minimum
-                if notional > min_result['total_capital']:
-                    scale = notional / min_result['total_capital']
-                    units_y = max(1, int(min_result['units_y'] * scale))
-                    units_x = max(1, int(min_result['units_x'] * scale))
-                else:
-                    units_y = min_result['units_y']
-                    units_x = min_result['units_x']
-                actual_y = units_y * inst_price_y
-                actual_x = units_x * inst_price_x
-                dev_y = abs(actual_y - mf_positions['capital_y']) / mf_positions['capital_y'] * 100 if mf_positions['capital_y'] > 0 else 0
-                dev_x = abs(actual_x - mf_positions['capital_x']) / mf_positions['capital_x'] * 100 if mf_positions['capital_x'] > 0 else 0
-            else:
-                inst_price_y, units_y, actual_y, dev_y = None, None, None, 0
-                inst_price_x, units_x, actual_x, dev_x = None, None, None, 0
-            
-            # Update Y leg display
+            # Spara för export/annan användning
+            self.current_mf_positions = {
+                'capital_y': capital_y, 'capital_x': capital_x,
+                'total_capital': total_capital,
+                'exposure_y': exposure_y, 'exposure_x': exposure_x,
+                'total_exposure': total_exposure,
+                'leverage_y': leverage_y, 'leverage_x': leverage_x,
+                'effective_leverage': effective_leverage,
+                'units_y': units_y, 'units_x': units_x,
+                'price_y': inst_price_y, 'price_x': inst_price_x,
+            }
+
+            # ── Y-ben ──
             action_y = "LONG POSITION:" if dir_y == "Long" else "SHORT POSITION:"
             color_y = "#00c853" if dir_y == "Long" else "#ff1744"
-            
+
             if mf_y:
-                self.mf_pos_y_action.setText(f"{action_y} {y_ticker}")
+                self.mf_pos_y_action.setText(f"{action_y} {display_ticker(y_ticker)}")
                 self.mf_pos_y_action.setStyleSheet(f"color: {color_y}; font-size: 11px; font-weight: 600; background: transparent; border: none;")
-                self.mf_pos_y_capital.setText(f"{mf_positions['capital_y']:,.0f} SEK")
+                self.mf_pos_y_capital.setText(f"{capital_y:,.0f} SEK")
                 self.mf_pos_y_capital.setStyleSheet(f"color: {color_y}; font-size: 20px; font-weight: 600; background: transparent; border: none;")
-                
-                # Show units and actual allocation
-                if units_y and inst_price_y:
-                    self.mf_pos_y_info.setText(f"{units_y} units @ {inst_price_y:.2f} SEK = {actual_y:,.0f} SEK")
-                    if dev_y > 10:
-                        self.mf_pos_y_info.setStyleSheet("color: #ff9800; font-size: 10px; background: transparent; border: none;")
-                    else:
-                        self.mf_pos_y_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
-                else:
-                    self.mf_pos_y_info.setText("capital allocation")
-                    self.mf_pos_y_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
-                    
-                self.mf_pos_y_exposure.setText(f"→ {mf_positions['exposure_y']:,.0f} SEK exposure ({mf_y['leverage']:.2f}x)")
+                self.mf_pos_y_info.setText(f"{units_y} units @ {inst_price_y:.2f} SEK")
+                self.mf_pos_y_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                self.mf_pos_y_exposure.setText(f"\u2192 {exposure_y:,.0f} SEK exposure ({leverage_y:.2f}x)")
             else:
-                self.mf_pos_y_action.setText(f"{y_ticker}")
+                self.mf_pos_y_action.setText(f"{display_ticker(y_ticker)}")
                 self.mf_pos_y_action.setStyleSheet("color: #888888; font-size: 11px; background: transparent; border: none;")
                 self.mf_pos_y_capital.setText("N/A")
                 self.mf_pos_y_capital.setStyleSheet("color: #555555; font-size: 20px; font-weight: 600; background: transparent; border: none;")
                 self.mf_pos_y_info.setText("No mini future available")
                 self.mf_pos_y_exposure.setText("Use regular shares")
-            
-            # Update X leg display
+
+            # ── X-ben ──
             action_x = "LONG POSITION:" if dir_x == "Long" else "SHORT POSITION:"
             color_x = "#00c853" if dir_x == "Long" else "#ff1744"
-            
+
             if mf_x:
-                self.mf_pos_x_action.setText(f"{action_x} {x_ticker}")
+                self.mf_pos_x_action.setText(f"{action_x} {display_ticker(x_ticker)}")
                 self.mf_pos_x_action.setStyleSheet(f"color: {color_x}; font-size: 11px; font-weight: 600; background: transparent; border: none;")
-                self.mf_pos_x_capital.setText(f"{mf_positions['capital_x']:,.0f} SEK")
+                self.mf_pos_x_capital.setText(f"{capital_x:,.0f} SEK")
                 self.mf_pos_x_capital.setStyleSheet(f"color: {color_x}; font-size: 20px; font-weight: 600; background: transparent; border: none;")
-                
-                # Show units and actual allocation
-                if units_x and inst_price_x:
-                    self.mf_pos_x_info.setText(f"{units_x} units @ {inst_price_x:.2f} SEK = {actual_x:,.0f} SEK")
-                    if dev_x > 10:
-                        self.mf_pos_x_info.setStyleSheet("color: #ff9800; font-size: 10px; background: transparent; border: none;")
-                    else:
-                        self.mf_pos_x_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
-                else:
-                    self.mf_pos_x_info.setText("capital allocation")
-                    self.mf_pos_x_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
-                    
-                self.mf_pos_x_exposure.setText(f"→ {mf_positions['exposure_x']:,.0f} SEK exposure ({mf_x['leverage']:.2f}x)")
+                self.mf_pos_x_info.setText(f"{units_x} units @ {inst_price_x:.2f} SEK")
+                self.mf_pos_x_info.setStyleSheet("color: #888888; font-size: 10px; background: transparent; border: none;")
+                self.mf_pos_x_exposure.setText(f"\u2192 {exposure_x:,.0f} SEK exposure ({leverage_x:.2f}x)")
             else:
-                self.mf_pos_x_action.setText(f"{x_ticker}")
+                self.mf_pos_x_action.setText(f"{display_ticker(x_ticker)}")
                 self.mf_pos_x_action.setStyleSheet("color: #888888; font-size: 11px; background: transparent; border: none;")
                 self.mf_pos_x_capital.setText("N/A")
                 self.mf_pos_x_capital.setStyleSheet("color: #555555; font-size: 20px; font-weight: 600; background: transparent; border: none;")
                 self.mf_pos_x_info.setText("No mini future available")
                 self.mf_pos_x_exposure.setText("Use regular shares")
-            
-            # Update total display
-            self.mf_pos_total_capital.setText(f"{mf_positions['total_capital']:,.0f} SEK")
-            notional_ratio = mf_positions.get('notional_ratio', hedge_ratio)
-            self.mf_pos_total_beta.setText(f"β = {hedge_ratio:.4f} | Notional ratio = {notional_ratio:.2f}")
-            self.mf_pos_total_exposure.setText(f"Total exposure: {mf_positions['total_exposure']:,.0f} SEK")
-            self.mf_pos_eff_leverage.setText(f"Effective leverage: {mf_positions['effective_leverage']:.2f}x")
-            
-            # Update info with ACTUAL total allocation (both legs)
-            if mf_y or mf_x:
-                actual_total = (actual_y or 0) + (actual_x or 0)
-                target_total = mf_positions['capital_y'] + mf_positions['capital_x']
-                
-                if actual_total > 0:
-                    total_deviation = abs(actual_total - target_total) / target_total * 100 if target_total > 0 else 0
-                    
-                    # Build detailed breakdown
-                    parts = []
-                    if actual_y:
-                        parts.append(f"Y: {actual_y:,.0f}")
-                    if actual_x:
-                        parts.append(f"X: {actual_x:,.0f}")
-                    breakdown = " + ".join(parts)
-                    
-                    if total_deviation > 15:
-                        info_text = f"⚠️ Actual: {actual_total:,.0f} SEK ({breakdown}) — {total_deviation:.1f}% from target {target_total:,.0f} SEK"
-                    elif total_deviation > 5:
-                        info_text = f"ℹ️ Actual: {actual_total:,.0f} SEK ({breakdown}) — {total_deviation:.1f}% deviation"
-                    else:
-                        info_text = f"✓ Actual: {actual_total:,.0f} SEK ({breakdown}) — within {total_deviation:.1f}% of target"
-                else:
-                    if mf_positions['is_at_minimum']:
-                        info_text = f"ℹ️ Minimum capital: {mf_positions['min_total_capital']:,.0f} SEK (binding: {mf_positions['binding_leg']} leg)"
-                    else:
-                        info_text = f"ℹ️ Target: {target_total:,.0f} SEK (binding: {mf_positions['binding_leg']} leg)"
-                        
-                self.mf_min_cap_label.setText(info_text)
+
+            # ── Totalt ──
+            self.mf_pos_total_capital.setText(f"{total_capital:,.0f} SEK")
+            self.mf_pos_total_beta.setText(f"\u03b2 = {hedge_ratio:.4f}")
+            self.mf_pos_total_exposure.setText(f"Total exposure: {total_exposure:,.0f} SEK")
+            self.mf_pos_eff_leverage.setText(f"Effective leverage: {effective_leverage:.2f}x")
+
+            # Verifiera att faktisk hedge ratio stämmer med target
+            actual_hedge = (units_x * exp_per_unit_x) / (units_y * exp_per_unit_y) if (units_y * exp_per_unit_y) > 0 else 0
+            hedge_dev = abs(actual_hedge - beta) / beta * 100 if beta > 0 else 0
+
+            if hedge_dev > 10:
+                info_text = f"\u26a0\ufe0f Hedge ratio: {actual_hedge:.4f} (target \u03b2={beta:.4f}, {hedge_dev:.1f}% avvikelse)"
             else:
-                self.mf_min_cap_label.setText("ℹ️ No mini futures available for position sizing calculation")
-                
+                info_text = f"\u2713 Hedge ratio: {actual_hedge:.4f} (target \u03b2={beta:.4f})"
+
+            self.mf_min_cap_label.setText(info_text)
+
         except Exception as e:
             print(f"Error calculating MF position sizing: {e}")
-            import traceback
             traceback.print_exc()
             self._clear_mf_position_sizing()
     
@@ -12381,150 +13550,250 @@ class PairsTradingTerminal(QMainWindow):
         
         self.mf_min_cap_label.setText("ℹ️ Position sizing info will appear here")
     
-    def _update_mini_future_card(self, ticker: str, direction: str, mf_data: dict, ticker_to_ms: dict, leg: str):
-        """Update a mini future/certificate card with data."""
+    def _switch_product_type(self, ptype: str, leg: str):
+        """Byt mellan 'mini' och 'cert' för ett specifikt ben (y/x)."""
+        current = self._active_product_type_y if leg == 'y' else self._active_product_type_x
+        if ptype == current:
+            return
+
+        if leg == 'y':
+            self._active_product_type_y = ptype
+            if ptype == 'mini':
+                self.btn_mini_y.setStyleSheet(self._deriv_btn_style_active)
+                self.btn_cert_y.setStyleSheet(self._deriv_btn_style_inactive)
+            else:
+                self.btn_mini_y.setStyleSheet(self._deriv_btn_style_inactive)
+                self.btn_cert_y.setStyleSheet(self._deriv_btn_style_active)
+        else:
+            self._active_product_type_x = ptype
+            if ptype == 'mini':
+                self.btn_mini_x.setStyleSheet(self._deriv_btn_style_active)
+                self.btn_cert_x.setStyleSheet(self._deriv_btn_style_inactive)
+            else:
+                self.btn_mini_x.setStyleSheet(self._deriv_btn_style_inactive)
+                self.btn_cert_x.setStyleSheet(self._deriv_btn_style_active)
+
+        self._repopulate_combo_for_leg(leg)
+
+    def _repopulate_combo_for_leg(self, leg: str):
+        """Filtrera instrument för ett ben baserat på dess aktiva produkttyp."""
+        all_insts = getattr(self, f'_all_instruments_{leg}', None)
+        if all_insts is None:
+            return
+
+        ptype = self._active_product_type_y if leg == 'y' else self._active_product_type_x
+        target_type = 'Certificate' if ptype == 'cert' else 'Mini Future'
+        filtered = [i for i in all_insts if i.get('product_type', 'Mini Future') == target_type]
+
+        if leg == 'y':
+            self._instruments_y = filtered
+        else:
+            self._instruments_x = filtered
+
+        ticker = filtered[0]['ticker'] if filtered else (all_insts[0]['ticker'] if all_insts else '')
+        direction = filtered[0]['direction'] if filtered else (all_insts[0]['direction'] if all_insts else 'Long')
+
+        ticker_to_ms = getattr(self, '_last_ticker_to_ms', {})
+        self._populate_instrument_combo(leg, ticker, direction, filtered, ticker_to_ms)
+
+        self._recalculate_mf_position_sizing()
+
+    def _populate_instrument_combo(self, leg: str, ticker: str, direction: str,
+                                    instruments: list, ticker_to_ms: dict):
+        """Populera instrument-dropdown för ett ben och auto-välj bästa instrument."""
+        combo = self.mini_y_combo if leg == 'y' else self.mini_x_combo
+        ticker_label = self.mini_y_ticker if leg == 'y' else self.mini_x_ticker
+        info_label = self.mini_y_info if leg == 'y' else self.mini_x_info
+        frame = self.mini_y_frame if leg == 'y' else self.mini_x_frame
+
         action = "BUY" if direction == "Long" else "SELL"
         color = "#00c853" if direction == "Long" else "#ff1744"
-        
-        if leg == 'y':
-            ticker_label = self.mini_y_ticker
-            name_label = self.mini_y_name
-            info_label = self.mini_y_info
-            frame = self.mini_y_frame
+        dt = display_ticker(ticker)
+
+        combo.blockSignals(True)
+        combo.clear()
+
+        if not instruments:
+            active_ptype = self._active_product_type_y if leg == 'y' else self._active_product_type_x
+            ptype_name = "certificates" if active_ptype == 'cert' else "mini futures"
+            combo.addItem(f"No {ptype_name} found")
+            ticker_label.setText(f"{dt} - NO {ptype_name.upper()} FOUND")
+            ticker_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+            info_label.setText(f"Searched for: {ticker_to_ms.get(ticker, ticker)} ({direction})")
+            self.current_mini_futures[leg] = None
+            combo.blockSignals(False)
+            return
+
+        for inst in instruments:
+            product_type = inst.get('product_type', 'Mini Future')
+            if product_type == 'Certificate':
+                label = f"{inst['name']} ({inst['leverage']:.0f}x)"
+            else:
+                label = f"{inst['name']} ({inst['leverage']:.2f}x)"
+            combo.addItem(label)
+
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+        best = instruments[0]
+        product_type = best.get('product_type', 'Mini Future')
+        if product_type == 'Certificate':
+            ticker_label.setText(f"{action} {dt} CERTIFICATE {direction.upper()}")
         else:
-            ticker_label = self.mini_x_ticker
-            name_label = self.mini_x_name
-            info_label = self.mini_x_info
-            frame = self.mini_x_frame
-        
-        if mf_data:
-            # Determine product type
-            product_type = mf_data.get('product_type', 'Mini Future')
-            is_certificate = product_type == 'Certificate'
-            
-            # Update ticker label with product type
-            if is_certificate:
-                ticker_label.setText(f"{action} {ticker} BULL/BEAR {direction.upper()}")
-            else:
-                ticker_label.setText(f"{action} {ticker} MINI {direction.upper()}")
-            ticker_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
-            
-            name_label.setText(mf_data['name'])
-            name_label.setStyleSheet("color: #e8e8e8; font-size: 12px; font-weight: 500; background: transparent; border: none;")
-            
-            # Build info text based on product type
-            info_text = f"Underlying: {mf_data['underlying']}\n"
-            
-            if is_certificate:
-                # Certificates don't have financing level
-                info_text += f"Product Type: Bull/Bear Certificate\n"
-                if mf_data.get('spot_price'):
-                    info_text += f"Spot Price: {mf_data['spot_price']:,.2f}\n"
-                daily_lev = mf_data.get('daily_leverage', mf_data.get('leverage', 0))
-                info_text += f"Daily Leverage: {daily_lev:.0f}x"
-            else:
-                # Mini futures have financing level
-                if mf_data.get('financing_level'):
-                    info_text += f"Financing Level: {mf_data['financing_level']:,.2f}\n"
-                if mf_data.get('spot_price'):
-                    info_text += f"Spot Price: {mf_data['spot_price']:,.2f}\n"
-                info_text += f"Leverage: {mf_data['leverage']:.2f}x"
-            
-            info_label.setText(info_text)
-            
-            # Make frame clickable if Avanza link exists
-            if mf_data.get('avanza_link'):
+            ticker_label.setText(f"{action} {dt} MINI {direction.upper()}")
+        ticker_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+
+        self.current_mini_futures[leg] = best
+        self._update_instrument_info(best, leg)
+
+        if best.get('avanza_link'):
+            frame.setCursor(Qt.PointingHandCursor)
+            frame.mousePressEvent = lambda e, url=best['avanza_link']: (
+                QDesktopServices.openUrl(QUrl(url)) and None)
+
+    def _on_instrument_changed(self, index: int, leg: str):
+        """Hantera användarens val av ett annat instrument i dropdown."""
+        try:
+            instruments = self._instruments_y if leg == 'y' else self._instruments_x
+            if not instruments or index < 0 or index >= len(instruments):
+                return
+
+            selected = instruments[index]
+            self.current_mini_futures[leg] = selected
+            self._update_instrument_info(selected, leg)
+
+            # Uppdatera Avanza-klicklänk
+            frame = self.mini_y_frame if leg == 'y' else self.mini_x_frame
+            if selected.get('avanza_link'):
                 frame.setCursor(Qt.PointingHandCursor)
-                frame.setProperty('avanza_link', mf_data['avanza_link'])
-                frame.mousePressEvent = lambda e, url=mf_data['avanza_link']: QDesktopServices.openUrl(QUrl(url))
-                
-                # Add visual hint
-                name_label.setText(f"{mf_data['name']} ↗")
-            
-            frame.setStyleSheet(f"""
-                QFrame#metricCard {{
-                    background-color: #141414;
-                    border: 1px solid {color};
-                    border-radius: 4px;
-                }}
-                QFrame#metricCard:hover {{
-                    background-color: #1a1a1a;
-                    border-color: #ffaa00;
-                }}
-            """)
+                # OBS: lambda får INTE returnera värde — mousePressEvent är void
+                frame.mousePressEvent = lambda e, url=selected['avanza_link']: (
+                    QDesktopServices.openUrl(QUrl(url)) and None)
+
+            # Uppdatera ticker-label med produkttyp
+            ticker_label = self.mini_y_ticker if leg == 'y' else self.mini_x_ticker
+            action = "BUY" if selected['direction'] == "Long" else "SELL"
+            color = "#00c853" if selected['direction'] == "Long" else "#ff1744"
+            product_type = selected.get('product_type', 'Mini Future')
+            dt = display_ticker(selected['ticker'])
+            if product_type == 'Certificate':
+                ticker_label.setText(f"{action} {dt} CERTIFICATE {selected['direction'].upper()}")
+            else:
+                ticker_label.setText(f"{action} {dt} MINI {selected['direction'].upper()}")
+            ticker_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+
+            # Räkna om position sizing
+            self._recalculate_mf_position_sizing()
+        except Exception as e:
+            print(f"[Instrument] Selection error ({leg}): {e}")
+
+    def _update_instrument_info(self, mf_data: dict, leg: str):
+        """Uppdatera info-label med detaljer om valt instrument."""
+        info_label = self.mini_y_info if leg == 'y' else self.mini_x_info
+
+        product_type = mf_data.get('product_type', 'Mini Future')
+        is_certificate = product_type == 'Certificate'
+
+        info_text = f"Underlying: {mf_data['underlying']}\n"
+
+        if is_certificate:
+            info_text += f"Product Type: Bull/Bear Certificate\n"
+            if mf_data.get('spot_price'):
+                info_text += f"Spot Price: {mf_data['spot_price']:,.2f}\n"
+            daily_lev = mf_data.get('daily_leverage', mf_data.get('leverage', 0))
+            info_text += f"Daily Leverage: {daily_lev:.0f}x"
+            if mf_data.get('instrument_price'):
+                info_text += f"\nInstrument Price: {mf_data['instrument_price']:.2f} SEK"
+        else:
+            if mf_data.get('financing_level'):
+                info_text += f"Financing Level: {mf_data['financing_level']:,.2f}\n"
+            if mf_data.get('spot_price'):
+                info_text += f"Spot Price: {mf_data['spot_price']:,.2f}\n"
+            info_text += f"Leverage: {mf_data['leverage']:.2f}x"
+
+        if mf_data.get('isin') and mf_data['isin'] != 'N/A':
+            info_text += f"\nISIN: {mf_data['isin']}"
+
+        info_label.setText(info_text)
+
+    def _recalculate_mf_position_sizing(self):
+        """Räkna om position sizing med aktuellt valda instrument."""
+        if not hasattr(self, 'signal_selected_pair') or self.signal_selected_pair is None:
+            return
+        if not self.current_mini_futures:
+            return
+
+        pair = self.signal_selected_pair
+        tickers = pair.split('/')
+        if len(tickers) != 2:
+            return
+
+        y_ticker, x_ticker = tickers
+        dir_y = getattr(self, '_current_dir_y', 'Long')
+        dir_x = getattr(self, '_current_dir_x', 'Short')
+        direction = getattr(self, '_current_direction', 'LONG')
+
+        mf_y = self.current_mini_futures.get('y')
+        mf_x = self.current_mini_futures.get('x')
+
+        self._update_mf_position_sizing(pair, y_ticker, x_ticker, dir_y, dir_x, mf_y, mf_x, direction)
+
+    def _update_mini_future_card(self, ticker: str, direction: str, mf_data: dict, ticker_to_ms: dict, leg: str):
+        """Update instrument info label (combo is populated separately)."""
+        if mf_data:
+            self._update_instrument_info(mf_data, leg)
         else:
             self._update_mini_future_card_not_found(ticker, direction, ticker_to_ms, leg)
     
     def _clear_mini_future_card(self, leg: str, ticker: str, direction: str):
-        """Clear a mini future card to 'Searching...' state before fetching new data.
-        
-        This prevents stale data from showing if the new search fails.
-        """
+        """Clear a mini future card to 'Searching...' state before fetching new data."""
         action = "BUY" if direction == "Long" else "SELL"
-        
+        dt = display_ticker(ticker)
+
         if leg == 'y':
-            self.mini_y_ticker.setText(f"{action} {ticker} MINI {direction.upper()}")
+            self.mini_y_ticker.setText(f"{action} {dt} MINI {direction.upper()}")
             self.mini_y_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
-            self.mini_y_name.setText("⏳ Searching Morgan Stanley...")
-            self.mini_y_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; font-weight: 500; background: transparent; border: none")
+            self.mini_y_combo.blockSignals(True)
+            self.mini_y_combo.clear()
+            self.mini_y_combo.addItem("Searching Morgan Stanley...")
+            self.mini_y_combo.blockSignals(False)
             self.mini_y_info.setText("")
-            self.mini_y_frame.setStyleSheet(f"""
-                QFrame#metricCard {{
-                    background-color: {COLORS['bg_elevated']};
-                    border: none;
-                    border-radius: 4px;
-                }}
-            """)
-            # Clear click handler
+            self._instruments_y = []
             self.mini_y_frame.setCursor(Qt.ArrowCursor)
             self.mini_y_frame.mousePressEvent = lambda e: None
         else:
-            self.mini_x_ticker.setText(f"{action} {ticker} MINI {direction.upper()}")
+            self.mini_x_ticker.setText(f"{action} {dt} MINI {direction.upper()}")
             self.mini_x_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
-            self.mini_x_name.setText("⏳ Searching Morgan Stanley...")
-            self.mini_x_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; font-weight: 500; background: transparent; border: none")
+            self.mini_x_combo.blockSignals(True)
+            self.mini_x_combo.clear()
+            self.mini_x_combo.addItem("Searching Morgan Stanley...")
+            self.mini_x_combo.blockSignals(False)
             self.mini_x_info.setText("")
-            self.mini_x_frame.setStyleSheet(f"""
-                QFrame#metricCard {{
-                    background-color: {COLORS['bg_elevated']};
-                    border: none;
-                    border-radius: 4px;
-                }}
-            """)
-            # Clear click handler
+            self._instruments_x = []
             self.mini_x_frame.setCursor(Qt.ArrowCursor)
             self.mini_x_frame.mousePressEvent = lambda e: None
     
     def _update_mini_future_card_not_found(self, ticker: str, direction: str, ticker_to_ms: dict, leg: str):
         """Update mini future card when not found."""
         ms_name = ticker_to_ms.get(ticker, ticker)
-        
+        dt = display_ticker(ticker)
+
         if leg == 'y':
-            self.mini_y_ticker.setText(f"{ticker} - NO PRODUCT FOUND")
+            self.mini_y_ticker.setText(f"{dt} - NO PRODUCT FOUND")
             self.mini_y_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent; border: none")
-            self.mini_y_name.setText(f"No mini future or certificate for {ticker}")
-            self.mini_y_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent; border: none")
+            self.mini_y_combo.blockSignals(True)
+            self.mini_y_combo.clear()
+            self.mini_y_combo.addItem(f"No instruments for {dt}")
+            self.mini_y_combo.blockSignals(False)
             self.mini_y_info.setText(f"Searched for: {ms_name} ({direction})")
-            self.mini_y_frame.setStyleSheet(f"""
-                QFrame#metricCard {{
-                    background-color: {COLORS['bg_elevated']};
-                    border: none;
-                    border-radius: 4px;
-                }}
-            """)
         else:
-            self.mini_x_ticker.setText(f"{ticker} - NO PRODUCT FOUND")
+            self.mini_x_ticker.setText(f"{dt} - NO PRODUCT FOUND")
             self.mini_x_ticker.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; background: transparent; border: none")
-            self.mini_x_name.setText(f"No mini future or certificate for {ticker}")
-            self.mini_x_name.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: {TYPOGRAPHY['body_small']}px; font-weight: 500; background: transparent; border: none")
+            self.mini_x_combo.blockSignals(True)
+            self.mini_x_combo.clear()
+            self.mini_x_combo.addItem(f"No instruments for {dt}")
+            self.mini_x_combo.blockSignals(False)
             self.mini_x_info.setText(f"Searched for: {ms_name} ({direction})")
-            self.mini_x_frame.setStyleSheet(f"""
-                QFrame#metricCard {{
-                    background-color: {COLORS['bg_elevated']};
-                    border: none;
-                    border-radius: 4px;
-                }}
-            """)
     
     def update_position_sizing(self):
         """Update position sizing display."""
@@ -12557,13 +13826,13 @@ class PairsTradingTerminal(QMainWindow):
             
             # Always update labels with correct tickers first
             if z < 0:  # Long spread: buy Y, sell X
-                self.buy_action_label.setText(f"BUY {y_ticker}")
-                self.sell_action_label.setText(f"SELL {x_ticker}")
+                self.buy_action_label.setText(f"BUY {display_ticker(y_ticker)}")
+                self.sell_action_label.setText(f"SELL {display_ticker(x_ticker)}")
                 dir_y, dir_x = 'Long', 'Short'
                 direction = 'LONG'
             else:  # Short spread: sell Y, buy X
-                self.sell_action_label.setText(f"SELL {y_ticker}")
-                self.buy_action_label.setText(f"BUY {x_ticker}")
+                self.sell_action_label.setText(f"SELL {display_ticker(y_ticker)}")
+                self.buy_action_label.setText(f"BUY {display_ticker(x_ticker)}")
                 dir_y, dir_x = 'Short', 'Long'
                 direction = 'SHORT'
             
@@ -12688,6 +13957,7 @@ class PairsTradingTerminal(QMainWindow):
                 'mf_exposure_x': self.current_mf_positions.get('exposure_x') if self.current_mf_positions else None,
                 'mf_total_capital': self.current_mf_positions.get('total_capital') if self.current_mf_positions else None,
                 'mf_effective_leverage': self.current_mf_positions.get('effective_leverage') if self.current_mf_positions else None,
+                'window_size': min(pair_stats['passing_windows']) if pair_stats['passing_windows'] else None,
             }
             
             self.portfolio.append(position)
@@ -12701,7 +13971,6 @@ class PairsTradingTerminal(QMainWindow):
             
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to open position:\n{e}")
-            import traceback
             traceback.print_exc()
     
     def update_portfolio_display(self):
@@ -12709,72 +13978,87 @@ class PairsTradingTerminal(QMainWindow):
         # OPTIMERING: Guard för lazy loading - hoppa över om Portfolio-tab inte är laddad
         if not hasattr(self, 'positions_table') or self.positions_table is None:
             return
-        
+
+        # Batch-uppdatering: stäng av repaints under modifiering
+        self.positions_table.setUpdatesEnabled(False)
+        try:
+            self._update_portfolio_display_inner()
+        finally:
+            self.positions_table.setUpdatesEnabled(True)
+
+        # Clean up stale pair monitors and init new ones
+        self._lm_cleanup_stale_pairs()
+
+    def _update_portfolio_display_inner(self):
+        """Inner portfolio display update (called with setUpdatesEnabled=False)."""
         self.positions_table.setRowCount(len(self.portfolio))
-        
+
         # Update summary labels
         open_count = len(self.portfolio)
         closed_count = len(self.trade_history)
-        
+
         self.open_pos_label.setText(f"Open: <span style='color:#22c55e; font-weight:600;'>{open_count}</span>")
         self.closed_pos_label.setText(f"Closed: <span style='color:#888;'>{closed_count}</span>")
-        
+
         # Calculate total P/L
         total_pnl = 0.0
         total_invested = 0.0
-        
+
         for i, pos in enumerate(self.portfolio):
             # PAIR (col 0)
             pair_item = QTableWidgetItem(pos['pair'])
-            pair_item.setForeground(QColor("#e8e8e8"))
+            pair_item.setForeground(_QCOLOR_TEXT)
+            pair_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 0, pair_item)
-            
+
             # DIRECTION (col 1)
             dir_item = QTableWidgetItem(pos['direction'])
-            dir_item.setForeground(QColor("#e8e8e8"))
+            dir_item.setForeground(_QCOLOR_TEXT)
+            dir_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 1, dir_item)
-            
+
             # CURRENT Z (col 2)
             current_z = pos.get('current_z', pos['entry_z'])
             z_item = QTableWidgetItem(f"{current_z:.2f}")
-            z_item.setForeground(QColor("#e8e8e8"))
+            z_item.setForeground(_QCOLOR_TEXT)
+            z_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 2, z_item)
-            
+
             # STATUS (col 3) - Purely dynamic: SELL when z crosses zero toward profit
             direction = pos['direction']
-            
+
             if direction == 'LONG' and current_z > 0:
                 status_text = 'SELL'
-                status_color = '#ffaa00'  # Amber
+                status_qcolor = _QCOLOR_AMBER
             elif direction == 'SHORT' and current_z < 0:
                 status_text = 'SELL'
-                status_color = '#ffaa00'
+                status_qcolor = _QCOLOR_AMBER
             else:
                 status_text = 'OPEN'
-                status_color = '#e8e8e8'
-            
+                status_qcolor = _QCOLOR_TEXT
+
             status_item = QTableWidgetItem(status_text)
-            status_item.setForeground(QColor(status_color))
+            status_item.setForeground(status_qcolor)
+            status_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 3, status_item)
-            
+
             # MINI Y (col 4) - Show NAME (ISIN in tooltip)
             mini_y_isin = pos.get('mini_y_isin', '')
             mini_y_name = pos.get('mini_y_name', '')
             if mini_y_name:
-                # Korta ner namnet om det är för långt
-                display_name = mini_y_name
-                mini_y_item = QTableWidgetItem(display_name)
+                mini_y_item = QTableWidgetItem(mini_y_name)
                 mini_y_item.setToolTip(f"{mini_y_name}\nISIN: {mini_y_isin}")
-                mini_y_item.setForeground(QColor("#e8e8e8"))  # Vit text
+                mini_y_item.setForeground(_QCOLOR_TEXT)
             elif mini_y_isin:
                 mini_y_item = QTableWidgetItem(mini_y_isin[:12])
                 mini_y_item.setToolTip(f"ISIN: {mini_y_isin}")
-                mini_y_item.setForeground(QColor("#e8e8e8"))
+                mini_y_item.setForeground(_QCOLOR_TEXT)
             else:
                 mini_y_item = QTableWidgetItem("-")
-                mini_y_item.setForeground(QColor("#666666"))
+                mini_y_item.setForeground(_QCOLOR_MUTED)
+            mini_y_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 4, mini_y_item)
-            
+
             # ENTRY Y (col 5) - Editable entry price
             entry_y_widget = QDoubleSpinBox()
             entry_y_widget.setRange(0, 1000000)
@@ -12782,91 +14066,59 @@ class PairsTradingTerminal(QMainWindow):
             entry_y_widget.setSingleStep(1.0)
             entry_y_widget.setValue(pos.get('mf_entry_price_y', 0.0))
             entry_y_widget.setFixedHeight(36)
-            entry_y_widget.setStyleSheet("""
-                QDoubleSpinBox {
-                    background: #1a1a1a;
-                    color: #e8e8e8;
-                    border: 1px solid #333;
-                    border-radius: 3px;
-                    padding: 4px 6px;
-                    font-size: 13px;
-                }
-                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                    width: 18px;
-                    background: #252525;
-                    border: none;
-                }
-                QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-                    background: #333;
-                }
-            """)
+            entry_y_widget.setAlignment(Qt.AlignCenter)
+            entry_y_widget.setStyleSheet(_DSPINBOX_STYLESHEET)
             entry_y_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_entry_price(idx, 'y', val))
             self.positions_table.setCellWidget(i, 5, entry_y_widget)
-            
+
             # QTY Y (col 6) - Editable quantity
             qty_y_widget = QSpinBox()
             qty_y_widget.setRange(0, 100000)
             qty_y_widget.setValue(pos.get('mf_qty_y', 0))
             qty_y_widget.setFixedHeight(36)
-            qty_y_widget.setStyleSheet("""
-                QSpinBox {
-                    background: #1a1a1a;
-                    color: #e8e8e8;
-                    border: 1px solid #333;
-                    border-radius: 3px;
-                    padding: 4px 6px;
-                    font-size: 13px;
-                }
-                QSpinBox::up-button, QSpinBox::down-button {
-                    width: 18px;
-                    background: #252525;
-                    border: none;
-                }
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                    background: #333;
-                }
-            """)
+            qty_y_widget.setAlignment(Qt.AlignCenter)
+            qty_y_widget.setStyleSheet(_SPINBOX_STYLESHEET)
             qty_y_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_qty(idx, 'y', val))
             self.positions_table.setCellWidget(i, 6, qty_y_widget)
-            
+
             # P/L Y (col 7) - Calculated P/L for Y leg
             entry_price_y = pos.get('mf_entry_price_y', 0.0)
             current_price_y = pos.get('mf_current_price_y', 0.0)
             qty_y = pos.get('mf_qty_y', 0)
-            
+
             if entry_price_y > 0 and qty_y > 0:
                 pnl_y = (current_price_y - entry_price_y) * qty_y
                 pnl_y_pct = ((current_price_y / entry_price_y) - 1) * 100 if entry_price_y > 0 else 0
                 pnl_y_text = f"{pnl_y:+,.0f} ({pnl_y_pct:+.1f}%)"
-                pnl_y_color = "#22c55e" if pnl_y >= 0 else "#ff1744"
+                pnl_y_qcolor = _QCOLOR_POSITIVE if pnl_y >= 0 else _QCOLOR_NEGATIVE
                 total_pnl += pnl_y
                 total_invested += entry_price_y * qty_y
             else:
                 pnl_y_text = "-"
-                pnl_y_color = "#666666"
-            
+                pnl_y_qcolor = _QCOLOR_MUTED
+
             pnl_y_item = QTableWidgetItem(pnl_y_text)
-            pnl_y_item.setForeground(QColor(pnl_y_color))
+            pnl_y_item.setForeground(pnl_y_qcolor)
+            pnl_y_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 7, pnl_y_item)
-            
+
             # MINI X (col 8) - Show NAME (ISIN in tooltip)
             mini_x_isin = pos.get('mini_x_isin', '')
             mini_x_name = pos.get('mini_x_name', '')
             if mini_x_name:
-                # Korta ner namnet om det är för långt
-                display_name = mini_x_name
-                mini_x_item = QTableWidgetItem(display_name)
+                mini_x_item = QTableWidgetItem(mini_x_name)
                 mini_x_item.setToolTip(f"{mini_x_name}\nISIN: {mini_x_isin}")
-                mini_x_item.setForeground(QColor("#e8e8e8"))  # Vit text
+                mini_x_item.setForeground(_QCOLOR_TEXT)
             elif mini_x_isin:
                 mini_x_item = QTableWidgetItem(mini_x_isin[:12])
                 mini_x_item.setToolTip(f"ISIN: {mini_x_isin}")
-                mini_x_item.setForeground(QColor("#e8e8e8"))
+                mini_x_item.setForeground(_QCOLOR_TEXT)
             else:
                 mini_x_item = QTableWidgetItem("-")
-                mini_x_item.setForeground(QColor("#666666"))
+                mini_x_item.setForeground(_QCOLOR_MUTED)
+            mini_x_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 8, mini_x_item)
-            
+
             # ENTRY X (col 9) - Editable entry price
             entry_x_widget = QDoubleSpinBox()
             entry_x_widget.setRange(0, 1000000)
@@ -12874,73 +14126,42 @@ class PairsTradingTerminal(QMainWindow):
             entry_x_widget.setSingleStep(1.0)
             entry_x_widget.setValue(pos.get('mf_entry_price_x', 0.0))
             entry_x_widget.setFixedHeight(36)
-            entry_x_widget.setStyleSheet("""
-                QDoubleSpinBox {
-                    background: #1a1a1a;
-                    color: #e8e8e8;
-                    border: 1px solid #333;
-                    border-radius: 3px;
-                    padding: 4px 6px;
-                    font-size: 13px;
-                }
-                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                    width: 18px;
-                    background: #252525;
-                    border: none;
-                }
-                QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-                    background: #333;
-                }
-            """)
+            entry_x_widget.setAlignment(Qt.AlignCenter)
+            entry_x_widget.setStyleSheet(_DSPINBOX_STYLESHEET)
             entry_x_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_entry_price(idx, 'x', val))
             self.positions_table.setCellWidget(i, 9, entry_x_widget)
-            
+
             # QTY X (col 10) - Editable quantity
             qty_x_widget = QSpinBox()
             qty_x_widget.setRange(0, 100000)
             qty_x_widget.setValue(pos.get('mf_qty_x', 0))
             qty_x_widget.setFixedHeight(36)
-            qty_x_widget.setStyleSheet("""
-                QSpinBox {
-                    background: #1a1a1a;
-                    color: #e8e8e8;
-                    border: 1px solid #333;
-                    border-radius: 3px;
-                    padding: 4px 6px;
-                    font-size: 13px;
-                }
-                QSpinBox::up-button, QSpinBox::down-button {
-                    width: 18px;
-                    background: #252525;
-                    border: none;
-                }
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                    background: #333;
-                }
-            """)
+            qty_x_widget.setAlignment(Qt.AlignCenter)
+            qty_x_widget.setStyleSheet(_SPINBOX_STYLESHEET)
             qty_x_widget.valueChanged.connect(lambda val, idx=i: self._update_mf_qty(idx, 'x', val))
             self.positions_table.setCellWidget(i, 10, qty_x_widget)
-            
+
             # P/L X (col 11) - Calculated P/L for X leg
             entry_price_x = pos.get('mf_entry_price_x', 0.0)
             current_price_x = pos.get('mf_current_price_x', 0.0)
             qty_x = pos.get('mf_qty_x', 0)
-            
+
             if entry_price_x > 0 and qty_x > 0:
                 pnl_x = (current_price_x - entry_price_x) * qty_x
                 pnl_x_pct = ((current_price_x / entry_price_x) - 1) * 100 if entry_price_x > 0 else 0
                 pnl_x_text = f"{pnl_x:+,.0f} ({pnl_x_pct:+.1f}%)"
-                pnl_x_color = "#22c55e" if pnl_x >= 0 else "#ff1744"
+                pnl_x_qcolor = _QCOLOR_POSITIVE if pnl_x >= 0 else _QCOLOR_NEGATIVE
                 total_pnl += pnl_x
                 total_invested += entry_price_x * qty_x
             else:
                 pnl_x_text = "-"
-                pnl_x_color = "#666666"
-            
+                pnl_x_qcolor = _QCOLOR_MUTED
+
             pnl_x_item = QTableWidgetItem(pnl_x_text)
-            pnl_x_item.setForeground(QColor(pnl_x_color))
+            pnl_x_item.setForeground(pnl_x_qcolor)
+            pnl_x_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 11, pnl_x_item)
-            
+
             # CLOSE button (col 12)
             close_btn = QPushButton("✕")
             close_btn.setStyleSheet("""
@@ -12958,7 +14179,17 @@ class PairsTradingTerminal(QMainWindow):
             """)
             close_btn.clicked.connect(lambda checked, idx=i: self.close_position(idx))
             self.positions_table.setCellWidget(i, 12, close_btn)
-        
+
+            # Z-CHART (col 13) — z-score sparkline from historical data
+            pair = pos['pair']
+            entry_z_val = pos.get('entry_z', pos.get('current_z', 0))
+            self._lm_update_chart(pair, entry_z=entry_z_val,
+                                  entry_date=pos.get('entry_date'),
+                                  window_size=pos.get('window_size'))
+            pd_data = self._lm_pairs.get(pair)
+            if pd_data and pd_data.get('plot_widget'):
+                self.positions_table.setCellWidget(i, 13, pd_data['plot_widget'])
+
         # Update total P/L summary
         if total_invested > 0:
             total_pnl_pct = (total_pnl / total_invested) * 100
@@ -13003,45 +14234,45 @@ class PairsTradingTerminal(QMainWindow):
         """Recalculate P/L for a specific row without full table refresh."""
         if idx < 0 or idx >= len(self.portfolio):
             return
-        
+
         pos = self.portfolio[idx]
-        
+
         # P/L Y
         entry_price_y = pos.get('mf_entry_price_y', 0.0)
         current_price_y = pos.get('mf_current_price_y', 0.0)
         qty_y = pos.get('mf_qty_y', 0)
-        
+
         if entry_price_y > 0 and qty_y > 0 and current_price_y > 0:
             pnl_y = (current_price_y - entry_price_y) * qty_y
             pnl_y_pct = ((current_price_y / entry_price_y) - 1) * 100
             pnl_y_text = f"{pnl_y:+,.0f} ({pnl_y_pct:+.1f}%)"
-            pnl_y_color = "#22c55e" if pnl_y >= 0 else "#ff1744"
+            pnl_y_qcolor = _QCOLOR_POSITIVE if pnl_y >= 0 else _QCOLOR_NEGATIVE
         else:
             pnl_y_text = "-"
-            pnl_y_color = "#666666"
-        
+            pnl_y_qcolor = _QCOLOR_MUTED
+
         pnl_y_item = QTableWidgetItem(pnl_y_text)
-        pnl_y_item.setForeground(QColor(pnl_y_color))
+        pnl_y_item.setForeground(pnl_y_qcolor)
         self.positions_table.setItem(idx, 7, pnl_y_item)
-        
+
         # P/L X
         entry_price_x = pos.get('mf_entry_price_x', 0.0)
         current_price_x = pos.get('mf_current_price_x', 0.0)
         qty_x = pos.get('mf_qty_x', 0)
-        
+
         if entry_price_x > 0 and qty_x > 0 and current_price_x > 0:
             pnl_x = (current_price_x - entry_price_x) * qty_x
             pnl_x_pct = ((current_price_x / entry_price_x) - 1) * 100
             pnl_x_text = f"{pnl_x:+,.0f} ({pnl_x_pct:+.1f}%)"
-            pnl_x_color = "#22c55e" if pnl_x >= 0 else "#ff1744"
+            pnl_x_qcolor = _QCOLOR_POSITIVE if pnl_x >= 0 else _QCOLOR_NEGATIVE
         else:
             pnl_x_text = "-"
-            pnl_x_color = "#666666"
-        
+            pnl_x_qcolor = _QCOLOR_MUTED
+
         pnl_x_item = QTableWidgetItem(pnl_x_text)
-        pnl_x_item.setForeground(QColor(pnl_x_color))
+        pnl_x_item.setForeground(pnl_x_qcolor)
         self.positions_table.setItem(idx, 11, pnl_x_item)
-        
+
         # Update summary
         self._update_total_pnl_summary()
     
@@ -13164,8 +14395,10 @@ class PairsTradingTerminal(QMainWindow):
         for pos in self.portfolio:
             try:
                 pair = pos['pair']
-                ou, spread, current_z = self.engine.get_pair_ou_params(pair, use_raw_data=True)
-                
+                ou, spread, current_z = self.engine.get_pair_ou_params(
+                    pair, use_raw_data=True,
+                    window_size=pos.get('window_size'))
+
                 # Store previous z for comparison
                 pos['previous_z'] = pos.get('current_z', pos['entry_z'])
                 pos['current_z'] = current_z
@@ -13339,7 +14572,7 @@ def main():
         try:
             scale = get_scale_factor()
             base_font_size = max(9, round(10 * scale))
-        except:
+        except (ValueError, RuntimeError, Exception):
             base_font_size = 10
     else:
         base_font_size = 10
@@ -13361,3 +14594,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

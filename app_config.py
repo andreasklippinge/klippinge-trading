@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ── Version ──────────────────────────────────────────────────────────────────
 APP_NAME = "Klippinge Investment Trading Terminal"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_AUTHOR = "Klippinge Investment"
 GITHUB_REPO = "andreasklippinge/klippinge-trading"  # ← Ändra detta!
 
@@ -155,6 +155,10 @@ class Paths:
     @staticmethod
     def regime_cache_file() -> str:
         return str(get_user_data_dir() / "regime_cache_weekly.pkl")
+
+    @staticmethod
+    def volatility_cache_file() -> str:
+        return str(get_trading_data_dir() / "volatility_cache.pkl")
     
     @staticmethod
     def notification_config_file() -> str:
