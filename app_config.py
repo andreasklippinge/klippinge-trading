@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ── Version ──────────────────────────────────────────────────────────────────
 APP_NAME = "Klippinge Investment Trading Terminal"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_AUTHOR = "Klippinge Investment"
 GITHUB_REPO = "andreasklippinge/klippinge-trading"  # ← Ändra detta!
 
@@ -220,8 +220,48 @@ def save_discord_webhook_url(url: str) -> None:
                 config = json.load(f)
     except (json.JSONDecodeError, IOError):
         pass
-    
+
     config["discord_webhook_url"] = url
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+
+
+# ── Email Configuration ─────────────────────────────────────────────────────
+
+def get_email_config() -> dict:
+    """
+    Load email configuration from notification_config.json.
+    Returns dict with keys: email_address, email_app_password, email_recipient.
+    """
+    config_path = Paths.notification_config_file()
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            return {
+                "email_address": config.get("email_address", ""),
+                "email_app_password": config.get("email_app_password", ""),
+                "email_recipient": config.get("email_recipient", ""),
+            }
+    except (json.JSONDecodeError, IOError):
+        pass
+    return {"email_address": "", "email_app_password": "", "email_recipient": ""}
+
+
+def save_email_config(email_address: str, email_app_password: str, email_recipient: str) -> None:
+    """Save email configuration to notification_config.json."""
+    config_path = Paths.notification_config_file()
+    config = {}
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
+
+    config["email_address"] = email_address
+    config["email_app_password"] = email_app_password
+    config["email_recipient"] = email_recipient
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
 
@@ -271,7 +311,7 @@ def initialize_user_data():
             shutil.copy2(str(src), str(dst))
             print(f"  Initialized: {dst}")
     
-    print(f"User data directory: {user_dir}")
+    # User data dir initialized
 
 
 # ── Ticker File Resolution ──────────────────────────────────────────────────
@@ -342,17 +382,7 @@ def setup_logging():
 
 def print_config():
     """Print current configuration for debugging."""
-    print(f"\n{'='*60}")
-    print(f"  {APP_NAME} v{APP_VERSION}")
-    print(f"{'='*60}")
-    print(f"  Frozen:       {_is_frozen()}")
-    print(f"  App dir:      {get_app_dir()}")
-    print(f"  Install dir:  {get_install_dir()}")
-    print(f"  User data:    {get_user_data_dir()}")
-    print(f"  Trading data: {get_trading_data_dir()}")
-    print(f"  Logs:         {get_logs_dir()}")
-    print(f"  Platform:     {platform.system()} {platform.release()}")
-    print(f"{'='*60}\n")
+    print(f"\n  {APP_NAME} v{APP_VERSION} | {platform.system()} {platform.release()}\n")
 
 
 if __name__ == "__main__":

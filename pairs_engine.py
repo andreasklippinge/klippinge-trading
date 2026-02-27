@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy import stats, integrate
-from scipy.special import erf
+from scipy.special import erf, gammaln
+from scipy.optimize import minimize_scalar, minimize
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
@@ -25,6 +26,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import warnings
 warnings.filterwarnings('ignore')
+
+# Optional: arch package for GARCH models
+try:
+    from arch import arch_model
+    ARCH_AVAILABLE = True
+except ImportError:
+    ARCH_AVAILABLE = False
 
 # Number of workers for parallel processing
 N_WORKERS = min(8, multiprocessing.cpu_count())
@@ -77,6 +85,7 @@ class TradeSignal:
     risk_reward: float
     avg_holding_days: float
     confidence: str       # 'HIGH', 'MEDIUM', 'LOW'
+    optimal_z_entry: float = 0.0  # Optimal entry z-score (profit-maximizing)
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -173,9 +182,11 @@ class OUProcess:
         return result / self.theta
     
     def win_probability(self, S0: float, take_profit: float, stop_loss: float,
-                       n_sims: int = 5000, max_time_years: float = 0.5) -> Dict:
+                       n_sims: int = 5000, max_time_years: float = 0.5,
+                       return_paths: bool = False) -> Dict:
         """
         P(hit take_profit before stop_loss | S_0) via Monte Carlo.
+        When return_paths=True, also returns sampled paths and percentile fan data.
         """
         dt = 1/252
         n_steps = int(max_time_years / dt)
@@ -189,6 +200,15 @@ class OUProcess:
 
         going_down = S0 > self.mu
 
+        # Record path history every 5th step to save memory
+        record_every = 5
+        if return_paths:
+            path_steps = list(range(0, n_steps, record_every))
+            path_history = np.full((n_sims, len(path_steps)), np.nan)
+            path_history[:, 0] = S0
+            rec_idx = 1
+
+        final_step = 0
         for step in range(n_steps):
             if going_down:
                 new_tp = (S <= take_profit) & ~hit_tp & ~hit_sl
@@ -202,26 +222,57 @@ class OUProcess:
             hit_time[new_tp | new_sl] = step * dt
 
             if (hit_tp | hit_sl).all():
+                final_step = step
                 break
 
-            # Early exit: >99% resolved → marginal gain from continuing
+            # Early exit: >99% resolved
             if step > 10 and (hit_tp | hit_sl).sum() / n_sims > 0.99:
+                final_step = step
                 break
 
             dW = rng.randn(n_sims) * np.sqrt(dt)
             S = S + self.theta * (self.mu - S) * dt + self.sigma * dW
-        
+            final_step = step
+
+            if return_paths and rec_idx < len(path_steps) and step + 1 == path_steps[rec_idx]:
+                path_history[:, rec_idx] = S
+                rec_idx += 1
+
         n_wins = hit_tp.sum()
         n_losses = hit_sl.sum()
         n_timeout = n_sims - n_wins - n_losses
-        
-        return {
+
+        result = {
             'win_prob': n_wins / n_sims,
             'loss_prob': n_losses / n_sims,
             'timeout_prob': n_timeout / n_sims,
             'avg_win_time_days': np.nanmean(hit_time[hit_tp]) * 252 if n_wins > 0 else np.nan,
             'avg_loss_time_days': np.nanmean(hit_time[hit_sl]) * 252 if n_losses > 0 else np.nan,
         }
+
+        if return_paths:
+            # Trim to actual recorded columns
+            path_history = path_history[:, :rec_idx]
+            time_days = np.array(path_steps[:rec_idx]) * dt * 252  # trading days
+
+            # Sample 30 display paths
+            n_display = min(30, n_sims)
+            display_idx = rng.choice(n_sims, n_display, replace=False)
+
+            # Compute percentile fan
+            fan = {
+                'p10': np.nanpercentile(path_history, 10, axis=0),
+                'p25': np.nanpercentile(path_history, 25, axis=0),
+                'p50': np.nanpercentile(path_history, 50, axis=0),
+                'p75': np.nanpercentile(path_history, 75, axis=0),
+                'p90': np.nanpercentile(path_history, 90, axis=0),
+            }
+
+            result['paths'] = path_history[display_idx]
+            result['fan'] = fan
+            result['time_days'] = time_days
+
+        return result
     
     def expected_pnl(self, S0: float, take_profit: float, stop_loss: float) -> Dict:
         """Calculate expected P&L and Kelly fraction for a trade."""
@@ -251,7 +302,24 @@ class OUProcess:
             'avg_win_days': outcome['avg_win_time_days'],
             'avg_loss_days': outcome['avg_loss_time_days']
         }
-    
+
+    def mc_fan_data(self, current_spread: float, z_entry: float,
+                    z_exit: float = 0.0, z_stop: float = 3.5) -> Dict:
+        """Get MC fan chart data: converts z-scores to spread levels and runs simulation."""
+        if z_entry > 0:
+            take_profit = self.spread_from_z(z_exit)
+            stop_loss = self.spread_from_z(z_stop)
+        else:
+            take_profit = self.spread_from_z(-z_exit)
+            stop_loss = self.spread_from_z(-z_stop)
+
+        outcome = self.win_probability(current_spread, take_profit, stop_loss,
+                                       return_paths=True)
+        outcome['take_profit_level'] = take_profit
+        outcome['stop_loss_level'] = stop_loss
+        outcome['mu_level'] = self.mu
+        return outcome
+
     def calculate_expected_moves(self, current_spread: float, y_price: float, x_price: float,
                                   hedge_ratio: float, y_volatility: float = None, 
                                   x_volatility: float = None) -> Dict:
@@ -324,6 +392,109 @@ class OUProcess:
             # Direction indicators
             'y_direction': 'UP' if delta_y_only > 0 else 'DOWN',
             'x_direction': 'UP' if delta_x_only > 0 else 'DOWN',
+        }
+
+    def optimal_entry_zscore(self, z_exit: float = 0.0,
+                              z_stop: float = 3.5,
+                              transaction_cost_z: float = 0.05,
+                              z_min: float = 1.0, z_max: float = 4.0,
+                              n_grid: int = 40,
+                              garch_persistence: float = 0.0,
+                              fractional_d: float = 0.5,
+                              hurst: float = 0.5) -> Dict:
+        """
+        Find optimal entry z-score maximizing the trade Sharpe ratio.
+
+        Key insight: for pure OU in z-space, the scale function is exp(z²/2)
+        which is universal (parameter-free). To get pair-specific optima, we
+        incorporate empirical characteristics:
+
+        1. GARCH persistence → effective z_stop (vol clustering widens stop)
+        2. Fractional d → p_win discount (d > 0.5 = less mean-reverting than OU)
+        3. Hurst exponent → additional p_win adjustment
+
+        Objective = E[PnL] / σ[PnL]   (trade Sharpe)
+
+        Returns:
+            Dict with optimal_z, expected_profit_per_day, roundtrip_days
+        """
+        best_z = 1.5  # fallback
+        best_score = -np.inf
+        best_rt_days = np.inf
+
+        # --- Pair-specific adjustments ---
+
+        # 1. GARCH: high persistence → vol clustering → effective stop is closer
+        #    (a vol spike can push spread further before reverting)
+        #    Shrink z_stop for high-persistence pairs
+        garch_penalty = garch_persistence ** 2  # quadratic: 0.9→0.81, 0.7→0.49
+        z_stop_eff = z_stop - 0.8 * garch_penalty  # max ~0.8σ tighter stop
+        z_stop_eff = max(z_stop_eff, 2.0)  # floor at 2.0
+
+        # 2. Fractional d: d > 0.5 means less mean-reverting than pure OU
+        #    Discount win probability (OU overestimates reversion strength)
+        #    d=0.3 → strong MR, no discount; d=0.5 → moderate; d=0.9 → heavy discount
+        d_discount = max(0.0, (fractional_d - 0.3)) * 0.4  # 0 to 0.24
+        # Also factor in Hurst: lower = more mean-reverting
+        h_discount = max(0.0, (hurst - 0.35)) * 0.3  # 0 to ~0.05
+
+        z_grid = np.linspace(z_min, min(z_max, z_stop_eff - 0.3), n_grid)
+
+        # Universal OU scale function in z-space: s(z) = ∫exp(u²/2)du
+        # Pre-compute on a fine grid
+        z_fine = np.linspace(-0.5, z_stop_eff + 0.5, 500)
+        s_vals = np.exp(z_fine**2 / 2)
+        s_cum = np.cumsum(s_vals) * (z_fine[1] - z_fine[0])
+
+        def s_at(z_val):
+            idx = int(np.clip(np.searchsorted(z_fine, z_val), 0, len(z_fine) - 1))
+            return s_cum[idx]
+
+        for z_entry in z_grid:
+            profit_z = z_entry - z_exit - 2 * transaction_cost_z
+            loss_z = z_stop_eff - z_entry + 2 * transaction_cost_z
+            if profit_z <= 0 or loss_z <= 0:
+                continue
+
+            # OU win probability in z-space (universal)
+            # P(hit z_exit before z_stop | start z_entry)
+            denom = s_at(z_stop_eff) - s_at(z_exit)
+            if abs(denom) < 1e-15:
+                p_win_ou = 0.5
+            else:
+                p_win_ou = (s_at(z_stop_eff) - s_at(z_entry)) / denom
+
+            # Apply pair-specific discounts to win probability
+            p_win = p_win_ou * (1 - d_discount) * (1 - h_discount)
+            p_win = float(np.clip(p_win, 0.05, 0.99))
+
+            # Expected PnL and variance per trade
+            e_pnl = p_win * profit_z - (1 - p_win) * loss_z
+            var_pnl = (p_win * (profit_z - e_pnl)**2 +
+                       (1 - p_win) * (-loss_z - e_pnl)**2)
+            std_pnl = np.sqrt(max(var_pnl, 1e-12))
+
+            # Trade Sharpe ratio
+            sharpe = e_pnl / std_pnl
+
+            # Expected roundtrip time (for reporting)
+            S_entry = self.spread_from_z(z_entry)
+            S_exit = self.spread_from_z(z_exit)
+            try:
+                t_hit = self.expected_hitting_time(S_entry, S_exit)
+                rt_days = t_hit * 252
+            except Exception:
+                rt_days = self.half_life_days() * 2
+
+            if sharpe > best_score:
+                best_score = sharpe
+                best_z = z_entry
+                best_rt_days = rt_days
+
+        return {
+            'optimal_z': float(round(best_z, 2)),
+            'expected_profit_per_day': float(best_score) if best_score > -np.inf else 0.0,
+            'roundtrip_days': float(best_rt_days) if np.isfinite(best_rt_days) else 0.0,
         }
 
 
@@ -700,8 +871,12 @@ class KalmanOUEstimator:
         mu_lower = mu_hist - 1.96 * mu_std_hist
         
         # ── STABILITY METRICS ──
-        # Parameter stability: coefficient of variation of theta over last 60 obs
-        stability_window = min(60, len(theta_hist))
+        # Adaptive window: max(60, min(N/4, 10×half_life))
+        # — 10 mean-reversion cycles gives meaningful stability estimate
+        # — capped at 25% of series to still detect regime shifts
+        hl_based = int(10 * half_life) if np.isfinite(half_life) else 60
+        stability_window = max(60, min(len(theta_hist) // 4, hl_based))
+        stability_window = min(stability_window, len(theta_hist))
         recent_theta = theta_hist[-stability_window:]
         if np.mean(recent_theta) > 0:
             theta_cv = np.std(recent_theta) / np.mean(recent_theta)
@@ -784,6 +959,538 @@ class KalmanOUEstimator:
             valid=result.valid,
             reason=result.reason
         )
+
+
+# ============================================================================
+# GARCH VOLATILITY MODEL
+# ============================================================================
+
+@dataclass
+class GARCHResult:
+    """GARCH(1,1) estimation result."""
+    omega: float = 0.0
+    alpha: float = 0.0      # News impact (ARCH term)
+    beta: float = 0.0       # Persistence (GARCH term)
+    persistence: float = 0.0  # alpha + beta
+    current_vol: float = 0.0  # Current conditional volatility (annualized)
+    long_run_vol: float = 0.0  # Unconditional volatility (annualized)
+    cvar_95: float = 0.0     # 95% CVaR (Expected Shortfall)
+    cvar_99: float = 0.0     # 99% CVaR
+    valid: bool = False
+
+
+class GARCHModel:
+    """
+    GARCH(1,1) model for spread volatility estimation.
+
+    σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}
+
+    Uses `arch` package if available, otherwise falls back to
+    variance-targeting estimation.
+    """
+
+    def fit(self, spread_returns: np.ndarray) -> GARCHResult:
+        """
+        Fit GARCH(1,1) to spread returns.
+
+        Args:
+            spread_returns: Array of spread return series (daily)
+
+        Returns:
+            GARCHResult with parameters and risk metrics
+        """
+        returns = np.asarray(spread_returns).flatten()
+        returns = returns[np.isfinite(returns)]
+
+        if len(returns) < 50:
+            return GARCHResult(valid=False)
+
+        # Scale returns for numerical stability (arch package expects %)
+        scale = 100.0
+
+        if ARCH_AVAILABLE:
+            try:
+                am = arch_model(returns * scale, vol='Garch', p=1, q=1,
+                                mean='Zero', rescale=False)
+                res = am.fit(disp='off', show_warning=False)
+
+                omega = res.params.get('omega', 0) / (scale ** 2)
+                alpha = res.params.get('alpha[1]', 0)
+                beta = res.params.get('beta[1]', 0)
+                persistence = alpha + beta
+
+                # Current conditional volatility (last forecast)
+                cond_vol = res.conditional_volatility[-1] / scale
+
+                # Long-run volatility
+                if persistence < 1:
+                    long_run_var = omega / (1 - persistence)
+                    long_run_vol = np.sqrt(long_run_var)
+                else:
+                    long_run_vol = cond_vol
+
+                # Express current vol as ratio to long-run vol (1.0 = normal)
+                current_vol = cond_vol / long_run_vol if long_run_vol > 1e-10 else 1.0
+
+                # CVaR from standardized residuals (using daily cond_vol)
+                std_resid = res.std_resid[np.isfinite(res.std_resid)]
+                if len(std_resid) > 20:
+                    cvar_95 = -np.mean(std_resid[std_resid <= np.percentile(std_resid, 5)]) * cond_vol
+                    cvar_99 = -np.mean(std_resid[std_resid <= np.percentile(std_resid, 1)]) * cond_vol
+                else:
+                    cvar_95 = cond_vol * 1.65
+                    cvar_99 = cond_vol * 2.33
+
+                return GARCHResult(
+                    omega=float(omega), alpha=float(alpha), beta=float(beta),
+                    persistence=float(persistence),
+                    current_vol=float(current_vol),
+                    long_run_vol=float(long_run_vol * np.sqrt(252)),
+                    cvar_95=float(cvar_95), cvar_99=float(cvar_99),
+                    valid=True
+                )
+            except Exception:
+                pass
+
+        # Fallback: variance-targeting GARCH estimation
+        try:
+            return self._fit_variance_targeting(returns)
+        except Exception:
+            return GARCHResult(valid=False)
+
+    def _fit_variance_targeting(self, returns: np.ndarray) -> GARCHResult:
+        """Simple variance-targeting GARCH(1,1) estimation without arch package.
+
+        Använder tvåstegs grid-search med Ljung-Box pre-check för att
+        identifiera om datan överhuvudtaget har GARCH-effekter.
+        """
+        n = len(returns)
+        var_target = np.var(returns)
+
+        if var_target <= 0:
+            return GARCHResult(valid=False)
+
+        # Pre-check: har datan volatilitets-klustring?
+        # Ljung-Box-liknande test på r² — om autokorrelation saknas
+        # finns ingen GARCH-effekt och vi returnerar iid-modell.
+        r2 = returns ** 2
+        r2_demean = r2 - r2.mean()
+        if r2.std() > 1e-12:
+            acf1 = np.corrcoef(r2_demean[:-1], r2_demean[1:])[0, 1]
+        else:
+            acf1 = 0.0
+        if abs(acf1) < 0.05 and n > 100:
+            # Ingen signifikant vol-klustring → rapportera flat GARCH
+            daily_vol = np.sqrt(var_target)
+            return GARCHResult(
+                omega=float(var_target), alpha=0.0, beta=0.0,
+                persistence=0.0,
+                current_vol=1.0,
+                long_run_vol=float(daily_vol * np.sqrt(252)),
+                cvar_95=float(daily_vol * 1.65),
+                cvar_99=float(daily_vol * 2.33),
+                valid=True
+            )
+
+        # Two-pass grid search: coarse → local refinement
+        best_ll = -np.inf
+        best_alpha, best_beta = 0.05, 0.90
+
+        def _garch_ll(alpha, beta):
+            omega = var_target * (1 - alpha - beta)
+            if omega <= 0:
+                return -np.inf
+            sigma2 = np.full(n, var_target)
+            for t in range(1, n):
+                sigma2[t] = omega + alpha * r2[t-1] + beta * sigma2[t-1]
+                sigma2[t] = max(sigma2[t], 1e-20)
+            return -0.5 * np.sum(np.log(sigma2) + r2 / sigma2)
+
+        # Pass 1: coarse grid (0.02 steps) — full range
+        for alpha in np.arange(0.01, 0.25, 0.02):
+            for beta in np.arange(0.02, 0.98, 0.02):
+                if alpha + beta >= 0.999:
+                    continue
+                ll = _garch_ll(alpha, beta)
+                if ll > best_ll:
+                    best_ll = ll
+                    best_alpha, best_beta = alpha, beta
+
+        # Pass 2: fine grid around best (0.005 steps)
+        a_lo = max(0.005, best_alpha - 0.03)
+        a_hi = min(0.30, best_alpha + 0.03)
+        b_lo = max(0.01, best_beta - 0.03)
+        b_hi = min(0.995, best_beta + 0.03)
+        for alpha in np.arange(a_lo, a_hi, 0.005):
+            for beta in np.arange(b_lo, b_hi, 0.005):
+                if alpha + beta >= 0.999:
+                    continue
+                ll = _garch_ll(alpha, beta)
+                if ll > best_ll:
+                    best_ll = ll
+                    best_alpha, best_beta = alpha, beta
+
+        omega = var_target * (1 - best_alpha - best_beta)
+        persistence = best_alpha + best_beta
+
+        # Compute conditional vol series
+        sigma2 = np.full(n, var_target)
+        for t in range(1, n):
+            sigma2[t] = omega + best_alpha * returns[t-1]**2 + best_beta * sigma2[t-1]
+            sigma2[t] = max(sigma2[t], 1e-20)
+
+        daily_cond_vol = np.sqrt(sigma2[-1])
+        daily_lr_vol = np.sqrt(var_target)
+
+        # Current vol as ratio to long-run vol (1.0 = normal)
+        current_vol = daily_cond_vol / daily_lr_vol if daily_lr_vol > 1e-10 else 1.0
+        long_run_vol = daily_lr_vol * np.sqrt(252)
+
+        # CVaR from empirical distribution
+        cvar_95 = daily_cond_vol * 1.65  # Normal approx
+        cvar_99 = daily_cond_vol * 2.33
+
+        return GARCHResult(
+            omega=float(omega), alpha=float(best_alpha), beta=float(best_beta),
+            persistence=float(persistence),
+            current_vol=float(current_vol),
+            long_run_vol=float(long_run_vol),
+            cvar_95=float(cvar_95), cvar_99=float(cvar_99),
+            valid=True
+        )
+
+
+# ============================================================================
+# KALMAN DYNAMIC HEDGE RATIO
+# ============================================================================
+
+@dataclass
+class KalmanHedgeResult:
+    """Result from Kalman hedge ratio estimation."""
+    beta_current: float = 1.0
+    beta_std: float = 0.0
+    alpha_current: float = 0.0
+    beta_stability: float = 0.0  # [0, 1]
+    beta_history: Optional[np.ndarray] = None
+    alpha_history: Optional[np.ndarray] = None
+    beta_upper: Optional[np.ndarray] = None
+    beta_lower: Optional[np.ndarray] = None
+    valid: bool = False
+
+
+class KalmanHedgeRatio:
+    """
+    Kalman filter for dynamic hedge ratio estimation.
+
+    State: x_t = [α_t, β_t]'
+    Observation: Y_t = [1, X_t] @ x_t + v_t
+
+    Tracks time-varying hedge ratio β between two price series.
+    """
+
+    def __init__(self, q_scale: float = 1e-6):
+        self.q_scale = q_scale
+
+    def fit(self, y: pd.Series, x: pd.Series, half_life_days: float = None) -> KalmanHedgeResult:
+        """
+        Estimate dynamic hedge ratio β_t using Kalman filter.
+
+        Args:
+            y: Price series Y (dependent)
+            x: Price series X (independent)
+            half_life_days: OU half-life for adaptive stability window
+
+        Returns:
+            KalmanHedgeResult with current β, CI bands, stability
+        """
+        self._half_life_days = half_life_days
+        y_vals = y.values
+        x_vals = x.values
+        n = len(y_vals)
+
+        if n < 60:
+            return KalmanHedgeResult(valid=False)
+
+        # Initialize with OLS on first 30 observations
+        X_init = np.column_stack([np.ones(30), x_vals[:30]])
+        try:
+            beta_init = np.linalg.lstsq(X_init, y_vals[:30], rcond=None)[0]
+        except np.linalg.LinAlgError:
+            beta_init = np.array([0.0, 1.0])
+
+        resid_init = y_vals[:30] - X_init @ beta_init
+        R = float(np.var(resid_init))
+        R = max(R, 1e-10)
+
+        x_state = beta_init.copy()
+        P = np.eye(2) * 0.01
+        Q = np.eye(2) * self.q_scale
+
+        # Storage
+        beta_hist = np.zeros(n)
+        alpha_hist = np.zeros(n)
+        P_beta_hist = np.zeros(n)
+
+        for t in range(n):
+            # Predict
+            x_pred = x_state
+            P_pred = P + Q
+
+            # Observe
+            H = np.array([1.0, x_vals[t]])
+            y_pred = H @ x_pred
+            innov = y_vals[t] - y_pred
+            S = H @ P_pred @ H + R
+            S = max(S, 1e-20)
+
+            # Update
+            K = P_pred @ H / S
+            x_state = x_pred + K * innov
+            IKH = np.eye(2) - np.outer(K, H)
+            P = IKH @ P_pred @ IKH.T + R * np.outer(K, K)
+
+            # Adaptive R
+            if t >= 10:
+                R = 0.98 * R + 0.02 * innov**2
+                R = max(R, 1e-20)
+
+            beta_hist[t] = x_state[1]
+            alpha_hist[t] = x_state[0]
+            P_beta_hist[t] = P[1, 1]
+
+        # Compute CI bands
+        beta_std_hist = np.sqrt(np.maximum(P_beta_hist, 0))
+        beta_upper = beta_hist + 1.96 * beta_std_hist
+        beta_lower = beta_hist - 1.96 * beta_std_hist
+
+        # Adaptive stability window: max(60, min(N/4, 10×half_life))
+        hl = self._half_life_days
+        hl_based = int(10 * hl) if hl is not None and np.isfinite(hl) else 60
+        stab_win = max(60, min(n // 4, hl_based))
+        stab_win = min(stab_win, n)
+        recent_beta = beta_hist[-stab_win:]
+        mean_beta = np.mean(recent_beta)
+        if abs(mean_beta) > 1e-10:
+            cv = np.std(recent_beta) / abs(mean_beta)
+            stability = max(0, 1 - cv)
+        else:
+            stability = 0.0
+
+        return KalmanHedgeResult(
+            beta_current=float(x_state[1]),
+            beta_std=float(np.sqrt(max(P[1, 1], 0))),
+            alpha_current=float(x_state[0]),
+            beta_stability=float(stability),
+            beta_history=beta_hist,
+            alpha_history=alpha_hist,
+            beta_upper=beta_upper,
+            beta_lower=beta_lower,
+            valid=True
+        )
+
+
+# ============================================================================
+# FRACTIONAL COINTEGRATION (GPH ESTIMATOR)
+# ============================================================================
+
+def estimate_fractional_d(spread: np.ndarray, bandwidth: float = 0.5) -> Dict:
+    """
+    Estimate fractional integration parameter d using GPH spectral method.
+
+    Log-periodogram regression: log(I(ω_j)) = c - d·log(4·sin²(ω_j/2)) + error
+
+    Args:
+        spread: Spread time series
+        bandwidth: Fraction of frequencies to use (0.5 = sqrt(n))
+
+    Returns:
+        Dict with d, d_se, d_significant, classification
+    """
+    spread = np.asarray(spread).flatten()
+    spread = spread[np.isfinite(spread)]
+    n = len(spread)
+
+    if n < 60:
+        return {'d': 0.5, 'd_se': 1.0, 'd_significant': False,
+                'classification': 'insufficient_data'}
+
+    # Demean
+    spread = spread - np.mean(spread)
+
+    # Compute periodogram
+    fft_vals = np.fft.fft(spread)
+    periodogram = (np.abs(fft_vals[:n//2+1])**2) / n
+
+    # Frequencies (skip j=0)
+    freqs = 2 * np.pi * np.arange(1, n//2+1) / n
+    I_j = periodogram[1:]
+
+    # Number of frequencies to use (GPH bandwidth)
+    m = int(n**bandwidth)
+    m = max(10, min(m, len(I_j)))
+
+    # Log-periodogram regression
+    X = np.log(4 * np.sin(freqs[:m]/2)**2)
+    Y = np.log(np.maximum(I_j[:m], 1e-20))
+
+    # OLS: Y = c - d*X + error
+    X_design = np.column_stack([np.ones(m), X])
+    try:
+        beta = np.linalg.lstsq(X_design, Y, rcond=None)[0]
+        d = -beta[1]
+
+        # Standard error
+        resid = Y - X_design @ beta
+        sigma2 = np.sum(resid**2) / (m - 2)
+        XtX_inv = np.linalg.inv(X_design.T @ X_design)
+        d_se = np.sqrt(sigma2 * XtX_inv[1, 1])
+    except (np.linalg.LinAlgError, ValueError):
+        return {'d': 0.5, 'd_se': 1.0, 'd_significant': False,
+                'classification': 'estimation_failed'}
+
+    # Significance test: H0: d=0
+    d_significant = abs(d / d_se) > 1.96 if d_se > 0 else False
+
+    # Classification
+    if d < 0.0:
+        classification = 'strong_MR'    # Strong mean reversion (anti-persistent)
+    elif d < 0.5:
+        classification = 'weak_MR'      # Weak mean reversion (stationary long memory)
+    elif d < 1.0:
+        classification = 'borderline'   # Non-stationary but mean-reverting
+    else:
+        classification = 'non_stationary'
+
+    return {
+        'd': float(d),
+        'd_se': float(d_se),
+        'd_significant': bool(d_significant),
+        'classification': classification,
+    }
+
+
+# ============================================================================
+# COPULA TAIL DEPENDENCE
+# ============================================================================
+
+def estimate_tail_dependence(returns_y: np.ndarray, returns_x: np.ndarray) -> Dict:
+    """
+    Estimate tail dependence using Student-t copula.
+
+    1. Rank-transform marginals to uniform [0,1]
+    2. Fit Student-t copula (ρ, ν) via maximum likelihood
+    3. Compute tail dependence: λ = 2·t_{ν+1}(-√((ν+1)(1-ρ)/(1+ρ)))
+
+    Uses scipy.stats.t and scipy.optimize — no extra packages needed.
+
+    Args:
+        returns_y: Return series for Y
+        returns_x: Return series for X
+
+    Returns:
+        Dict with lambda_lower, lambda_upper, copula_rho, copula_nu
+    """
+    ry = np.asarray(returns_y).flatten()
+    rx = np.asarray(returns_x).flatten()
+
+    # Align and clean
+    mask = np.isfinite(ry) & np.isfinite(rx)
+    ry, rx = ry[mask], rx[mask]
+    n = len(ry)
+
+    if n < 50:
+        return {'lambda_lower': 0.0, 'lambda_upper': 0.0,
+                'copula_rho': 0.0, 'copula_nu': 30.0}
+
+    # Rank-transform to pseudo-uniform (avoid 0 and 1)
+    u = (np.argsort(np.argsort(ry)) + 0.5) / n
+    v = (np.argsort(np.argsort(rx)) + 0.5) / n
+
+    # Transform to standard normal for correlation estimate
+    z_u = stats.norm.ppf(u)
+    z_v = stats.norm.ppf(v)
+    rho_init = np.corrcoef(z_u, z_v)[0, 1]
+    rho_init = np.clip(rho_init, -0.99, 0.99)
+
+    # Fit Student-t copula via profile likelihood
+    # For each ν, compute optimal ρ analytically, then optimize over ν
+    def neg_log_lik(nu):
+        """Negative log-likelihood of t-copula for given degrees of freedom."""
+        nu = max(nu, 2.01)  # Ensure ν > 2
+
+        # Inverse t-CDF of pseudo-uniforms
+        t_u = stats.t.ppf(u, df=nu)
+        t_v = stats.t.ppf(v, df=nu)
+
+        # MLE for ρ given ν: correlation of t-transformed data
+        rho = np.corrcoef(t_u, t_v)[0, 1]
+        rho = np.clip(rho, -0.999, 0.999)
+
+        # Log-likelihood of bivariate t-copula
+        det_R = 1 - rho**2
+        if det_R <= 0:
+            return 1e10
+
+        # Copula density log(c(u,v))
+        t2 = t_u**2 + t_v**2 - 2*rho*t_u*t_v
+
+        ll = n * (gammaln((nu+2)/2) + gammaln(nu/2)
+                   - 2*gammaln((nu+1)/2)
+                   - 0.5*np.log(det_R))
+        ll += -(nu+2)/2 * np.sum(np.log(1 + t2/(nu*det_R)))
+        ll += (nu+1)/2 * np.sum(np.log(1 + t_u**2/nu) + np.log(1 + t_v**2/nu))
+
+        return -ll
+
+    # Optimize over ν ∈ [2.1, 50]
+    try:
+        result = minimize_scalar(neg_log_lik, bounds=(2.1, 50), method='bounded')
+        nu_opt = result.x
+    except Exception:
+        nu_opt = 10.0
+
+    nu_opt = max(nu_opt, 2.01)
+
+    # Compute final ρ at optimal ν
+    t_u = stats.t.ppf(u, df=nu_opt)
+    t_v = stats.t.ppf(v, df=nu_opt)
+    rho_opt = np.corrcoef(t_u, t_v)[0, 1]
+    rho_opt = np.clip(rho_opt, -0.999, 0.999)
+
+    # Tail dependence coefficient
+    # λ = 2·t_{ν+1}(-√((ν+1)(1-ρ)/(1+ρ)))
+    if nu_opt < 100 and abs(1 + rho_opt) > 1e-10:
+        arg = -np.sqrt((nu_opt + 1) * (1 - rho_opt) / (1 + rho_opt))
+        lambda_tail = 2 * stats.t.cdf(arg, df=nu_opt + 1)
+    else:
+        lambda_tail = 0.0
+
+    lambda_tail = float(np.clip(lambda_tail, 0, 1))
+
+    # Empirical tail dependence for asymmetry detection
+    # Count joint exceedances below/above quantile thresholds
+    try:
+        q_lo, q_hi = 0.05, 0.95
+        u_lo = u < q_lo
+        v_lo = v < q_lo
+        u_hi = u > q_hi
+        v_hi = v > q_hi
+        n_tail = max(1, int(n * q_lo))
+        emp_lower = np.sum(u_lo & v_lo) / n_tail
+        emp_upper = np.sum(u_hi & v_hi) / n_tail
+        # Blend: 70% parametric (t-copula) + 30% empirical
+        lambda_lower = 0.7 * lambda_tail + 0.3 * float(np.clip(emp_lower, 0, 1))
+        lambda_upper = 0.7 * lambda_tail + 0.3 * float(np.clip(emp_upper, 0, 1))
+    except Exception:
+        lambda_lower = lambda_tail
+        lambda_upper = lambda_tail
+
+    return {
+        'lambda_lower': round(lambda_lower, 4),
+        'lambda_upper': round(lambda_upper, 4),
+        'copula_rho': float(rho_opt),
+        'copula_nu': float(nu_opt),
+    }
 
 
 # ============================================================================
@@ -1255,8 +1962,8 @@ class PairsTradingEngine:
             'max_position_pct': 0.10,
             'max_sector_exposure': 0.30,
             'drawdown_limit': 0.15,
-            'robustness_windows': [500, 750, 1000, 1250, 1500, 1750, 2000],
-            'min_windows_passed': 4,
+            'robustness_windows': [250, 500, 750, 1000, 1250, 1500, 1750, 2000],
+            'min_windows_passed': 3,
             'max_data_points': 2500,
         }
         for key, value in defaults.items():
@@ -1359,7 +2066,26 @@ class PairsTradingEngine:
             self.price_data = pd.DataFrame()
             self.raw_price_data = pd.DataFrame()
             return self.price_data
-        
+
+        # Retry missing tickers individually (yf.download batch can silently drop tickers)
+        missing = [t for t in tickers if t not in all_data]
+        if missing and len(missing) <= 100:
+            if progress_callback:
+                progress_callback(total_batches, total_batches, f"Retrying {len(missing)} missing tickers individually...")
+            for ticker in missing:
+                try:
+                    t_obj = yf.Ticker(ticker)
+                    hist = t_obj.history(period=period, interval='1d')
+                    if hist is not None and not hist.empty and 'Close' in hist.columns:
+                        series = hist['Close'].copy()
+                        if series.notna().sum() > 50:
+                            all_data[ticker] = series
+                except Exception:
+                    pass
+            still_missing = [t for t in tickers if t not in all_data]
+            if still_missing:
+                print(f"[Data] {len(still_missing)} tickers still missing after retry: {still_missing[:10]}...")
+
         # Combine into DataFrame
         data = pd.DataFrame(all_data)
         
@@ -1604,6 +2330,12 @@ class PairsTradingEngine:
             'half_life_days': None, 'kalman_stability': None,
             'kalman_innovation_ratio': None, 'kalman_regime_score': None,
             'kalman_theta_significant': None,
+            # New institutional-grade metrics (soft / informational)
+            'tail_dep_lower': 0.0, 'tail_dep_upper': 0.0,
+            'garch_alpha': 0.0, 'garch_beta': 0.0, 'garch_persistence': 0.0,
+            'garch_current_vol': 0.0, 'garch_cvar_95': 0.0,
+            'fractional_d': 0.5, 'fractional_d_class': 'unknown',
+            'kalman_beta': 1.0, 'kalman_beta_stability': 0.0,
         }
 
         # --- 1. Correlation (~0.1ms) ---
@@ -1614,21 +2346,40 @@ class PairsTradingEngine:
             return fail
         fail['correlation'] = corr
 
-        # --- 2. OLS hedge ratio + spread → Hurst DFA (~2ms) ---
+        # --- 2. OLS hedge ratio (baseline) + Kalman dynamic hedge ---
         try:
             x_const = sm.add_constant(x)
             model = sm.OLS(y, x_const).fit()
             hedge_ratio = float(model.params.iloc[1])
             intercept = float(model.params.iloc[0])
-            spread = y - hedge_ratio * x - intercept
+            ols_spread = y - hedge_ratio * x - intercept
         except Exception:
             fail['failed_at'] = 'ols'
             return fail
 
-        if len(spread) < 50:
+        if len(ols_spread) < 50:
             fail['failed_at'] = 'spread_length'
             return fail
 
+        # Kalman dynamic hedge ratio — use Kalman spread for all downstream tests
+        kalman_hedge = None
+        spread = ols_spread  # default fallback
+        try:
+            kalman_hedge = KalmanHedgeRatio().fit(y, x)
+            if kalman_hedge.valid and kalman_hedge.beta_history is not None:
+                # Build time-varying spread: Y_t - β_t·X_t - α_t
+                kalman_spread = pd.Series(
+                    y.values - kalman_hedge.beta_history * x.values - kalman_hedge.alpha_history,
+                    index=y.index
+                )
+                if len(kalman_spread.dropna()) >= 50:
+                    spread = kalman_spread
+                    hedge_ratio = kalman_hedge.beta_current
+                    intercept = kalman_hedge.alpha_current
+        except Exception:
+            pass
+
+        # --- 2b. Hurst DFA on spread ---
         try:
             hurst = self.calculate_hurst_exponent(spread)
         except Exception:
@@ -1638,7 +2389,7 @@ class PairsTradingEngine:
             fail['failed_at'] = 'hurst'
             return fail
 
-        # --- 3. Engle-Granger ADF on spread (~5ms) ---
+        # --- 3. ADF on spread (Kalman or OLS) ---
         try:
             adf_result = adfuller(spread.dropna(), autolag='AIC')
             eg_pvalue = float(adf_result[1])
@@ -1706,7 +2457,7 @@ class PairsTradingEngine:
             fail['failed_at'] = 'half_life'
             return fail
 
-        # Kalman diagnostics — at least 3 of 4 must pass
+        # Kalman diagnostics — hard gates + soft checks (all must pass)
         kalman_res = getattr(ou_params, '_kalman', None)
         if kalman_res is not None:
             k_stability = kalman_res.param_stability
@@ -1714,15 +2465,7 @@ class PairsTradingEngine:
             k_regime = kalman_res.regime_change_score
             k_theta_sig = (kalman_res.theta > 1.96 * kalman_res.theta_std
                            if kalman_res.theta_std > 0 else False)
-            kalman_checks = [
-                k_stability > 0.4,
-                0.4 <= k_inn_ratio <= 2.5,
-                k_regime < 5.0,
-                k_theta_sig,
-            ]
-            passes_kalman = sum(kalman_checks) >= 3
         else:
-            passes_kalman = False
             k_stability = 0.0
             k_inn_ratio = 0.0
             k_regime = 99.0
@@ -1732,9 +2475,91 @@ class PairsTradingEngine:
         fail['kalman_innovation_ratio'] = round(k_inn_ratio, 4)
         fail['kalman_regime_score'] = round(k_regime, 4)
         fail['kalman_theta_significant'] = bool(k_theta_sig)
+
+        # HARD gates — immediate fail
+        if k_regime >= 4.0:
+            fail['failed_at'] = 'regime'
+            return fail
+        if not k_theta_sig:
+            fail['failed_at'] = 'theta_sig'
+            return fail
+
+        # Soft Kalman checks — all must pass
+        if kalman_res is not None:
+            kalman_checks = [
+                k_stability > 0.4,
+                0.4 <= k_inn_ratio <= 2.5,
+            ]
+            passes_kalman = all(kalman_checks)
+        else:
+            passes_kalman = False
+
         if not passes_kalman:
             fail['failed_at'] = 'kalman'
             return fail
+
+        # --- 6. Soft metrics (informational, do not gate pass/fail) ---
+        # Tail dependence (copula)
+        td_lower, td_upper = 0.0, 0.0
+        try:
+            y_ret = y.pct_change().dropna().values
+            x_ret = x.pct_change().dropna().values
+            td = estimate_tail_dependence(y_ret, x_ret)
+            td_lower = td['lambda_lower']
+            td_upper = td['lambda_upper']
+        except Exception:
+            pass
+
+        # GARCH volatility on normalized spread changes (NOT pct_change —
+        # EG spread crosses zero, making pct_change explode).
+        # Normalize by spread std so GARCH operates on unit-scale innovations.
+        g_alpha, g_beta, g_persist, g_cvol, g_cvar95 = 0.0, 0.0, 0.0, 0.0, 0.0
+        try:
+            spread_diff = spread.diff().dropna()
+            spread_std = spread_diff.std()
+            spread_ret = (spread_diff / spread_std).values if spread_std > 1e-10 else spread_diff.values
+            if len(spread_ret) > 50:
+                garch_res = GARCHModel().fit(spread_ret)
+                if garch_res.valid:
+                    g_alpha = garch_res.alpha
+                    g_beta = garch_res.beta
+                    g_persist = garch_res.persistence
+                    g_cvol = garch_res.current_vol
+                    g_cvar95 = garch_res.cvar_95
+        except Exception:
+            pass
+
+        # Fractional integration
+        frac_d, frac_d_class = 0.5, 'unknown'
+        try:
+            fd_result = estimate_fractional_d(spread.values)
+            frac_d = fd_result['d']
+            frac_d_class = fd_result['classification']
+        except Exception:
+            pass
+
+        # Dynamic Kalman hedge ratio — reuse from step 2, recompute stability with half_life
+        kb_current, kb_stability = 1.0, 0.0
+        if kalman_hedge is not None and kalman_hedge.valid:
+            kb_current = kalman_hedge.beta_current
+            # Recompute stability with adaptive window based on half_life
+            bh = kalman_hedge.beta_history
+            if bh is not None and len(bh) > 0:
+                hl_based = int(10 * half_life) if np.isfinite(half_life) else 60
+                stab_win = max(60, min(len(bh) // 4, hl_based))
+                stab_win = min(stab_win, len(bh))
+                recent = bh[-stab_win:]
+                mean_b = np.mean(recent)
+                if abs(mean_b) > 1e-10:
+                    kb_stability = max(0, 1 - np.std(recent) / abs(mean_b))
+        else:
+            try:
+                kh = KalmanHedgeRatio().fit(y, x, half_life_days=half_life)
+                if kh.valid:
+                    kb_current = kh.beta_current
+                    kb_stability = kh.beta_stability
+            except Exception:
+                pass
 
         # --- All tests passed ---
         return {
@@ -1760,6 +2585,18 @@ class PairsTradingEngine:
             'kalman_innovation_ratio': round(k_inn_ratio, 4),
             'kalman_regime_score': round(k_regime, 4),
             'kalman_theta_significant': bool(k_theta_sig),
+            # Institutional-grade soft metrics
+            'tail_dep_lower': round(td_lower, 4),
+            'tail_dep_upper': round(td_upper, 4),
+            'garch_alpha': round(g_alpha, 4),
+            'garch_beta': round(g_beta, 4),
+            'garch_persistence': round(g_persist, 4),
+            'garch_current_vol': round(g_cvol, 4),
+            'garch_cvar_95': round(g_cvar95, 6),
+            'fractional_d': round(frac_d, 4),
+            'fractional_d_class': frac_d_class,
+            'kalman_beta': round(kb_current, 4),
+            'kalman_beta_stability': round(kb_stability, 4),
         }
 
     def _test_pair_multi_window(self, pair_info: Tuple, data: pd.DataFrame,
@@ -1788,6 +2625,12 @@ class PairsTradingEngine:
             'data_length': 0, 'is_viable': False,
             'robustness_score': 0.0, 'windows_passed': 0,
             'windows_tested': 0, 'passing_windows': [],
+            # Institutional-grade soft metrics
+            'tail_dep_lower': 0.0, 'tail_dep_upper': 0.0,
+            'garch_alpha': 0.0, 'garch_beta': 0.0, 'garch_persistence': 0.0,
+            'garch_current_vol': 0.0, 'garch_cvar_95': 0.0,
+            'fractional_d': 0.5, 'fractional_d_class': 'unknown',
+            'kalman_beta': 1.0, 'kalman_beta_stability': 0.0,
         }
 
         try:
@@ -1803,7 +2646,7 @@ class PairsTradingEngine:
                 return fail_result
 
             windows = sorted(self.config.get('robustness_windows',
-                                             [500, 750, 1000, 1250, 1500, 1750, 2000]))
+                                             [250, 500, 750, 1000, 1250, 1500, 1750, 2000]))
             min_windows_req = self.config.get('min_windows_passed', 4)
 
             windows_passed = 0
@@ -1835,8 +2678,30 @@ class PairsTradingEngine:
                 fail_result['window_details'] = all_window_results
                 return fail_result
 
-            robustness_score = windows_passed / windows_tested if windows_tested > 0 else 0.0
-            is_viable = (windows_passed >= min_windows_req) and (best_result is not None)
+            # Check max consecutive passing windows (only among tested windows)
+            max_consecutive = 0
+            current_consecutive = 0
+            for ws in windows:
+                if data_length < ws:
+                    continue  # Not tested — skip
+                if ws in passing_windows:
+                    current_consecutive += 1
+                    max_consecutive = max(max_consecutive, current_consecutive)
+                else:
+                    current_consecutive = 0
+
+            # Robustness = viktad pass-rate (korta fönster väger tyngre)
+            # Korta fönster = senaste data = viktigast för trading
+            if windows_tested > 0:
+                tested_windows = [ws for ws in windows if data_length >= ws]
+                weights = np.array([1.0 / (i + 1) for i in range(len(tested_windows))])
+                weights /= weights.sum()
+                passed_mask = np.array([1.0 if ws in passing_windows else 0.0
+                                        for ws in tested_windows])
+                robustness_score = float(np.dot(weights, passed_mask))
+            else:
+                robustness_score = 0.0
+            is_viable = (max_consecutive >= min_windows_req) and (best_result is not None)
 
             if best_result is not None:
                 return {
@@ -1869,8 +2734,21 @@ class PairsTradingEngine:
                     'robustness_score': robustness_score,
                     'windows_passed': windows_passed,
                     'windows_tested': windows_tested,
+                    'max_consecutive_windows': max_consecutive,
                     'passing_windows': passing_windows,
                     'window_details': all_window_results,
+                    # Institutional-grade soft metrics (from shortest passing window)
+                    'tail_dep_lower': best_result.get('tail_dep_lower', 0.0),
+                    'tail_dep_upper': best_result.get('tail_dep_upper', 0.0),
+                    'garch_alpha': best_result.get('garch_alpha', 0.0),
+                    'garch_beta': best_result.get('garch_beta', 0.0),
+                    'garch_persistence': best_result.get('garch_persistence', 0.0),
+                    'garch_current_vol': best_result.get('garch_current_vol', 0.0),
+                    'garch_cvar_95': best_result.get('garch_cvar_95', 0.0),
+                    'fractional_d': best_result.get('fractional_d', 0.5),
+                    'fractional_d_class': best_result.get('fractional_d_class', 'unknown'),
+                    'kalman_beta': best_result.get('kalman_beta', 1.0),
+                    'kalman_beta_stability': best_result.get('kalman_beta_stability', 0.0),
                 }
             else:
                 fail_result['data_length'] = data_length
@@ -2020,7 +2898,7 @@ class PairsTradingEngine:
                 ar1_coef = 0
                 ou_valid = False
             
-            # === Kalman diagnostics (integrated — no separate post-screening step) ===
+            # === Kalman diagnostics (integrated — hard gates + soft checks) ===
             kalman_result = getattr(ou_params, '_kalman', None) if ou_params else None
             if kalman_result is not None:
                 k_stability = kalman_result.param_stability
@@ -2028,19 +2906,24 @@ class PairsTradingEngine:
                 k_regime = kalman_result.regime_change_score
                 k_theta_sig = (kalman_result.theta > 1.96 * kalman_result.theta_std
                                if kalman_result.theta_std > 0 else False)
-                kalman_checks = [
-                    k_stability > 0.4,
-                    0.4 <= k_inn_ratio <= 2.5,
-                    k_regime < 5.0,
-                    k_theta_sig,
-                ]
-                passes_kalman = sum(kalman_checks) >= 3
             else:
                 k_stability = 0.0
                 k_inn_ratio = 0.0
                 k_regime = 99.0
                 k_theta_sig = False
-                passes_kalman = False
+
+            # HARD gates — immediate fail
+            passes_hard_gates = (k_regime < 4.0) and k_theta_sig
+
+            # Soft Kalman checks — all must pass
+            if kalman_result is not None and passes_hard_gates:
+                kalman_checks = [
+                    k_stability > 0.4,
+                    0.4 <= k_inn_ratio <= 2.5,
+                ]
+                passes_kalman = all(kalman_checks)
+            else:
+                passes_kalman = passes_hard_gates  # False if hard gates failed
 
             # === Final viability ===
             # EG + Johansen + half-life + Hurst + Kalman validation
@@ -2361,12 +3244,184 @@ class PairsTradingEngine:
                 sigma=row.sigma
             )
 
+        # Calculate quality scores and re-sort viable pairs
+        if len(self.viable_pairs) > 0:
+            try:
+                self.calculate_quality_scores()
+                if 'quality_score' in self.viable_pairs.columns:
+                    self.viable_pairs = self.viable_pairs.sort_values('quality_score', ascending=False)
+                    print(f"[Scan] Quality scores computed, top pair: "
+                          f"{self.viable_pairs.iloc[0]['pair']} "
+                          f"(Q={self.viable_pairs.iloc[0]['quality_score']:.2f})")
+            except Exception as e:
+                print(f"[Scan] Quality score calculation failed: {e}")
+
+        # Detaljerad konsol-rapport
+        self._print_scan_report()
+
         if progress_callback:
             progress_callback('complete', len(results_df), len(results_df),
                             f"Found {len(self.viable_pairs)} viable pairs from {len(results_df)} tested ({len(candidate_pairs)} candidates)")
         
         return results_df
-    
+
+    def _print_scan_report(self):
+        """Print detailed scan report to console with all institutional-grade metrics."""
+        vp = self.viable_pairs
+        if vp is None or len(vp) == 0:
+            print("\n[Scan Report] No viable pairs found.\n")
+            return
+
+        # Pre-compute z-scores and optimal z* for all viable pairs
+        # Uses get_pair_ou_params() for EG-spread + Kalman z-score consistency
+        pair_live = {}  # pair -> {zscore, opt_z}
+        for row in vp.itertuples():
+            pair = getattr(row, 'pair', '?')
+            z = 0.0
+            oz = 0.0
+            try:
+                ou_live, _, z = self.get_pair_ou_params(pair, use_raw_data=True)
+            except Exception:
+                ou_live = self.ou_models.get(pair)
+            if ou_live is not None:
+                try:
+                    exit_z = self.config.get('exit_zscore', 0.5)
+                    g_p = getattr(row, 'garch_persistence', 0.0)
+                    f_d = getattr(row, 'fractional_d', 0.5)
+                    h_e = getattr(row, 'hurst_exponent', 0.5)
+                    oz_result = ou_live.optimal_entry_zscore(
+                        z_exit=exit_z,
+                        garch_persistence=g_p,
+                        fractional_d=f_d,
+                        hurst=h_e,
+                    )
+                    oz = oz_result.get('optimal_z', 0.0)
+                except Exception:
+                    pass
+            pair_live[pair] = {'zscore': z, 'opt_z': oz}
+
+        sep = "=" * 120
+        thin = "-" * 120
+        print(f"\n{sep}")
+        print(f"  PAIRS TRADING SCAN REPORT — {len(vp)} viable pairs")
+        print(f"{sep}\n")
+
+        # --- SUMMARY TABLE ---
+        header = (
+            f"{'#':>2} {'Pair':<22} {'Quality':>7} {'Z-score':>8} {'Half-life':>9} "
+            f"{'Hurst':>6} {'Frac.d':>7} {'EG p':>7} {'Corr':>6} {'Robust':>7} "
+            f"{'TailL':>6} {'TailU':>6} {'Opt.Z*':>7} {'GARCH p':>7} {'GVol':>6} "
+            f"{'Kβ':>6} {'Kβ stab':>7}"
+        )
+        print(header)
+        print(thin)
+
+        for i, row in enumerate(vp.itertuples(), 1):
+            pair = getattr(row, 'pair', '?')
+            live = pair_live.get(pair, {})
+            quality = getattr(row, 'quality_score', 0)
+            zscore = live.get('zscore', 0)
+            hl = getattr(row, 'half_life_days', 0) or 0
+            hurst = getattr(row, 'hurst_exponent', 0) or 0
+            frac_d = getattr(row, 'fractional_d', 0.5)
+            eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
+            corr = getattr(row, 'correlation', 0) or 0
+            robust = getattr(row, 'robustness_score', 0) or 0
+            tail_l = getattr(row, 'tail_dep_lower', 0)
+            tail_u = getattr(row, 'tail_dep_upper', 0)
+            opt_z = live.get('opt_z', 0)
+            garch_p = getattr(row, 'garch_persistence', 0)
+            garch_v = getattr(row, 'garch_current_vol', 0)
+            kb = getattr(row, 'kalman_beta', 1.0)
+            kb_s = getattr(row, 'kalman_beta_stability', 0)
+
+            print(
+                f"{i:>2} {pair:<22} {quality:>7.3f} {zscore:>+8.3f} {hl:>8.1f}d "
+                f"{hurst:>6.3f} {frac_d:>7.3f} {eg_p:>7.4f} {corr:>6.3f} {robust:>7.3f} "
+                f"{tail_l:>6.3f} {tail_u:>6.3f} {opt_z:>7.2f} {garch_p:>7.3f} {garch_v:>6.2f} "
+                f"{kb:>6.3f} {kb_s:>7.3f}"
+            )
+
+        print(thin)
+
+        # --- PER-PAIR DETAIL CARDS ---
+        print(f"\n{'=' * 120}")
+        print("  DETAILED METRICS PER PAIR")
+        print(f"{'=' * 120}")
+
+        for row in vp.itertuples():
+            pair = getattr(row, 'pair', '?')
+            live = pair_live.get(pair, {})
+            print(f"\n  ┌─ {pair} {'─' * (80 - len(pair))}")
+
+            # OU Parameters
+            theta = getattr(row, 'theta', 0) or 0
+            mu = getattr(row, 'mu', 0) or 0
+            sigma = getattr(row, 'sigma', 0) or 0
+            hl = getattr(row, 'half_life_days', 0) or 0
+            zscore = live.get('zscore', 0)
+            print(f"  │  OU Process:  θ={theta:.4f}  μ={mu:.4f}  σ={sigma:.4f}  "
+                  f"half-life={hl:.1f}d  z-score={zscore:+.3f}")
+
+            # Cointegration
+            eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
+            eg_s = getattr(row, 'eg_statistic', 0) or 0
+            joh_t = getattr(row, 'johansen_trace', 0) or 0
+            joh_c = getattr(row, 'johansen_crit', 0) or 0
+            hurst = getattr(row, 'hurst_exponent', 0) or 0
+            corr = getattr(row, 'correlation', 0) or 0
+            print(f"  │  Cointeg:    EG p={eg_p:.4f} stat={eg_s:.2f}  "
+                  f"Johansen trace={joh_t:.2f}/crit={joh_c:.2f}  "
+                  f"Hurst={hurst:.3f}  Corr={corr:.3f}")
+
+            # Kalman
+            ks = getattr(row, 'kalman_stability', 0) or 0
+            kir = getattr(row, 'kalman_innovation_ratio', 0) or 0
+            krs = getattr(row, 'kalman_regime_score', 0) or 0
+            kts = getattr(row, 'kalman_theta_significant', False)
+            kb = getattr(row, 'kalman_beta', 1.0)
+            kb_s = getattr(row, 'kalman_beta_stability', 0)
+            print(f"  │  Kalman:     stability={ks:.3f}  innov_ratio={kir:.3f}  "
+                  f"regime_score={krs:.3f}  θ_sig={kts}  "
+                  f"dyn_β={kb:.4f}  β_stab={kb_s:.3f}")
+
+            # GARCH
+            ga = getattr(row, 'garch_alpha', 0)
+            gb = getattr(row, 'garch_beta', 0)
+            gp = getattr(row, 'garch_persistence', 0)
+            gv = getattr(row, 'garch_current_vol', 0)
+            gc = getattr(row, 'garch_cvar_95', 0)
+            garch_method = "arch" if ARCH_AVAILABLE else "grid"
+            garch_note = ""
+            if ga == 0 and gb == 0 and gp == 0:
+                garch_note = "  (no vol clustering)"
+            print(f"  │  GARCH({garch_method}): α={ga:.4f}  β={gb:.4f}  "
+                  f"persistence={gp:.3f}  current_vol={gv:.2f}  CVaR95={gc:.4f}{garch_note}")
+
+            # Tail dependence
+            tl = getattr(row, 'tail_dep_lower', 0)
+            tu = getattr(row, 'tail_dep_upper', 0)
+            print(f"  │  Tail Dep:   λ_lower={tl:.4f}  λ_upper={tu:.4f}  "
+                  f"asymmetry={abs(tu - tl):.4f}")
+
+            # Fractional integration
+            fd = getattr(row, 'fractional_d', 0.5)
+            fdc = getattr(row, 'fractional_d_class', 'unknown')
+            print(f"  │  Frac Integ: d={fd:.4f}  class={fdc}")
+
+            # Robustness & Quality
+            robust = getattr(row, 'robustness_score', 0) or 0
+            wp = getattr(row, 'windows_passed', 0) or 0
+            wt = getattr(row, 'windows_tested', 0) or 0
+            quality = getattr(row, 'quality_score', 0)
+            opt_z = live.get('opt_z', 0)
+            print(f"  │  Quality:    score={quality:.3f}  robustness={robust:.3f} "
+                  f"({wp}/{wt} windows)  optimal_z*={opt_z:.2f}")
+
+            print(f"  └{'─' * 90}")
+
+        print(f"\n{sep}\n")
+
     # ------------------------------------------------------------------------
     # LAYER 3: SIGNAL GENERATION
     # ------------------------------------------------------------------------
@@ -2389,51 +3444,71 @@ class PairsTradingEngine:
     def generate_signal(self, pair: str, ou_model: OUProcess = None) -> TradeSignal:
         """Generate trade signal for a pair with OU probability calculations."""
         t1, t2 = pair.split('/')
-        
-        # Use pairwise aligned data
-        pair_data = self.price_data[[t1, t2]].dropna()
-        if len(pair_data) < 50:
-            return TradeSignal(
-                pair=pair, signal_type='NO_TRADE', current_zscore=0,
-                entry_spread=0, take_profit_spread=0, stop_loss_spread=0,
-                win_probability=0, expected_pnl=0, kelly_fraction=0,
-                risk_reward=0, avg_holding_days=0, confidence='LOW'
-            )
-        
-        if ou_model is None:
-            ou_model = self.ou_models.get(pair)
 
-        # Beräkna log_spread en gång och återanvänd
-        log_spread = np.log(pair_data[t1] / pair_data[t2])
-
-        if ou_model is None:
-            # Fit on the fly
-            ou_params = self.fit_ou_parameters(log_spread)
-            if not ou_params.valid:
+        # Use get_pair_ou_params for EG spread + Kalman z-score consistency
+        try:
+            ou_live, eg_spread, current_z = self.get_pair_ou_params(pair, use_raw_data=True)
+            if ou_model is None:
+                ou_model = ou_live
+            current_spread = eg_spread.iloc[-1]
+        except Exception:
+            # Fallback to basic approach
+            pair_data = self.price_data[[t1, t2]].dropna()
+            if len(pair_data) < 50:
                 return TradeSignal(
                     pair=pair, signal_type='NO_TRADE', current_zscore=0,
                     entry_spread=0, take_profit_spread=0, stop_loss_spread=0,
                     win_probability=0, expected_pnl=0, kelly_fraction=0,
                     risk_reward=0, avg_holding_days=0, confidence='LOW'
                 )
-            ou_model = OUProcess(ou_params.theta, ou_params.mu, ou_params.sigma)
+            if ou_model is None:
+                ou_model = self.ou_models.get(pair)
+            if ou_model is None:
+                log_spread = np.log(pair_data[t1] / pair_data[t2])
+                ou_params = self.fit_ou_parameters(log_spread)
+                if not ou_params.valid:
+                    return TradeSignal(
+                        pair=pair, signal_type='NO_TRADE', current_zscore=0,
+                        entry_spread=0, take_profit_spread=0, stop_loss_spread=0,
+                        win_probability=0, expected_pnl=0, kelly_fraction=0,
+                        risk_reward=0, avg_holding_days=0, confidence='LOW'
+                    )
+                ou_model = OUProcess(ou_params.theta, ou_params.mu, ou_params.sigma)
+                current_spread = log_spread.iloc[-1]
+            else:
+                eg = pair_data[t1] - pair_data[t2]
+                current_spread = eg.iloc[-1]
+            current_z = ou_model.zscore(current_spread)
 
-        current_spread = log_spread.iloc[-1]
-        current_z = ou_model.zscore(current_spread)
-        
-        entry_z = self.config['entry_zscore']
         exit_z = self.config['exit_zscore']
         stop_z = self.config['stop_zscore']
-        
-        # No signal if not at entry threshold
-        if abs(current_z) < entry_z:
+
+        # Compute pair-specific optimal entry z* (replaces global entry_zscore)
+        try:
+            pair_row = self._pair_index.get(pair)
+            g_p = getattr(pair_row, 'garch_persistence', 0.0) if pair_row else 0.0
+            f_d = getattr(pair_row, 'fractional_d', 0.5) if pair_row else 0.5
+            h_e = getattr(pair_row, 'hurst_exponent', 0.5) if pair_row else 0.5
+            opt_z_result = ou_model.optimal_entry_zscore(
+                z_exit=exit_z,
+                garch_persistence=g_p,
+                fractional_d=f_d,
+                hurst=h_e,
+            )
+            optimal_z = opt_z_result['optimal_z']
+        except Exception:
+            optimal_z = self.config['entry_zscore']
+
+        # No signal if not at pair-specific entry threshold
+        if abs(current_z) < optimal_z:
             return TradeSignal(
                 pair=pair, signal_type='NO_TRADE', current_zscore=current_z,
                 entry_spread=current_spread, take_profit_spread=0, stop_loss_spread=0,
                 win_probability=0, expected_pnl=0, kelly_fraction=0,
-                risk_reward=0, avg_holding_days=0, confidence='LOW'
+                risk_reward=0, avg_holding_days=0, confidence='LOW',
+                optimal_z_entry=optimal_z,
             )
-        
+
         # Determine direction and levels
         if current_z > 0:
             signal_type = 'SHORT_SPREAD'
@@ -2443,10 +3518,10 @@ class PairsTradingEngine:
             signal_type = 'LONG_SPREAD'
             take_profit = ou_model.spread_from_z(-exit_z)
             stop_loss = ou_model.spread_from_z(-stop_z)
-        
+
         # Calculate expected outcome
         metrics = ou_model.expected_pnl(current_spread, take_profit, stop_loss)
-        
+
         # Determine confidence
         if metrics['win_prob'] >= 0.65 and metrics['kelly_fraction'] >= 0.15:
             confidence = 'HIGH'
@@ -2455,12 +3530,12 @@ class PairsTradingEngine:
         else:
             confidence = 'LOW'
             signal_type = 'NO_TRADE'
-        
-        avg_holding = (metrics['avg_win_days'] * metrics['win_prob'] + 
+
+        avg_holding = (metrics['avg_win_days'] * metrics['win_prob'] +
                       metrics['avg_loss_days'] * metrics['loss_prob'])
         if np.isnan(avg_holding):
             avg_holding = ou_model.half_life_days() * 2
-        
+
         return TradeSignal(
             pair=pair,
             signal_type=signal_type,
@@ -2473,18 +3548,62 @@ class PairsTradingEngine:
             kelly_fraction=metrics['kelly_fraction'],
             risk_reward=metrics['risk_reward'],
             avg_holding_days=avg_holding,
-            confidence=confidence
+            confidence=confidence,
+            optimal_z_entry=optimal_z,
         )
     
     def generate_all_signals(self) -> Dict[str, TradeSignal]:
         """Generate signals for all viable pairs."""
         self.signals = {}
-        
+
         for pair in self.ou_models.keys():
             signal = self.generate_signal(pair)
             self.signals[pair] = signal
-        
+
+        # Print signal report
+        self._print_signal_report()
+
         return self.signals
+
+    def _print_signal_report(self):
+        """Print signal summary to console."""
+        if not self.signals:
+            return
+
+        active = [s for s in self.signals.values()
+                  if s.signal_type in ('LONG_SPREAD', 'SHORT_SPREAD')]
+        no_trade = [s for s in self.signals.values()
+                    if s.signal_type == 'NO_TRADE']
+
+        sep = "=" * 100
+        print(f"\n{sep}")
+        print(f"  SIGNAL REPORT — {len(active)} active / {len(no_trade)} no-trade / {len(self.signals)} total")
+        print(f"{sep}")
+
+        if active:
+            header = (
+                f"  {'Pair':<22} {'Signal':<15} {'Z-score':>8} {'Win%':>6} "
+                f"{'E[PnL]':>8} {'Kelly':>6} {'R:R':>6} {'Hold':>6} "
+                f"{'Opt.Z*':>7} {'Conf':<6}"
+            )
+            print(header)
+            print(f"  {'-' * 96}")
+            for s in sorted(active, key=lambda x: -x.win_probability):
+                print(
+                    f"  {s.pair:<22} {s.signal_type:<15} {s.current_zscore:>+8.3f} "
+                    f"{s.win_probability:>5.1%} {s.expected_pnl:>8.4f} "
+                    f"{s.kelly_fraction:>6.3f} {s.risk_reward:>6.2f} "
+                    f"{s.avg_holding_days:>5.1f}d {s.optimal_z_entry or 0:>7.2f} "
+                    f"{s.confidence:<6}"
+                )
+
+        if no_trade:
+            print(f"\n  No-trade pairs (|z| < Opt.Z*):")
+            for s in sorted(no_trade, key=lambda x: -abs(x.current_zscore)):
+                oz = s.optimal_z_entry or 0
+                print(f"    {s.pair:<22} z={s.current_zscore:>+.3f}  (need ±{oz:.2f})")
+
+        print(f"{sep}\n")
     
     def get_active_signals(self) -> List[TradeSignal]:
         """Get all pairs with active trade signals."""
@@ -2662,6 +3781,7 @@ class PairsTradingEngine:
 
         # Get pair-specific aligned data
         pair_data = data_source[[t1, t2]].dropna()
+        pair_row = self._pair_index.get(pair)
 
         if window_size is not None:
             # Explicit window size override
@@ -2670,7 +3790,6 @@ class PairsTradingEngine:
         else:
             # Truncate to shortest passing robustness window for consistency
             # with scanner results (scanner OU params come from shortest window)
-            pair_row = self._pair_index.get(pair)
             if pair_row is not None:
                 pw = getattr(pair_row, 'passing_windows', None)
                 if pw and len(pw) > 0:
@@ -2695,8 +3814,6 @@ class PairsTradingEngine:
         hedge_ratio = 1.0
         intercept = 0.0
 
-        if pair_row is None:
-            pair_row = self._pair_index.get(pair)
         if pair_row is not None:
             hedge_ratio = float(pair_row.hedge_ratio)
             intercept = float(pair_row.intercept)
@@ -2711,13 +3828,26 @@ class PairsTradingEngine:
             except Exception:
                 pass  # Keep defaults
         
-        # Calculate Engle-Granger spread: Y - β*X - α
-        eg_spread = y - hedge_ratio * x - intercept
-        
+        # Build spread — prefer Kalman dynamic hedge ratio over static OLS
+        kalman_hedge = None
+        try:
+            kalman_hedge = KalmanHedgeRatio().fit(y, x)
+            if kalman_hedge.valid and kalman_hedge.beta_history is not None:
+                eg_spread = pd.Series(
+                    y.values - kalman_hedge.beta_history * x.values - kalman_hedge.alpha_history,
+                    index=y.index
+                )
+                hedge_ratio = kalman_hedge.beta_current
+                intercept = kalman_hedge.alpha_current
+            else:
+                eg_spread = y - hedge_ratio * x - intercept
+        except Exception:
+            eg_spread = y - hedge_ratio * x - intercept
+
         # ===== OU PARAMETER ESTIMATION =====
         ou_params = None
         kalman_result = None
-        
+
         if method == 'kalman':
             # PRIMARY: Kalman filter with adaptive Q and RTS smoother
             try:
@@ -2795,6 +3925,264 @@ class PairsTradingEngine:
         }
 
         return ou, eg_spread, current_z
+
+    def margrabe_valuation(self, pair: str, T: float = None) -> Dict:
+        """
+        Margrabe exchange option valuation for spread.
+
+        C = Y·N(d1) - β·X·N(d2)
+        where σ_spread = √(σ_Y² + β²·σ_X² - 2·β·ρ·σ_Y·σ_X)
+
+        Args:
+            pair: Pair string "TICKER_Y/TICKER_X"
+            T: Time to expiry in years (default: half-life based)
+
+        Returns:
+            Dict with fair_value, implied_vol, greeks
+        """
+        try:
+            t1, t2 = pair.split('/')
+            pair_row = self._pair_index.get(pair)
+            hedge_ratio = float(pair_row.hedge_ratio) if pair_row else 1.0
+
+            prices = self.price_data[[t1, t2]].dropna()
+            if len(prices) < 60:
+                return {}
+
+            y_price = float(prices[t1].iloc[-1])
+            x_price = float(prices[t2].iloc[-1])
+
+            # Component volatilities (annualized)
+            ret_y = prices[t1].pct_change().dropna()
+            ret_x = prices[t2].pct_change().dropna()
+            sigma_y = float(ret_y.std() * np.sqrt(252))
+            sigma_x = float(ret_x.std() * np.sqrt(252))
+            rho = float(ret_y.corr(ret_x))
+
+            # Spread volatility
+            sigma_spread = np.sqrt(
+                sigma_y**2 + hedge_ratio**2 * sigma_x**2
+                - 2 * hedge_ratio * rho * sigma_y * sigma_x
+            )
+
+            if T is None:
+                ou_model = self.ou_models.get(pair)
+                if ou_model:
+                    T = ou_model.half_life_days() / 252
+                else:
+                    T = 20 / 252  # Default 20 trading days
+
+            T = max(T, 1/252)  # Minimum 1 day
+
+            # Margrabe formula: option to exchange β·X for Y
+            S1 = y_price
+            S2 = hedge_ratio * x_price
+
+            if S2 <= 0 or sigma_spread <= 0:
+                return {}
+
+            d1 = (np.log(S1 / S2) + 0.5 * sigma_spread**2 * T) / (sigma_spread * np.sqrt(T))
+            d2 = d1 - sigma_spread * np.sqrt(T)
+
+            N = stats.norm.cdf
+            n = stats.norm.pdf
+
+            fair_value = S1 * N(d1) - S2 * N(d2)
+
+            # Greeks
+            delta_y = N(d1)
+            delta_x = -hedge_ratio * N(d2)
+            gamma = n(d1) / (S1 * sigma_spread * np.sqrt(T)) if S1 > 0 else 0
+            vega = S1 * n(d1) * np.sqrt(T)
+            theta = -(S1 * n(d1) * sigma_spread) / (2 * np.sqrt(T)) / 252  # Per day
+
+            return {
+                'fair_value': float(fair_value),
+                'implied_vol': float(sigma_spread),
+                'delta_y': float(delta_y),
+                'delta_x': float(delta_x),
+                'gamma': float(gamma),
+                'vega': float(vega),
+                'theta': float(theta),
+                'T_days': float(T * 252),
+            }
+        except Exception as e:
+            print(f"Margrabe valuation error for {pair}: {e}")
+            return {}
+
+    def calculate_quality_scores(self):
+        """
+        Calculate composite quality score for all viable pairs.
+
+        Weighted composite:
+            - IR proxy (spread return / spread vol): 0.30
+            - Win probability: 0.20
+            - Hurst exponent: 0.15  (lower = better)
+            - Kalman stability: 0.15
+            - Robustness score: 0.10
+            - Half-life score: 0.10  (closer to ideal range = better)
+
+        Adds 'quality_score' column to self.viable_pairs.
+        """
+        if self.viable_pairs is None or len(self.viable_pairs) == 0:
+            return
+
+        df = self.viable_pairs
+
+        # Compute raw metrics
+        n = len(df)
+        scores = np.zeros(n)
+
+        # Helper: rank-normalize to [0, 1] (higher = better)
+        def rank_norm(series, higher_is_better=True):
+            s = pd.Series(series)
+            ranks = s.rank(method='average')
+            normalized = (ranks - 1) / max(n - 1, 1)
+            if not higher_is_better:
+                normalized = 1 - normalized
+            return normalized.values
+
+        # 1. IR proxy: theta * eq_std / sigma (mean-reversion "Sharpe")
+        ir_proxy = np.zeros(n)
+        for i, row in enumerate(df.itertuples()):
+            theta = getattr(row, 'theta', 0)
+            sigma = getattr(row, 'sigma', 1)
+            if sigma > 0 and theta > 0:
+                ir_proxy[i] = theta / sigma
+        ir_scores = rank_norm(ir_proxy, higher_is_better=True)
+
+        # 2. Win probability (computed on the fly)
+        win_probs = np.zeros(n)
+        for i, row in enumerate(df.itertuples()):
+            ou = self.ou_models.get(row.pair)
+            if ou:
+                try:
+                    entry_z = self.config['entry_zscore']
+                    exit_z = self.config['exit_zscore']
+                    stop_z = self.config['stop_zscore']
+                    S0 = ou.spread_from_z(entry_z)
+                    tp = ou.spread_from_z(exit_z)
+                    sl = ou.spread_from_z(stop_z)
+                    result = ou.win_probability(S0, tp, sl, n_sims=1000, max_time_years=0.25)
+                    win_probs[i] = result['win_prob']
+                except Exception:
+                    win_probs[i] = 0.5
+            else:
+                win_probs[i] = 0.5
+        wp_scores = rank_norm(win_probs, higher_is_better=True)
+
+        # 3. Hurst exponent (lower = better mean reversion)
+        hurst_vals = df['hurst_exponent'].values if 'hurst_exponent' in df.columns else np.full(n, 0.5)
+        hurst_scores = rank_norm(hurst_vals, higher_is_better=False)
+
+        # 4. Kalman stability
+        kalman_stab = df['kalman_stability'].values if 'kalman_stability' in df.columns else np.zeros(n)
+        stab_scores = rank_norm(kalman_stab, higher_is_better=True)
+
+        # 5. Robustness score
+        rob_vals = df['robustness_score'].values if 'robustness_score' in df.columns else np.zeros(n)
+        rob_scores = rank_norm(rob_vals, higher_is_better=True)
+
+        # 6. Half-life score (closer to ideal range 5-30 = better)
+        hl_vals = df['half_life_days'].values if 'half_life_days' in df.columns else np.full(n, 30)
+        hl_score_raw = np.zeros(n)
+        for i, hl in enumerate(hl_vals):
+            if 5 <= hl <= 30:
+                hl_score_raw[i] = 1.0
+            elif hl < 5:
+                hl_score_raw[i] = max(0, hl / 5)
+            else:
+                hl_score_raw[i] = max(0, 1 - (hl - 30) / 30)
+        hl_scores = rank_norm(hl_score_raw, higher_is_better=True)
+
+        # Weighted composite
+        quality = (0.30 * ir_scores + 0.20 * wp_scores + 0.15 * hurst_scores +
+                   0.15 * stab_scores + 0.10 * rob_scores + 0.10 * hl_scores)
+
+        self.viable_pairs['quality_score'] = quality
+
+    def calculate_spread_correlations(self) -> Dict:
+        """
+        Calculate spread-return correlations between open positions.
+
+        Eigendecomposition → effective_bets = (Σλ)²/Σλ²
+        Concentration score = 1 / effective_bets (normalized)
+
+        Returns:
+            Dict with effective_bets, concentration_score, max_corr_pair, corr_matrix
+        """
+        if not self.positions or len(self.positions) < 2:
+            return {
+                'effective_bets': len(self.positions) if self.positions else 0,
+                'concentration_score': 0.0,
+                'max_corr_pair': ('', '', 0.0),
+                'corr_matrix': None,
+            }
+
+        # Collect spread returns for each open position
+        spread_returns = {}
+        for pair in self.positions:
+            try:
+                _, spread, _ = self.get_pair_ou_params(pair, use_raw_data=True)
+                ret = spread.pct_change().dropna()
+                if len(ret) > 20:
+                    spread_returns[pair] = ret
+            except Exception:
+                continue
+
+        if len(spread_returns) < 2:
+            return {
+                'effective_bets': len(spread_returns),
+                'concentration_score': 0.0,
+                'max_corr_pair': ('', '', 0.0),
+                'corr_matrix': None,
+            }
+
+        # Build correlation matrix
+        pairs_list = list(spread_returns.keys())
+        ret_df = pd.DataFrame(spread_returns).dropna()
+
+        if len(ret_df) < 20:
+            return {
+                'effective_bets': len(pairs_list),
+                'concentration_score': 0.0,
+                'max_corr_pair': ('', '', 0.0),
+                'corr_matrix': None,
+            }
+
+        corr_matrix = ret_df.corr()
+
+        # Eigendecomposition
+        eigenvalues = np.linalg.eigvalsh(corr_matrix.values)
+        eigenvalues = np.maximum(eigenvalues, 0)  # Numerical guard
+
+        sum_lambda = np.sum(eigenvalues)
+        sum_lambda_sq = np.sum(eigenvalues**2)
+
+        if sum_lambda_sq > 0:
+            effective_bets = sum_lambda**2 / sum_lambda_sq
+        else:
+            effective_bets = float(len(pairs_list))
+
+        concentration_score = 1.0 - (effective_bets / len(pairs_list)) if len(pairs_list) > 0 else 0.0
+        concentration_score = max(0, min(1, concentration_score))
+
+        # Find max correlation pair
+        max_corr = 0.0
+        max_pair = ('', '')
+        for i in range(len(pairs_list)):
+            for j in range(i+1, len(pairs_list)):
+                c = abs(corr_matrix.iloc[i, j])
+                if c > max_corr:
+                    max_corr = c
+                    max_pair = (pairs_list[i], pairs_list[j])
+
+        return {
+            'effective_bets': float(effective_bets),
+            'concentration_score': float(concentration_score),
+            'max_corr_pair': (max_pair[0], max_pair[1], float(max_corr)),
+            'corr_matrix': corr_matrix,
+        }
 
     def get_spread_history(self, pair: str, use_raw_data: bool = True) -> pd.DataFrame:
         """Get historical spread data with z-scores and bands using Engle-Granger spread."""

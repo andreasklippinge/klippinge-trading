@@ -155,7 +155,7 @@ class UpdateCheckerWorker(QObject):
             return
         
         try:
-            print(f"[AutoUpdater] Checking for updates... (current: {self.current_version})")
+            # Checking for updates
             
             response = requests.get(
                 GITHUB_API_URL,
@@ -164,7 +164,7 @@ class UpdateCheckerWorker(QObject):
             )
             
             if response.status_code == 404:
-                print("[AutoUpdater] No releases found")
+                pass  # No releases
                 self.no_update.emit()
                 self.finished.emit()
                 return
@@ -187,19 +187,16 @@ class UpdateCheckerWorker(QObject):
             if not download_url:
                 download_url = release.get('html_url', '')
             
-            print(f"[AutoUpdater] Remote version: {remote_version}")
-            
             # Kontrollera om detta är en ny version
             if is_newer_version(remote_version, self.current_version):
                 # Kontrollera om användaren redan hoppat över denna version
                 if self.skipped_version and remote_version == self.skipped_version:
-                    print(f"[AutoUpdater] Version {remote_version} was skipped by user")
                     self.no_update.emit()
                 else:
                     print(f"[AutoUpdater] New version available: {remote_version}")
                     self.update_available.emit(remote_version, download_url, release_notes)
             else:
-                print("[AutoUpdater] No new version available")
+                self.no_update.emit()
                 self.no_update.emit()
             
         except requests.exceptions.Timeout:
@@ -375,7 +372,7 @@ class AutoUpdater(QObject):
     
     def start(self):
         """Start the auto-updater (check now + start timer)."""
-        print(f"[AutoUpdater] Starting with {self.check_interval_ms/1000/60:.0f} minute interval")
+        # AutoUpdater started
         
         # Kör en första kontroll efter kort delay (låt GUI ladda först)
         QTimer.singleShot(5000, self.check_for_updates)
@@ -386,12 +383,12 @@ class AutoUpdater(QObject):
     def stop(self):
         """Stop the auto-updater."""
         self.timer.stop()
-        print("[AutoUpdater] Stopped")
+        pass  # AutoUpdater stopped
     
     def check_for_updates(self):
         """Check for updates in background thread."""
         if self._checking:
-            print("[AutoUpdater] Already checking, skipping")
+            pass  # Already checking
             return
         
         self._checking = True
@@ -429,12 +426,12 @@ class AutoUpdater(QObject):
     
     def _on_update_found(self, version: str, url: str, notes: str):
         """Handle update found."""
-        print(f"[AutoUpdater] Update found: {version}")
+        # Update found
         self.update_available.emit(version, url, notes)
     
     def _on_no_update(self):
         """Handle no update available."""
-        print("[AutoUpdater] No update available")
+        pass  # No update available
     
     def _on_check_error(self, error: str):
         """Handle check error."""

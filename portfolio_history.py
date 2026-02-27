@@ -132,7 +132,7 @@ class PortfolioHistoryManager:
                     PortfolioSnapshot.from_dict(s) 
                     for s in data.get('snapshots', [])
                 ]
-                print(f"Loaded {len(self.snapshots)} historical snapshots")
+                pass  # Snapshots loaded
             except Exception as e:
                 print(f"Error loading portfolio history: {e}")
                 self.snapshots = []

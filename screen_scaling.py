@@ -178,7 +178,7 @@ def get_scaled_typography(scale_factor: float = None) -> Dict[str, int]:
         # Skala och runda till närmaste heltal
         scaled[key] = max(8, round(base_size * scale_factor))
     
-    print(f"[ScreenScaling] Applied scale factor: {scale_factor:.2f}")
+    # Scale factor applied
     return scaled
 
 
@@ -264,7 +264,7 @@ def apply_screen_scaling():
     except:
         pass  # Inte på Windows eller funkar inte
     
-    print("[ScreenScaling] High DPI scaling enabled")
+    # High DPI scaling enabled
 
 
 def get_scaled_stylesheet(base_stylesheet: str, scale_factor: float = None) -> str:
