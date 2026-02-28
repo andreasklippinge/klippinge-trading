@@ -2662,25 +2662,52 @@ class AnalysisWorker(QObject):
     @Slot()
     def run(self):
         try:
+            import time as _time
+
             self.progress.emit(5, "Initializing engine...")
+            print(f"[Worker] Start: {len(self.tickers)} tickers, period={self.lookback}, config={self.config}")
             engine = PairsTradingEngine(self.config)
-            
-            self.progress.emit(15, f"Fetching data for {len(self.tickers)} tickers...")
-            engine.fetch_data(self.tickers, 'max')
-            
+
+            self.progress.emit(10, f"Fetching data for {len(self.tickers)} tickers (period={self.lookback})...")
+            t0 = _time.time()
+
+            def _fetch_progress(done, total, msg):
+                # Mappa fetch-progress till 10-40% av totalen
+                if total > 0:
+                    pct = 10 + int(30 * done / total)
+                else:
+                    pct = 15
+                self.progress.emit(pct, msg)
+                print(f"[Worker/fetch] {msg}")
+
+            engine.fetch_data(self.tickers, self.lookback, progress_callback=_fetch_progress)
+            t1 = _time.time()
+            print(f"[Worker] fetch_data klart på {t1-t0:.1f}s")
+
             if engine.price_data is None or len(engine.price_data.columns) == 0:
                 self.error.emit("No price data loaded")
+                print(f"[Worker] ABORT: Ingen prisdata laddad")
                 return
-            
+
             loaded = len(engine.price_data.columns)
-            self.progress.emit(40, f"Loaded {loaded} tickers, screening pairs...")
-            
+            total = len(self.tickers)
+            failed = len(getattr(engine, 'failed_tickers', []))
+            fail_msg = f" ({failed} failed)" if failed else ""
+            print(f"[Worker] Laddade {loaded}/{total} tickers{fail_msg}, {len(engine.price_data)} rader data")
+            self.progress.emit(40, f"Loaded {loaded}/{total} tickers{fail_msg}, screening pairs...")
+
+            t2 = _time.time()
             engine.screen_pairs(correlation_prefilter=True)
-            
+            t3 = _time.time()
+            viable = len(engine.viable_pairs)
+            print(f"[Worker] screen_pairs klart på {t3-t2:.1f}s — {viable} viable pairs")
+
             self.progress.emit(100, "Complete!")
             self.result.emit(engine)
-            
+
         except Exception as e:
+            import traceback
+            print(f"[Worker] EXCEPTION: {e}\n{traceback.format_exc()}")
             self.error.emit(str(e))
         finally:
             self.finished.emit()
@@ -7328,7 +7355,7 @@ class PairsTradingTerminal(QMainWindow):
             self.tickers_input.setText(', '.join(tickers))
 
             # Force Extended preset for scheduled scans (max data points)
-            self.lookback_combo.setCurrentText("Extended (250-2500)")
+            # Period är alltid 2y — ingen combo att sätta
 
             # Store that this is a scheduled scan so we can send Discord after completion
             self._is_scheduled_scan = True
@@ -8180,12 +8207,6 @@ class PairsTradingTerminal(QMainWindow):
         arrow = "\u25bc" if visible else "\u25b6"
         self.sizing_header.setText(f"{arrow} POSITION SIZING")
 
-    def _toggle_robustness_section(self):
-        visible = not self.robustness_container.isVisible()
-        self.robustness_container.setVisible(visible)
-        arrow = "\u25bc" if visible else "\u25b6"
-        self.robustness_header.setText(f"{arrow} WINDOW ROBUSTNESS")
-
     def _on_tab_changed(self, index: int):
         """Handle tab change - load tab content on demand.
         
@@ -8448,17 +8469,15 @@ class PairsTradingTerminal(QMainWindow):
         ticker_group.addWidget(self.tickers_input)
         config_layout.addLayout(ticker_group)
         
-        # Windows preset
-        lookback_group = QVBoxLayout()
-        lookback_label = QLabel("WINDOWS:")
-        lookback_label.setStyleSheet("color: #d4a574; font-size: 11px; font-weight: 600; letter-spacing: 1px; padding: 6px; border: none;")
-        lookback_group.addWidget(lookback_label)
-        self.lookback_combo = QComboBox()
-        self.lookback_combo.addItems(["Standard (250-2000)", "Quick (750-1500)", "Extended (250-2500)"])
-        self.lookback_combo.setCurrentIndex(0)
-        self.lookback_combo.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333; padding: 6px; min-width: 80px;")
-        lookback_group.addWidget(self.lookback_combo)
-        config_layout.addLayout(lookback_group)
+        # Period label (ingen combo längre — alltid 2y)
+        period_group = QVBoxLayout()
+        period_label = QLabel("PERIOD:")
+        period_label.setStyleSheet("color: #d4a574; font-size: 11px; font-weight: 600; letter-spacing: 1px; padding: 6px; border: none;")
+        period_group.addWidget(period_label)
+        self.period_display = QLabel("2 år")
+        self.period_display.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333; padding: 6px; min-width: 80px; color: #e0e0e0;")
+        period_group.addWidget(self.period_display)
+        config_layout.addLayout(period_group)
         
         config_layout.addStretch()
         
@@ -8573,8 +8592,8 @@ class PairsTradingTerminal(QMainWindow):
             "• Innovation ratio: [0.4, 2.5]",
             "• Regime score: < 4.0",
             "• \u03b8 significant at 95% CI",
-            "\u2500\u2500 Robustness \u2500\u2500",
-            "• \u2265 3 consecutive windows pass",
+            "\u2500\u2500 Data \u2500\u2500",
+            "• Period: 2 år (~500 handelsdagar)",
         ]
         for item in criteria_items:
             lbl = QLabel(item)
@@ -8605,25 +8624,23 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.verticalHeader().setVisible(False)
         self.viable_table.verticalHeader().setDefaultSectionSize(44)  # Öka radhöjd ytterligare
 
-        self.viable_table.setColumnCount(16)
+        self.viable_table.setColumnCount(14)
         self.viable_table.setHorizontalHeaderLabels([
-            "Pair", "Quality", "Z-Score", "Half-life (days)", "EG p-value", "Johansen trace",
-            "Hurst", "Frac.d", "Correlation", "Robustness",
+            "Pair", "Z-Score", "Half-life", "EG p-value", "Johansen",
+            "Hurst", "Frac.d", "Correlation",
             "Kalman Stab.", "Innov. Ratio", "Regime Score", "\u03b8 Sig.",
             "Tail Dep", "Opt.Z*"
         ])
         # Tooltips for scanner columns
         _scanner_tips = [
             "Stock pair Y/X. Spread = Y - \u03b2\u00b7X - \u03b1",
-            "Composite quality score [0-1].\nWeighted: IR(30%), WinProb(20%), Hurst(15%),\nKalman(15%), Robustness(10%), HL(10%).",
-            "Current Z-score of the spread.\n|Z| > 2.0 = signal (highlighted).\nComputed from shortest passing window.",
+            "Current Z-score of the spread.\n|Z| > Opt.Z* = signal (highlighted).",
             "Days for spread to move halfway to equilibrium.\nln(2)/\u03b8 \u00d7 252. Ideal: 5-60 days.",
             "Engle-Granger cointegration p-value.\np < 0.05 = significant mean reversion.",
             "Johansen trace statistic.\nHigher = stronger cointegration evidence.",
             "Hurst exponent. H < 0.5 = mean-reverting (good).\nH \u2248 0.5 = random walk. H > 0.5 = trending.",
             "Fractional integration parameter d.\nd < 0 = strong MR, 0-0.5 = weak MR,\n0.5-1 = borderline, > 1 = non-stationary.",
             "Pearson correlation between Y and X.\nHigher = more stable hedge. > 0.8 desirable.",
-            "Windows passed / windows tested.\nHigher = more robust across time periods.",
             "Kalman parameter stability [0-1].\n1 = perfectly stable \u03b8. > 0.5 required.",
             "Normalized innovation ratio.\nShould be \u22481.0 (valid range [0.5, 2.0]).",
             "CUSUM regime change score.\n< 4.0 = no structural break detected.",
@@ -8675,62 +8692,7 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.doubleClicked.connect(self._on_scanner_pair_double_clicked)
         results_layout.addWidget(self.viable_table)
 
-        # Window breakdown panel (hidden by default)
-        self.window_detail_frame = QFrame()
-        self.window_detail_frame.setVisible(False)
-        self.window_detail_frame.setMaximumHeight(280)
-        self.window_detail_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['bg_elevated']};
-                border: 1px solid {COLORS['border_default']};
-                border-radius: 6px;
-            }}
-        """)
-        wd_layout = QVBoxLayout(self.window_detail_frame)
-        wd_layout.setContentsMargins(10, 8, 10, 8)
-        wd_layout.setSpacing(4)
-
-        self.window_detail_header = QLabel("WINDOW BREAKDOWN")
-        self.window_detail_header.setStyleSheet(
-            f"color: {COLORS['accent']}; font-size: 12px; font-weight: 600; "
-            f"letter-spacing: 1px; background: transparent; border: none;")
-        wd_layout.addWidget(self.window_detail_header)
-
-        self.window_detail_table = QTableWidget()
-        self.window_detail_table.setColumnCount(9)
-        self.window_detail_table.setHorizontalHeaderLabels([
-            "Window", "Status", "Half-life", "EG p-val", "Johansen",
-            "Hurst", "Corr", "Kalman Stab", "Failed At"
-        ])
-        self.window_detail_table.verticalHeader().setVisible(False)
-        self.window_detail_table.verticalHeader().setDefaultSectionSize(28)
-        self.window_detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.window_detail_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.window_detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.window_detail_table.setStyleSheet(f"""
-            QTableWidget {{
-                background-color: {COLORS['bg_card']};
-                gridline-color: {COLORS['border_subtle']};
-                border: none;
-                font-family: 'JetBrains Mono', 'Consolas', monospace;
-                font-size: 11px;
-            }}
-            QTableWidget::item {{
-                padding: 4px 6px;
-                border-bottom: 1px solid {COLORS['border_subtle']};
-            }}
-            QHeaderView::section {{
-                background-color: {COLORS['bg_dark']};
-                color: {COLORS['text_secondary']};
-                padding: 6px 4px;
-                border: none;
-                border-bottom: 1px solid {COLORS['border_default']};
-                font-weight: 600;
-                font-size: 10px;
-            }}
-        """)
-        wd_layout.addWidget(self.window_detail_table)
-        results_layout.addWidget(self.window_detail_frame)
+        # (Window breakdown borttagen — alla nyckeltal visas direkt i tabellen)
 
         # All Pairs expandable
         self.all_pairs_btn = QPushButton("▼ View All Analyzed Pairs")
@@ -8948,38 +8910,16 @@ class PairsTradingTerminal(QMainWindow):
         exp_grid.addWidget(self.exp_x_only_card, 0, 2)
         left_layout.addLayout(exp_grid)
 
-        # === WINDOW ROBUSTNESS (collapsible, collapsed by default) ===
+        # === DATA INFO ===
         left_layout.addWidget(_ou_divider())
-        self.robustness_header = QPushButton("\u25b6 WINDOW ROBUSTNESS")
-        self.robustness_header.setStyleSheet(f"""
-            color: {COLORS['accent']}; font-size: 13px; font-weight: 700;
-            letter-spacing: 1px; border: none; text-align: left;
-            padding: 2px 0px; background: transparent;
-        """)
-        self.robustness_header.setCursor(Qt.PointingHandCursor)
-        self.robustness_header.clicked.connect(self._toggle_robustness_section)
-        left_layout.addWidget(self.robustness_header)
+        left_layout.addWidget(_ou_header("DATA"))
 
-        self.robustness_container = QWidget()
-        robustness_container_layout = QVBoxLayout(self.robustness_container)
-        robustness_container_layout.setContentsMargins(0, 0, 0, 0)
-        robustness_container_layout.setSpacing(4)
-
-        rob_grid = QGridLayout()
-        rob_grid.setSpacing(8)
-        self.ou_robustness_card = CompactMetricCard("ROBUSTNESS SCORE", "-",
-            tooltip="Windows passed / windows tested.\nGreen \u226570%, Yellow \u226550%, Red <50%.")
-        rob_grid.addWidget(self.ou_robustness_card, 0, 0)
-        robustness_container_layout.addLayout(rob_grid)
-
-        self.ou_window_container = QWidget()
-        self.ou_window_container_layout = QVBoxLayout(self.ou_window_container)
-        self.ou_window_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.ou_window_container_layout.setSpacing(2)
-        robustness_container_layout.addWidget(self.ou_window_container)
-
-        self.robustness_container.setVisible(False)
-        left_layout.addWidget(self.robustness_container)
+        data_grid = QGridLayout()
+        data_grid.setSpacing(8)
+        self.ou_data_length_card = CompactMetricCard("DATAPUNKTER", "-",
+            tooltip="Antal handelsdagar i pair-datasetet.")
+        data_grid.addWidget(self.ou_data_length_card, 0, 0)
+        left_layout.addLayout(data_grid)
 
         # === GARCH + TAIL + FRACTIONAL + HEDGE (compact combined row) ===
         left_layout.addWidget(_ou_divider())
@@ -9179,9 +9119,9 @@ class PairsTradingTerminal(QMainWindow):
         """Create Pair Signals tab with professional institutional layout."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 15, 20, 15)
-        
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+
         # ===== TOP: Signal selector row =====
         top_frame = QFrame()
         top_frame.setStyleSheet(f"""
@@ -9241,9 +9181,14 @@ class PairsTradingTerminal(QMainWindow):
         
         layout.addWidget(top_frame)
         
-        # ===== MAIN CONTENT: Two-column layout (2:3 ratio) =====
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(16)
+        # ===== MAIN CONTENT: Splitter (2:3 ratio, samma som OU Analytics) =====
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(3)
+        splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background-color: {COLORS['border_subtle']};
+            }}
+        """)
         
         # ===== LEFT COLUMN: Signal State, Position Sizing, Derivatives =====
         left_scroll = QScrollArea()
@@ -9808,7 +9753,7 @@ class PairsTradingTerminal(QMainWindow):
         left_layout.addStretch()
         
         left_scroll.setWidget(left_panel)
-        content_layout.addWidget(left_scroll, stretch=2)
+        splitter.addWidget(left_scroll)
         
         # ===== RIGHT COLUMN: Charts =====
         right_panel = QFrame()
@@ -9904,10 +9849,13 @@ class PairsTradingTerminal(QMainWindow):
             no_pg_label.setAlignment(Qt.AlignCenter)
             right_layout.addWidget(no_pg_label)
         
-        content_layout.addWidget(right_panel, stretch=3)
-        
-        layout.addLayout(content_layout)
-        
+        splitter.addWidget(right_panel)
+
+        # Samma ratio som OU Analytics: 400:600 = 2:3
+        splitter.setSizes([400, 600])
+
+        layout.addWidget(splitter)
+
         return tab
     
     # ========================================================================
@@ -13139,29 +13087,17 @@ class PairsTradingTerminal(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
-        # Map window preset to robustness_windows list
-        window_presets = {
-            "Standard (250-2000)": [250, 500, 750, 1000, 1250, 1500, 1750, 2000],
-            "Quick (750-1500)": [750, 1000, 1250, 1500],
-            "Extended (250-2500)": [250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500],
-        }
-        preset = self.lookback_combo.currentText()
-        windows = window_presets.get(preset, [250, 500, 750, 1000, 1250, 1500, 1750, 2000])
-        max_pts = max(windows) + 500 if windows else 2500
-
         config = {
-            'lookback_period': 'max',
+            'lookback_period': '2y',
             'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
             'min_correlation': 0.70,
-            'robustness_windows': windows,
-            'min_windows_passed': 4,
-            'max_data_points': max_pts,
+            'max_data_points': 600,
         }
 
         self.worker_thread = QThread()
-        self.worker = AnalysisWorker(tickers, 'max', config)
+        self.worker = AnalysisWorker(tickers, '2y', config)
         self.worker.moveToThread(self.worker_thread)
         
         self.worker_thread.started.connect(self.worker.run)
@@ -13232,8 +13168,22 @@ class PairsTradingTerminal(QMainWindow):
         if os.path.exists(ENGINE_CACHE_FILE):
             self._engine_cache_mtime = os.path.getmtime(ENGINE_CACHE_FILE)
         
-        self.statusBar().showMessage(f"Analysis complete: {n_viable} viable pairs found")
-        
+        # Visa varning om tickers misslyckades
+        failed_tickers = getattr(engine, 'failed_tickers', [])
+        if failed_tickers:
+            n_failed = len(failed_tickers)
+            n_total = n_tickers + n_failed
+            self.statusBar().showMessage(
+                f"Analysis complete: {n_viable} viable pairs — {n_failed}/{n_total} tickers kunde ej laddas")
+            # Visa popup om det inte är en schemalagd scan
+            if not getattr(self, '_is_scheduled_scan', False):
+                preview = ', '.join(failed_tickers[:20])
+                suffix = f"\n... och {n_failed - 20} till" if n_failed > 20 else ""
+                QMessageBox.warning(self, "Tickers misslyckades",
+                    f"{n_failed} av {n_total} tickers kunde inte laddas:\n\n{preview}{suffix}")
+        else:
+            self.statusBar().showMessage(f"Analysis complete: {n_viable} viable pairs found")
+
         # If this was a scheduled scan, send Discord and refresh volatility cache
         if self._is_scheduled_scan:
             self._is_scheduled_scan = False
@@ -13287,11 +13237,9 @@ class PairsTradingTerminal(QMainWindow):
             return
 
         df = self.engine.viable_pairs
-        # Sort by quality_score (or robustness_score as fallback) descending
-        if 'quality_score' in df.columns:
-            df = df.sort_values('quality_score', ascending=False)
-        elif 'robustness_score' in df.columns:
-            df = df.sort_values('robustness_score', ascending=False)
+        # Sortera på EG p-value (lägst = starkast kointegration)
+        if 'eg_pvalue' in df.columns:
+            df = df.sort_values('eg_pvalue', ascending=True)
         if hasattr(self, 'viable_count_label'):
             self.viable_count_label.setText(f"({len(df)})")
 
@@ -13299,27 +13247,28 @@ class PairsTradingTerminal(QMainWindow):
         self.viable_table.setUpdatesEnabled(False)
         try:
             self.viable_table.setRowCount(len(df))
-            # Fix #5: Use itertuples instead of iterrows (10-100x faster)
+
+            def _fmt(val):
+                """Dynamisk formatering: alltid 2 signifikanta decimaler."""
+                if val is None:
+                    return "-"
+                v = float(val)
+                if v == 0:
+                    return "0.00"
+                abs_v = abs(v)
+                if abs_v >= 1:
+                    return f"{v:.2f}"
+                # Hitta första icke-noll decimal och visa 2 siffror därifrån
+                import math
+                digits = -math.floor(math.log10(abs_v))
+                return f"{v:.{digits + 1}f}"
+
             for i, row in enumerate(df.itertuples()):
                 self.viable_table.setItem(i, 0, QTableWidgetItem(row.pair))
-                # Quality score (column 1)
-                qs = getattr(row, 'quality_score', None)
-                if qs is not None:
-                    qs_item = QTableWidgetItem(f"{qs:.2f}")
-                    if qs >= 0.7:
-                        qs_item.setForeground(QColor(COLORS['positive']))
-                    elif qs >= 0.4:
-                        qs_item.setForeground(QColor(COLORS['warning']))
-                    else:
-                        qs_item.setForeground(QColor(COLORS['negative']))
-                    self.viable_table.setItem(i, 1, qs_item)
-                else:
-                    self.viable_table.setItem(i, 1, QTableWidgetItem("-"))
-                # Z-Score from shortest passing window (column 2)
+                # Z-Score (column 1)
                 try:
                     ou_tmp, _, z_val = self.engine.get_pair_ou_params(row.pair, use_raw_data=True)
                     z_item = QTableWidgetItem(f"{z_val:+.2f}")
-                    # Highlight when |z| exceeds pair's own optimal z*
                     try:
                         g_p = getattr(row, 'garch_persistence', 0.0)
                         f_d = getattr(row, 'fractional_d', 0.5)
@@ -13332,18 +13281,22 @@ class PairsTradingTerminal(QMainWindow):
                     if abs(z_val) >= pair_opt_z:
                         z_item.setForeground(QColor(COLORS['positive'] if z_val < 0 else COLORS['negative']))
                         z_item.setBackground(QColor(COLORS['positive_bg'] if z_val < 0 else COLORS['negative_bg']))
-                    self.viable_table.setItem(i, 2, z_item)
+                    self.viable_table.setItem(i, 1, z_item)
                 except Exception:
-                    self.viable_table.setItem(i, 2, QTableWidgetItem("-"))
-                self.viable_table.setItem(i, 3, QTableWidgetItem(f"{row.half_life_days:.2f}"))
-                self.viable_table.setItem(i, 4, QTableWidgetItem(f"{row.eg_pvalue:.4f}"))
-                self.viable_table.setItem(i, 5, QTableWidgetItem(f"{row.johansen_trace:.2f}"))
-                self.viable_table.setItem(i, 6, QTableWidgetItem(f"{row.hurst_exponent:.2f}"))
-                # Fractional d (column 7)
+                    self.viable_table.setItem(i, 1, QTableWidgetItem("-"))
+                # Half-life (col 2)
+                self.viable_table.setItem(i, 2, QTableWidgetItem(_fmt(row.half_life_days)))
+                # EG p-value (col 3)
+                self.viable_table.setItem(i, 3, QTableWidgetItem(_fmt(row.eg_pvalue)))
+                # Johansen (col 4)
+                self.viable_table.setItem(i, 4, QTableWidgetItem(_fmt(row.johansen_trace)))
+                # Hurst (col 5)
+                self.viable_table.setItem(i, 5, QTableWidgetItem(_fmt(row.hurst_exponent)))
+                # Fractional d (col 6)
                 fd = getattr(row, 'fractional_d', None)
                 fd_class = getattr(row, 'fractional_d_class', 'unknown')
                 if fd is not None:
-                    fd_item = QTableWidgetItem(f"{fd:.2f}")
+                    fd_item = QTableWidgetItem(_fmt(fd))
                     if fd_class == 'strong_MR':
                         fd_item.setForeground(QColor(COLORS['positive']))
                     elif fd_class == 'weak_MR':
@@ -13353,59 +13306,25 @@ class PairsTradingTerminal(QMainWindow):
                     else:
                         fd_item.setForeground(QColor(COLORS['negative']))
                     fd_item.setToolTip(f"Classification: {fd_class}")
-                    self.viable_table.setItem(i, 7, fd_item)
+                    self.viable_table.setItem(i, 6, fd_item)
                 else:
-                    self.viable_table.setItem(i, 7, QTableWidgetItem("-"))
-                self.viable_table.setItem(i, 8, QTableWidgetItem(f"{row.correlation:.2f}"))
-                # Robustness score — colored dots + text (column 9)
-                wp = getattr(row, 'windows_passed', 0)
-                wt = getattr(row, 'windows_tested', 0)
-                pair_name = row.pair
-                window_details = self.engine.get_window_details(pair_name) if self.engine else []
-                rob_widget = QWidget()
-                rob_layout = QHBoxLayout(rob_widget)
-                rob_layout.setContentsMargins(6, 0, 6, 0)
-                rob_layout.setSpacing(3)
-                if window_details:
-                    for wd in window_details:
-                        dot = QLabel()
-                        dot.setFixedSize(10, 10)
-                        passed = wd.get('passed', False)
-                        color = COLORS['positive'] if passed else COLORS['negative']
-                        dot.setStyleSheet(
-                            f"background-color: {color}; border-radius: 5px; border: none;")
-                        ws = wd.get('window_size', '?')
-                        status = "PASS" if passed else "FAIL"
-                        failed_at = wd.get('failed_at', '')
-                        tip = f"Window {ws}: {status}"
-                        if failed_at:
-                            tip += f" (failed at {failed_at})"
-                        dot.setToolTip(tip)
-                        rob_layout.addWidget(dot)
-                rob_label = QLabel(f"{wp}/{wt}" if wt > 0 else "N/A")
-                rob_label.setStyleSheet(
-                    f"color: {COLORS['text_secondary']}; font-size: 11px; "
-                    f"background: transparent; border: none; margin-left: 4px;")
-                rob_layout.addWidget(rob_label)
-                rob_layout.addStretch()
-                self.viable_table.setCellWidget(i, 9, rob_widget)
-                # Kalman diagnostics (columns 10-13)
+                    self.viable_table.setItem(i, 6, QTableWidgetItem("-"))
+                # Correlation (col 7)
+                self.viable_table.setItem(i, 7, QTableWidgetItem(_fmt(row.correlation)))
+                # Kalman diagnostics (col 8-11)
                 ks = getattr(row, 'kalman_stability', None)
-                self.viable_table.setItem(i, 10, QTableWidgetItem(
-                    f"{ks:.2f}" if ks is not None else "N/A"))
+                self.viable_table.setItem(i, 8, QTableWidgetItem(_fmt(ks) if ks is not None else "N/A"))
                 ir = getattr(row, 'kalman_innovation_ratio', None)
-                self.viable_table.setItem(i, 11, QTableWidgetItem(
-                    f"{ir:.2f}" if ir is not None else "N/A"))
+                self.viable_table.setItem(i, 9, QTableWidgetItem(_fmt(ir) if ir is not None else "N/A"))
                 rs = getattr(row, 'kalman_regime_score', None)
-                self.viable_table.setItem(i, 12, QTableWidgetItem(
-                    f"{rs:.2f}" if rs is not None else "N/A"))
+                self.viable_table.setItem(i, 10, QTableWidgetItem(_fmt(rs) if rs is not None else "N/A"))
                 ts = getattr(row, 'kalman_theta_significant', None)
-                self.viable_table.setItem(i, 13, QTableWidgetItem(
+                self.viable_table.setItem(i, 11, QTableWidgetItem(
                     "Yes" if ts else ("No" if ts is not None else "N/A")))
-                # Tail Dependence (column 14)
+                # Tail Dependence (col 12)
                 td = getattr(row, 'tail_dep_lower', None)
                 if td is not None and td > 0:
-                    td_item = QTableWidgetItem(f"{td:.3f}")
+                    td_item = QTableWidgetItem(_fmt(td))
                     if td > 0.3:
                         td_item.setForeground(QColor(COLORS['negative']))
                         td_item.setToolTip("High tail dependence — co-crash risk!")
@@ -13413,10 +13332,10 @@ class PairsTradingTerminal(QMainWindow):
                         td_item.setForeground(QColor(COLORS['warning']))
                     else:
                         td_item.setForeground(QColor(COLORS['positive']))
-                    self.viable_table.setItem(i, 14, td_item)
+                    self.viable_table.setItem(i, 12, td_item)
                 else:
-                    self.viable_table.setItem(i, 14, QTableWidgetItem("-"))
-                # Optimal Z* (column 15) — computed on the fly from OU model
+                    self.viable_table.setItem(i, 12, QTableWidgetItem("-"))
+                # Optimal Z* (col 13)
                 ou = self.engine.ou_models.get(row.pair)
                 if ou:
                     try:
@@ -13424,16 +13343,13 @@ class PairsTradingTerminal(QMainWindow):
                         f_d = getattr(row, 'fractional_d', 0.5)
                         h_e = getattr(row, 'hurst_exponent', 0.5)
                         opt_result = ou.optimal_entry_zscore(
-                            garch_persistence=g_p,
-                            fractional_d=f_d,
-                            hurst=h_e,
-                        )
+                            garch_persistence=g_p, fractional_d=f_d, hurst=h_e)
                         opt_z = opt_result['optimal_z']
-                        self.viable_table.setItem(i, 15, QTableWidgetItem(f"{opt_z:.2f}"))
+                        self.viable_table.setItem(i, 13, QTableWidgetItem(_fmt(opt_z)))
                     except Exception:
-                        self.viable_table.setItem(i, 15, QTableWidgetItem("-"))
+                        self.viable_table.setItem(i, 13, QTableWidgetItem("-"))
                 else:
-                    self.viable_table.setItem(i, 15, QTableWidgetItem("-"))
+                    self.viable_table.setItem(i, 13, QTableWidgetItem("-"))
         finally:
             self.viable_table.setUpdatesEnabled(True)
     
@@ -13480,60 +13396,15 @@ class PairsTradingTerminal(QMainWindow):
         self._on_scanner_pair_clicked()
 
     def _on_scanner_pair_clicked(self):
-        """Single-click: show window breakdown panel inline."""
+        """Single-click: select pair."""
         selected = self.viable_table.selectedItems()
         if not selected:
-            self.window_detail_frame.setVisible(False)
             return
         row_idx = selected[0].row()
         pair_item = self.viable_table.item(row_idx, 0)
         if pair_item is None:
             return
-        pair = pair_item.text()
-        self.selected_pair = pair
-
-        # Populate window breakdown panel
-        details = self.engine.get_window_details(pair) if self.engine else []
-        self.window_detail_header.setText(f"WINDOW BREAKDOWN — {pair}")
-        self.window_detail_table.setRowCount(len(details))
-        for i, wd in enumerate(details):
-            passed = wd.get('passed', False)
-            bg = "rgba(34, 197, 94, 0.10)" if passed else "rgba(239, 68, 68, 0.10)"
-            status_color = COLORS['positive'] if passed else COLORS['negative']
-
-            def _item(text, color=None):
-                item = QTableWidgetItem(str(text))
-                if color:
-                    item.setForeground(QColor(color))
-                item.setBackground(QColor(bg))
-                return item
-
-            self.window_detail_table.setItem(i, 0, _item(wd.get('window_size', '?')))
-            self.window_detail_table.setItem(i, 1, _item(
-                "PASS" if passed else "FAIL", status_color))
-            hl = wd.get('half_life_days')
-            self.window_detail_table.setItem(i, 2, _item(
-                f"{hl:.1f}" if hl is not None else "-"))
-            eg = wd.get('eg_pvalue')
-            self.window_detail_table.setItem(i, 3, _item(
-                f"{eg:.4f}" if eg is not None else "-"))
-            jt = wd.get('johansen_trace')
-            self.window_detail_table.setItem(i, 4, _item(
-                f"{jt:.1f}" if jt is not None else "-"))
-            h = wd.get('hurst_exponent')
-            self.window_detail_table.setItem(i, 5, _item(
-                f"{h:.3f}" if h is not None else "-"))
-            c = wd.get('correlation')
-            self.window_detail_table.setItem(i, 6, _item(
-                f"{c:.3f}" if c is not None else "-"))
-            ks = wd.get('kalman_stability')
-            self.window_detail_table.setItem(i, 7, _item(
-                f"{ks:.3f}" if ks is not None else "-"))
-            fa = wd.get('failed_at', '')
-            self.window_detail_table.setItem(i, 8, _item(
-                fa if fa else "", COLORS['warning'] if fa else None))
-
-        self.window_detail_frame.setVisible(len(details) > 0)
+        self.selected_pair = pair_item.text()
 
     def _on_scanner_pair_double_clicked(self):
         """Double-click: navigate to OU Analytics tab."""
@@ -13688,7 +13559,9 @@ class PairsTradingTerminal(QMainWindow):
             garch_persist = pair_stats.get('garch_persistence', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'garch_persistence', 0)
             garch_cvol = pair_stats.get('garch_current_vol', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'garch_current_vol', 0)
 
-            if garch_persist > 0:
+            # Visa GARCH-värden (grid-fallback eller arch-paket)
+            garch_computed = (garch_alpha > 0 or garch_beta > 0 or garch_persist > 0 or garch_cvol > 0)
+            if garch_computed:
                 self.garch_alpha_card.set_value(f"{garch_alpha:.4f}")
                 self.garch_beta_card.set_value(f"{garch_beta:.4f}")
                 persist_color = "#ff1744" if garch_persist > 0.98 else ("#ffc107" if garch_persist > 0.95 else "#00c853")
@@ -13696,10 +13569,9 @@ class PairsTradingTerminal(QMainWindow):
                 cvol_color = "#ff1744" if garch_cvol > 1.5 else ("#ffc107" if garch_cvol > 1.2 else "#00c853")
                 self.garch_cvol_card.set_value(f"{garch_cvol:.2f}×", cvol_color)
             else:
-                na_text = "N/A (install arch)" if not hasattr(self, '_arch_checked') else "N/A"
                 for card in [self.garch_alpha_card, self.garch_beta_card,
                              self.garch_persist_card, self.garch_cvol_card]:
-                    card.set_value(na_text, "#666666")
+                    card.set_value("N/A", "#666666")
 
             # Update Tail Dependence cards
             td_lower = pair_stats.get('tail_dep_lower', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'tail_dep_lower', 0)
@@ -13792,39 +13664,12 @@ class PairsTradingTerminal(QMainWindow):
             print(f"OU display error: {e}")
 
     def _update_window_robustness(self, pair: str, pair_stats):
-        """Update the WINDOW ROBUSTNESS section in the OU analytics left panel."""
+        """Update the DATA section in the OU analytics left panel."""
         try:
-            # Update robustness score card
-            wp = pair_stats.get('windows_passed', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'windows_passed', 0)
-            wt = pair_stats.get('windows_tested', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'windows_tested', 0)
-            if wt > 0:
-                pct = wp / wt * 100
-                score_text = f"{wp}/{wt} ({pct:.0f}%)"
-                if pct >= 70:
-                    score_color = "#00c853"
-                elif pct >= 50:
-                    score_color = "#ffc107"
-                else:
-                    score_color = "#ff1744"
-            else:
-                score_text = "N/A"
-                score_color = COLORS['text_muted']
-            self.ou_robustness_card.set_value(score_text, score_color)
-
-            details = self.engine.get_window_details(pair) if self.engine else []
-
-            # Clear old window rows
-            while self.ou_window_container_layout.count():
-                child = self.ou_window_container_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
-
-            # Add new window rows
-            for wd in details:
-                row = WindowResultRow(wd)
-                self.ou_window_container_layout.addWidget(row)
+            dl = pair_stats.get('data_length', 0) if hasattr(pair_stats, 'get') else getattr(pair_stats, 'data_length', 0)
+            self.ou_data_length_card.set_value(str(dl), "#00c853" if dl >= 200 else COLORS['warning'])
         except Exception as e:
-            print(f"Window robustness update error: {e}")
+            print(f"Data info update error: {e}")
 
     def update_ou_charts(self, pair: str, ou, spread: pd.Series, z: float, pair_stats):
         """Update OU analytics charts with dates, crosshairs, and synchronized zoom."""

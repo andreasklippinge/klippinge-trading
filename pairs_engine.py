@@ -1948,7 +1948,7 @@ class PairsTradingEngine:
     def _set_defaults(self):
         """Set default configuration values."""
         defaults = {
-            'lookback_period': 'max',
+            'lookback_period': '2y',
             'min_half_life': 1,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
@@ -1962,9 +1962,7 @@ class PairsTradingEngine:
             'max_position_pct': 0.10,
             'max_sector_exposure': 0.30,
             'drawdown_limit': 0.15,
-            'robustness_windows': [250, 500, 750, 1000, 1250, 1500, 1750, 2000],
-            'min_windows_passed': 3,
-            'max_data_points': 2500,
+            'max_data_points': 600,
         }
         for key, value in defaults.items():
             if key not in self.config:
@@ -1976,125 +1974,176 @@ class PairsTradingEngine:
     
     def fetch_data(self, tickers: List[str], period: str = None, progress_callback=None) -> pd.DataFrame:
         """
-        Fetch adjusted close prices for tickers with proper batch handling.
-        
+        Fetch adjusted close prices via ett enda yf.download()-anrop.
+
         Args:
             tickers: List of ticker symbols
             period: Data period (1y, 2y, 5y, 10y, max)
             progress_callback: Optional function(batch_num, total_batches, message)
         """
         period = period or self.config['lookback_period']
-        
+
         # Map period to approximate trading days for truncation
-        # yfinance batch downloads return union of all dates across tickers,
-        # so we need to truncate to the requested period
         period_to_days = {
             '1y': 252,
             '2y': 504,
             '5y': 1260,
             '10y': 2520,
-            'max': None  # No truncation
+            'max': None
         }
         max_days = period_to_days.get(period, None)
-        
+
         # Clean tickers
         tickers = [str(t).strip() for t in tickers if t and str(t).strip()]
-        
+
         if not tickers:
             self.price_data = pd.DataFrame()
+            self.failed_tickers = []
             return self.price_data
-        
-        # Download in smaller batches for reliability
-        batch_size = 100
+
         all_data = {}
-        failed_count = 0
-        
+        too_few_data = []
+
+        import time as _time
+
+        print(f"[Data] === START fetch_data: {len(tickers)} tickers, period={period} ===")
+
+        # Batcha i grupper om 50 för att undvika att yf.download hänger sig
+        batch_size = 50
         total_batches = (len(tickers) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(0, len(tickers), batch_size):
-            batch = tickers[batch_idx:batch_idx + batch_size]
-            batch_num = batch_idx // batch_size + 1
-            
+        t0 = _time.time()
+
+        for batch_idx in range(total_batches):
+            batch_start = batch_idx * batch_size
+            batch = tickers[batch_start:batch_start + batch_size]
+            batch_num = batch_idx + 1
+
+            msg = f"Batch {batch_num}/{total_batches}: {len(batch)} tickers..."
+            print(f"[Data] {msg}")
             if progress_callback:
-                progress_callback(batch_num, total_batches, f"Batch {batch_num}/{total_batches}: {len(batch)} tickers")
-            
+                progress_callback(batch_num, total_batches + 1, msg)
+
             try:
-                # Download with group_by='ticker' for cleaner output
+                t_b = _time.time()
                 raw_data = yf.download(
-                    batch, 
-                    period=period, 
-                    interval='1d', 
-                    auto_adjust=True, 
+                    batch,
+                    period=period,
+                    interval='1d',
+                    auto_adjust=True,
                     progress=False,
-                    threads=False,
+                    threads=True,
                     group_by='ticker',
                     ignore_tz=True
                 )
-                
-                if raw_data.empty:
-                    failed_count += len(batch)
-                    continue
-                
-                # Parse the data based on number of tickers
-                if len(batch) == 1:
-                    # Single ticker - simple DataFrame with OHLCV columns
-                    ticker = batch[0]
-                    if 'Close' in raw_data.columns:
-                        all_data[ticker] = raw_data['Close'].copy()
-                else:
-                    # Multiple tickers with group_by='ticker'
-                    # Format: (Ticker, OHLCV) MultiIndex columns
-                    for ticker in batch:
-                        try:
-                            if ticker in raw_data.columns.get_level_values(0):
-                                ticker_df = raw_data[ticker]
-                                if 'Close' in ticker_df.columns:
-                                    series = ticker_df['Close'].copy()
-                                    if series.notna().sum() > 50:  # At least 50 valid points
-                                        all_data[ticker] = series
-                        except Exception:
-                            failed_count += 1
-                            continue
-                            
+                dt = _time.time() - t_b
+                print(f"[Data] Batch {batch_num} klart på {dt:.1f}s — shape={raw_data.shape if raw_data is not None else 'None'}")
             except Exception as e:
-                print(f"Batch {batch_num} failed: {e}")
-                failed_count += len(batch)
+                print(f"[Data] Batch {batch_num} EXCEPTION: {e}")
                 continue
-        
+
+            if raw_data is None or raw_data.empty:
+                print(f"[Data] Batch {batch_num}: tom data!")
+                continue
+
+            if len(batch) == 1:
+                ticker = batch[0]
+                if isinstance(raw_data.columns, pd.MultiIndex):
+                    raw_data.columns = raw_data.columns.droplevel(1)
+                if 'Close' in raw_data.columns:
+                    series = raw_data['Close'].copy()
+                    valid = series.notna().sum()
+                    if valid > 50:
+                        all_data[ticker] = series
+                    else:
+                        too_few_data.append(ticker)
+            else:
+                level0 = set(raw_data.columns.get_level_values(0).unique())
+                for ticker in batch:
+                    try:
+                        if ticker in level0:
+                            ticker_df = raw_data[ticker]
+                            if 'Close' in ticker_df.columns:
+                                series = ticker_df['Close'].copy()
+                                valid = series.notna().sum()
+                                if valid > 50:
+                                    all_data[ticker] = series
+                                else:
+                                    too_few_data.append(ticker)
+                    except Exception as ex:
+                        print(f"[Data] Fel vid parsing av {ticker}: {ex}")
+                        continue
+
+            print(f"[Data] Totalt {len(all_data)} tickers laddade hittills")
+
+        print(f"[Data] Alla batchar klara på {_time.time()-t0:.1f}s — {len(all_data)}/{len(tickers)} OK")
+
+        # Retry missade tickers individuellt
+        missing = [t for t in tickers if t not in all_data and t not in too_few_data]
+        if missing:
+            print(f"[Data] Retry: {len(missing)} tickers individuellt: {missing[:20]}")
+            if progress_callback:
+                progress_callback(1, 1, f"Retry: {len(missing)} tickers...")
+            for i, ticker in enumerate(missing):
+                try:
+                    t_r = _time.time()
+                    raw = yf.download(
+                        ticker,
+                        period=period,
+                        interval='1d',
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                        ignore_tz=True
+                    )
+                    dt = _time.time() - t_r
+                    if raw is not None and not raw.empty:
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            raw.columns = raw.columns.droplevel(1)
+                        if 'Close' in raw.columns:
+                            series = raw['Close'].copy()
+                            valid = series.notna().sum()
+                            if valid > 50:
+                                all_data[ticker] = series
+                                print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} OK ({valid} pts, {dt:.1f}s)")
+                            else:
+                                too_few_data.append(ticker)
+                                print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} för lite data ({valid} pts)")
+                        else:
+                            print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} ingen Close-kolumn")
+                    else:
+                        print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} tom data ({dt:.1f}s)")
+                except Exception as ex:
+                    print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} EXCEPTION: {ex}")
+                    continue
+
+        # Sammanställ misslyckade tickers
+        final_missing = [t for t in tickers if t not in all_data]
+        no_data_tickers = [t for t in final_missing if t not in too_few_data]
+        self.failed_tickers = final_missing
+
+        if final_missing:
+            print(f"[Data] === MISSLYCKADE TICKERS: {len(final_missing)} av {len(tickers)} ===")
+            if no_data_tickers:
+                print(f"[Data]   Ingen data: {no_data_tickers[:20]}{'...' if len(no_data_tickers) > 20 else ''}")
+            if too_few_data:
+                print(f"[Data]   För lite data (<50 punkter): {too_few_data[:20]}{'...' if len(too_few_data) > 20 else ''}")
+        else:
+            self.failed_tickers = []
+            print(f"[Data] Alla {len(tickers)} tickers laddade OK")
+
         if not all_data:
-            print(f"No data loaded. All {len(tickers)} tickers failed.")
+            print(f"[Data] Ingen data laddad. Alla {len(tickers)} tickers misslyckades.")
             self.price_data = pd.DataFrame()
             self.raw_price_data = pd.DataFrame()
             return self.price_data
 
-        # Retry missing tickers individually (yf.download batch can silently drop tickers)
-        missing = [t for t in tickers if t not in all_data]
-        if missing and len(missing) <= 100:
-            if progress_callback:
-                progress_callback(total_batches, total_batches, f"Retrying {len(missing)} missing tickers individually...")
-            for ticker in missing:
-                try:
-                    t_obj = yf.Ticker(ticker)
-                    hist = t_obj.history(period=period, interval='1d')
-                    if hist is not None and not hist.empty and 'Close' in hist.columns:
-                        series = hist['Close'].copy()
-                        if series.notna().sum() > 50:
-                            all_data[ticker] = series
-                except Exception:
-                    pass
-            still_missing = [t for t in tickers if t not in all_data]
-            if still_missing:
-                print(f"[Data] {len(still_missing)} tickers still missing after retry: {still_missing[:10]}...")
-
         # Combine into DataFrame
         data = pd.DataFrame(all_data)
-        
-        # IMPORTANT: Truncate to requested period
-        # yfinance batch downloads return union of all dates across all tickers,
-        # so if any ticker has 3y of data, the whole DataFrame gets 3y of dates
+
+        # Truncate to requested period
         if max_days is not None and len(data) > max_days:
             data = data.iloc[-max_days:]
-        
+
         # Safety cap: truncate to max_data_points
         max_pts = self.config.get('max_data_points')
         if max_pts and len(data) > max_pts:
@@ -2103,15 +2152,17 @@ class PairsTradingEngine:
         # Forward fill gaps first
         data = data.ffill()
 
-        # Store raw data for pair-specific calculations (read-only reference, no copy needed)
+        # Store raw data for pair-specific calculations
         self.raw_price_data = data
 
         # Keep NaN - correlation uses min_periods, pair testing uses pairwise dropna
         self.price_data = data
 
         if progress_callback:
-            progress_callback(total_batches, total_batches, f"Loaded {len(data.columns)} tickers ({len(data)} days)")
-        
+            progress_callback(2, 2,
+                f"Loaded {len(data.columns)}/{len(tickers)} tickers ({len(data)} days)"
+                + (f" — {len(final_missing)} failed" if final_missing else ""))
+
         return data
     
     # ------------------------------------------------------------------------
@@ -2645,116 +2696,72 @@ class PairsTradingEngine:
                 fail_result['data_length'] = data_length
                 return fail_result
 
-            windows = sorted(self.config.get('robustness_windows',
-                                             [250, 500, 750, 1000, 1250, 1500, 1750, 2000]))
-            min_windows_req = self.config.get('min_windows_passed', 4)
+            # Kör på hela datasetet — inget fönster-loopande
+            y = pair_data[t1]
+            x = pair_data[t2]
 
-            windows_passed = 0
-            windows_tested = 0
-            passing_windows = []
-            best_result = None  # From shortest passing window
-            all_window_results = []
+            result = self._test_pair_single_window(t1, t2, y, x, data_length)
+            is_viable = result['passed']
 
-            for window_size in windows:
-                if data_length < window_size:
-                    continue
-                windows_tested += 1
-
-                y = pair_data.iloc[-window_size:][t1]
-                x = pair_data.iloc[-window_size:][t2]
-
-                result = self._test_pair_single_window(t1, t2, y, x, window_size)
-                # Store per-window result (strip heavy ou_params object)
-                window_record = {k: v for k, v in result.items() if k != 'ou_params'}
-                all_window_results.append(window_record)
-                if result['passed']:
-                    windows_passed += 1
-                    passing_windows.append(window_size)
-                    if best_result is None:  # Shortest = most current
-                        best_result = result
-
-            if windows_tested == 0:
-                fail_result['data_length'] = data_length
-                fail_result['window_details'] = all_window_results
-                return fail_result
-
-            # Check max consecutive passing windows (only among tested windows)
-            max_consecutive = 0
-            current_consecutive = 0
-            for ws in windows:
-                if data_length < ws:
-                    continue  # Not tested — skip
-                if ws in passing_windows:
-                    current_consecutive += 1
-                    max_consecutive = max(max_consecutive, current_consecutive)
-                else:
-                    current_consecutive = 0
-
-            # Robustness = viktad pass-rate (korta fönster väger tyngre)
-            # Korta fönster = senaste data = viktigast för trading
-            if windows_tested > 0:
-                tested_windows = [ws for ws in windows if data_length >= ws]
-                weights = np.array([1.0 / (i + 1) for i in range(len(tested_windows))])
-                weights /= weights.sum()
-                passed_mask = np.array([1.0 if ws in passing_windows else 0.0
-                                        for ws in tested_windows])
-                robustness_score = float(np.dot(weights, passed_mask))
-            else:
-                robustness_score = 0.0
-            is_viable = (max_consecutive >= min_windows_req) and (best_result is not None)
-
-            if best_result is not None:
+            if is_viable:
                 return {
                     'pair': f"{t1}/{t2}", 'ticker_y': t1, 'ticker_x': t2,
                     'group': group_name,
-                    'correlation': best_result['correlation'],
-                    'hurst_exponent': best_result['hurst_exponent'],
-                    'eg_pvalue': best_result['eg_pvalue'],
-                    'eg_statistic': best_result['eg_statistic'],
-                    'johansen_trace': best_result['johansen_trace'],
-                    'johansen_crit': best_result['johansen_crit'],
-                    'half_life_days': best_result['half_life_days'],
-                    'theta': best_result['theta'],
-                    'mu': best_result['mu'],
-                    'sigma': best_result['sigma'],
-                    'eq_std': best_result['eq_std'],
-                    'ar1_coef': best_result['ar1_coef'],
-                    'hedge_ratio': best_result['hedge_ratio'],
-                    'intercept': best_result['intercept'],
+                    'correlation': result['correlation'],
+                    'hurst_exponent': result['hurst_exponent'],
+                    'eg_pvalue': result['eg_pvalue'],
+                    'eg_statistic': result['eg_statistic'],
+                    'johansen_trace': result['johansen_trace'],
+                    'johansen_crit': result['johansen_crit'],
+                    'half_life_days': result['half_life_days'],
+                    'theta': result['theta'],
+                    'mu': result['mu'],
+                    'sigma': result['sigma'],
+                    'eq_std': result['eq_std'],
+                    'ar1_coef': result['ar1_coef'],
+                    'hedge_ratio': result['hedge_ratio'],
+                    'intercept': result['intercept'],
                     'ou_valid': True,
                     'passes_eg': True, 'passes_johansen': True,
                     'passes_coint': True, 'passes_halflife': True,
                     'passes_hurst': True, 'passes_kalman': True,
-                    'kalman_stability': best_result['kalman_stability'],
-                    'kalman_innovation_ratio': best_result['kalman_innovation_ratio'],
-                    'kalman_regime_score': best_result['kalman_regime_score'],
-                    'kalman_theta_significant': best_result['kalman_theta_significant'],
+                    'kalman_stability': result['kalman_stability'],
+                    'kalman_innovation_ratio': result['kalman_innovation_ratio'],
+                    'kalman_regime_score': result['kalman_regime_score'],
+                    'kalman_theta_significant': result['kalman_theta_significant'],
                     'data_length': data_length,
-                    'is_viable': is_viable,
-                    'robustness_score': robustness_score,
-                    'windows_passed': windows_passed,
-                    'windows_tested': windows_tested,
-                    'max_consecutive_windows': max_consecutive,
-                    'passing_windows': passing_windows,
-                    'window_details': all_window_results,
-                    # Institutional-grade soft metrics (from shortest passing window)
-                    'tail_dep_lower': best_result.get('tail_dep_lower', 0.0),
-                    'tail_dep_upper': best_result.get('tail_dep_upper', 0.0),
-                    'garch_alpha': best_result.get('garch_alpha', 0.0),
-                    'garch_beta': best_result.get('garch_beta', 0.0),
-                    'garch_persistence': best_result.get('garch_persistence', 0.0),
-                    'garch_current_vol': best_result.get('garch_current_vol', 0.0),
-                    'garch_cvar_95': best_result.get('garch_cvar_95', 0.0),
-                    'fractional_d': best_result.get('fractional_d', 0.5),
-                    'fractional_d_class': best_result.get('fractional_d_class', 'unknown'),
-                    'kalman_beta': best_result.get('kalman_beta', 1.0),
-                    'kalman_beta_stability': best_result.get('kalman_beta_stability', 0.0),
+                    'is_viable': True,
+                    'robustness_score': 1.0,
+                    'windows_passed': 1,
+                    'windows_tested': 1,
+                    'max_consecutive_windows': 1,
+                    'passing_windows': [data_length],
+                    'window_details': [{k: v for k, v in result.items() if k != 'ou_params'}],
+                    'tail_dep_lower': result.get('tail_dep_lower', 0.0),
+                    'tail_dep_upper': result.get('tail_dep_upper', 0.0),
+                    'garch_alpha': result.get('garch_alpha', 0.0),
+                    'garch_beta': result.get('garch_beta', 0.0),
+                    'garch_persistence': result.get('garch_persistence', 0.0),
+                    'garch_current_vol': result.get('garch_current_vol', 0.0),
+                    'garch_cvar_95': result.get('garch_cvar_95', 0.0),
+                    'fractional_d': result.get('fractional_d', 0.5),
+                    'fractional_d_class': result.get('fractional_d_class', 'unknown'),
+                    'kalman_beta': result.get('kalman_beta', 1.0),
+                    'kalman_beta_stability': result.get('kalman_beta_stability', 0.0),
                 }
             else:
                 fail_result['data_length'] = data_length
-                fail_result['windows_tested'] = windows_tested
+                fail_result['windows_tested'] = 1
                 fail_result['robustness_score'] = 0.0
-                fail_result['window_details'] = all_window_results
+                fail_result['failed_at'] = result.get('failed_at', 'unknown')
+                # Kopiera diagnostik-värden från single window
+                for key in ['correlation', 'hurst_exponent', 'eg_pvalue', 'eg_statistic',
+                            'johansen_trace', 'johansen_crit', 'half_life_days',
+                            'kalman_stability', 'kalman_innovation_ratio',
+                            'kalman_regime_score', 'kalman_theta_significant']:
+                    if result.get(key) is not None:
+                        fail_result[key] = result[key]
+                fail_result['window_details'] = [{k: v for k, v in result.items() if k != 'ou_params'}]
                 return fail_result
 
         except Exception as e:
@@ -3093,9 +3100,12 @@ class PairsTradingEngine:
                 raise ValueError("No price data loaded. Call fetch_data first or provide tickers.")
             self.fetch_data(tickers)
         
+        import time as _time
+
         data = self.price_data
         available_tickers = data.columns.tolist()
         available_tickers_set = set(available_tickers)
+        print(f"[Scan] === START screen_pairs: {len(available_tickers)} tickers, {len(data)} rader ===")
 
         if progress_callback:
             progress_callback('grouping', 0, 0, f"Starting with {len(available_tickers)} tickers")
@@ -3117,38 +3127,44 @@ class PairsTradingEngine:
         if correlation_prefilter and len(available_tickers) > 1:
             if progress_callback:
                 progress_callback('correlation', 0, 1, "Computing correlation matrix...")
-            
+
             # Compute returns for correlation - DON'T drop NaN globally
-            # pandas .corr() handles pairwise complete observations automatically
             returns = data.pct_change()
-            
-            # Fixed min_periods for deterministic results across scan sizes
-            # 100 ≈ ~5 months of daily data — enough for reliable correlation
+
             min_obs_for_corr = 100
-            
-            # Check we have enough data
             valid_return_counts = returns.count()
-            
+
             for group_idx, (group_name, group_tickers) in enumerate(groups.items()):
                 if len(group_tickers) < 2:
                     continue
-                
-                # Get returns for this group - only tickers with enough data
-                valid_tickers = [t for t in group_tickers 
+
+                valid_tickers = [t for t in group_tickers
                                if t in returns.columns and valid_return_counts.get(t, 0) >= min_obs_for_corr]
+                print(f"[Scan] Grupp '{group_name}': {len(group_tickers)} tickers, {len(valid_tickers)} med >= {min_obs_for_corr} obs")
                 if len(valid_tickers) < 2:
                     continue
-                
+
                 group_returns = returns[valid_tickers]
-                # Use pairwise complete observations with scaled min_periods
+                t_corr = _time.time()
                 corr_matrix = group_returns.corr(min_periods=min_obs_for_corr)
-                
-                if progress_callback:
-                    progress_callback('correlation', group_idx + 1, len(groups), 
-                                    f"Group: {group_name} ({len(valid_tickers)} tickers, min_periods={min_obs_for_corr})")
-                
-                # Find pairs above correlation threshold (.values för snabb numpy-access)
+                dt_corr = _time.time() - t_corr
+
+                # Debug: visa korrelationsmatris-statistik
                 corr_values = corr_matrix.values
+                upper_tri = corr_values[np.triu_indices_from(corr_values, k=1)]
+                valid_corrs = upper_tri[~np.isnan(upper_tri)]
+                print(f"[Scan] Korrelationsmatris: {corr_matrix.shape}, {len(valid_corrs)} giltiga par, "
+                      f"NaN={np.isnan(upper_tri).sum()}, "
+                      f"beräknad på {dt_corr:.1f}s")
+                if len(valid_corrs) > 0:
+                    print(f"[Scan] Korrelationer: min={valid_corrs.min():.3f}, max={valid_corrs.max():.3f}, "
+                          f"mean={valid_corrs.mean():.3f}, median={np.median(valid_corrs):.3f}, "
+                          f">0.7: {(valid_corrs >= 0.7).sum()}, >0.5: {(valid_corrs >= 0.5).sum()}")
+
+                if progress_callback:
+                    progress_callback('correlation', group_idx + 1, len(groups),
+                                    f"Group: {group_name} ({len(valid_tickers)} tickers)")
+
                 corr_columns = corr_matrix.columns
                 min_corr = self.config['min_correlation']
                 for i in range(len(corr_columns)):
@@ -3157,7 +3173,6 @@ class PairsTradingEngine:
                         if not np.isnan(corr) and corr >= min_corr:
                             ticker_a = corr_columns[i]
                             ticker_b = corr_columns[j]
-                            # Always order alphabetically for consistency
                             t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                             candidate_pairs.append((t1, t2, group_name, corr))
         else:
@@ -3167,9 +3182,14 @@ class PairsTradingEngine:
                 for i in range(len(valid_tickers)):
                     for j in range(i + 1, len(valid_tickers)):
                         ticker_a, ticker_b = valid_tickers[i], valid_tickers[j]
-                        # Always order alphabetically for consistency
                         t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                         candidate_pairs.append((t1, t2, group_name, None))
+
+        print(f"[Scan] Korrelationsfilter: {len(candidate_pairs)} par klarade min_corr={self.config['min_correlation']}")
+        if candidate_pairs:
+            top5 = sorted(candidate_pairs, key=lambda x: x[3] if x[3] else 0, reverse=True)[:5]
+            for t1, t2, g, c in top5:
+                print(f"[Scan]   Top: {t1}/{t2} corr={c:.3f}")
         
         if progress_callback:
             progress_callback('screening', 0, max(1, len(candidate_pairs)), 
@@ -3209,6 +3229,19 @@ class PairsTradingEngine:
                 results.append(result)
 
         results_df = pd.DataFrame(results)
+
+        # Debug: visa varför par failade
+        if len(results) > 0:
+            viable_count = sum(1 for r in results if r.get('is_viable'))
+            print(f"[Scan] Testade {len(results)} par, {viable_count} viable")
+            # Visa fail-orsaker
+            fail_reasons = {}
+            for r in results:
+                if not r.get('is_viable'):
+                    reason = r.get('failed_at', 'unknown')
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+            if fail_reasons:
+                print(f"[Scan] Fail-orsaker: {dict(sorted(fail_reasons.items(), key=lambda x: -x[1]))}")
 
         # Extract window_details into separate dict before sorting
         self._window_details = {}
@@ -3309,7 +3342,7 @@ class PairsTradingEngine:
         # --- SUMMARY TABLE ---
         header = (
             f"{'#':>2} {'Pair':<22} {'Quality':>7} {'Z-score':>8} {'Half-life':>9} "
-            f"{'Hurst':>6} {'Frac.d':>7} {'EG p':>7} {'Corr':>6} {'Robust':>7} "
+            f"{'Hurst':>6} {'Frac.d':>7} {'EG p':>7} {'Corr':>6} "
             f"{'TailL':>6} {'TailU':>6} {'Opt.Z*':>7} {'GARCH p':>7} {'GVol':>6} "
             f"{'Kβ':>6} {'Kβ stab':>7}"
         )
@@ -3326,7 +3359,6 @@ class PairsTradingEngine:
             frac_d = getattr(row, 'fractional_d', 0.5)
             eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
             corr = getattr(row, 'correlation', 0) or 0
-            robust = getattr(row, 'robustness_score', 0) or 0
             tail_l = getattr(row, 'tail_dep_lower', 0)
             tail_u = getattr(row, 'tail_dep_upper', 0)
             opt_z = live.get('opt_z', 0)
@@ -3337,7 +3369,7 @@ class PairsTradingEngine:
 
             print(
                 f"{i:>2} {pair:<22} {quality:>7.3f} {zscore:>+8.3f} {hl:>8.1f}d "
-                f"{hurst:>6.3f} {frac_d:>7.3f} {eg_p:>7.4f} {corr:>6.3f} {robust:>7.3f} "
+                f"{hurst:>6.3f} {frac_d:>7.3f} {eg_p:>7.4f} {corr:>6.3f} "
                 f"{tail_l:>6.3f} {tail_u:>6.3f} {opt_z:>7.2f} {garch_p:>7.3f} {garch_v:>6.2f} "
                 f"{kb:>6.3f} {kb_s:>7.3f}"
             )
@@ -3409,14 +3441,11 @@ class PairsTradingEngine:
             fdc = getattr(row, 'fractional_d_class', 'unknown')
             print(f"  │  Frac Integ: d={fd:.4f}  class={fdc}")
 
-            # Robustness & Quality
-            robust = getattr(row, 'robustness_score', 0) or 0
-            wp = getattr(row, 'windows_passed', 0) or 0
-            wt = getattr(row, 'windows_tested', 0) or 0
+            # Quality
             quality = getattr(row, 'quality_score', 0)
+            dl = getattr(row, 'data_length', 0)
             opt_z = live.get('opt_z', 0)
-            print(f"  │  Quality:    score={quality:.3f}  robustness={robust:.3f} "
-                  f"({wp}/{wt} windows)  optimal_z*={opt_z:.2f}")
+            print(f"  │  Quality:    score={quality:.3f}  data_length={dl}  optimal_z*={opt_z:.2f}")
 
             print(f"  └{'─' * 90}")
 
@@ -4016,11 +4045,10 @@ class PairsTradingEngine:
 
         Weighted composite:
             - IR proxy (spread return / spread vol): 0.30
-            - Win probability: 0.20
+            - Win probability: 0.25
             - Hurst exponent: 0.15  (lower = better)
             - Kalman stability: 0.15
-            - Robustness score: 0.10
-            - Half-life score: 0.10  (closer to ideal range = better)
+            - Half-life score: 0.15  (closer to ideal range = better)
 
         Adds 'quality_score' column to self.viable_pairs.
         """
@@ -4079,11 +4107,7 @@ class PairsTradingEngine:
         kalman_stab = df['kalman_stability'].values if 'kalman_stability' in df.columns else np.zeros(n)
         stab_scores = rank_norm(kalman_stab, higher_is_better=True)
 
-        # 5. Robustness score
-        rob_vals = df['robustness_score'].values if 'robustness_score' in df.columns else np.zeros(n)
-        rob_scores = rank_norm(rob_vals, higher_is_better=True)
-
-        # 6. Half-life score (closer to ideal range 5-30 = better)
+        # 5. Half-life score (closer to ideal range 5-30 = better)
         hl_vals = df['half_life_days'].values if 'half_life_days' in df.columns else np.full(n, 30)
         hl_score_raw = np.zeros(n)
         for i, hl in enumerate(hl_vals):
@@ -4096,8 +4120,8 @@ class PairsTradingEngine:
         hl_scores = rank_norm(hl_score_raw, higher_is_better=True)
 
         # Weighted composite
-        quality = (0.30 * ir_scores + 0.20 * wp_scores + 0.15 * hurst_scores +
-                   0.15 * stab_scores + 0.10 * rob_scores + 0.10 * hl_scores)
+        quality = (0.30 * ir_scores + 0.25 * wp_scores + 0.15 * hurst_scores +
+                   0.15 * stab_scores + 0.15 * hl_scores)
 
         self.viable_pairs['quality_score'] = quality
 
