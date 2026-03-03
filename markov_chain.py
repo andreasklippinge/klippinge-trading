@@ -3,19 +3,16 @@ Markov Chain Analysis Engine
 ============================
 
 Discrete Markov chain model for weekly return forecasting.
-Uses 5 percentile-based states computed from each ticker's own return distribution.
+Uses 2 binary states based on return sign.
 
 States:
-    0 = Strong Down  (0-10th percentile)
-    1 = Down          (10-35th percentile)
-    2 = Flat          (35-65th percentile)
-    3 = Up            (65-90th percentile)
-    4 = Strong Up     (90-100th percentile)
+    0 = Negativ  (return <= 0)
+    1 = Positiv  (return > 0)
 
 Pipeline:
     1. Fetch daily prices → resample to weekly (Friday close)
-    2. Classify weekly returns into 5 states via percentile thresholds
-    3. Build 5×5 transition matrix with Jeffreys prior smoothing
+    2. Classify weekly returns into 2 states (positive/negative)
+    3. Build 2×2 transition matrix with Jeffreys prior smoothing
     4. Compute stationary distribution, spectral gap, mixing time
     5. Forecast next-week probabilities from current state row
     6. Track intraweek return vs last Friday's forecast
@@ -29,17 +26,12 @@ from datetime import datetime, timedelta
 
 # ── State definitions ──────────────────────────────────────────────────────────
 
-N_MARKOV_STATES = 5
+N_MARKOV_STATES = 2
 
 MARKOV_STATES = {
-    0: {'name': 'Strong Down', 'short': 'SD', 'color': '#ef4444'},
-    1: {'name': 'Down',        'short': 'D',  'color': '#f59e0b'},
-    2: {'name': 'Flat',        'short': 'F',  'color': '#a0a0a0'},
-    3: {'name': 'Up',          'short': 'U',  'color': '#22c55e'},
-    4: {'name': 'Strong Up',   'short': 'SU', 'color': '#3b82f6'},
+    0: {'name': 'Negativ', 'short': 'NEG', 'color': '#ef4444'},
+    1: {'name': 'Positiv', 'short': 'POS', 'color': '#22c55e'},
 }
-
-PERCENTILE_BOUNDARIES = [10, 35, 65, 90]
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -51,9 +43,9 @@ class MarkovResult:
     weekly_returns: np.ndarray
     weekly_dates: np.ndarray
     state_sequence: np.ndarray
-    thresholds: np.ndarray           # 4 percentile boundaries
-    transition_matrix: np.ndarray    # 5×5
-    stationary_dist: np.ndarray      # length 5
+    thresholds: np.ndarray           # [0.0] — single boundary
+    transition_matrix: np.ndarray    # 2×2
+    stationary_dist: np.ndarray      # length 2
     n_states: int = N_MARKOV_STATES
 
     current_state: int = 0
@@ -64,7 +56,7 @@ class MarkovResult:
     last_friday_close: float = 0.0
     current_price: float = 0.0
     current_intraweek_return: float = 0.0
-    current_intraweek_state: int = 2  # default Flat
+    current_intraweek_state: int = 0  # default Negativ
 
     state_stats: Dict = field(default_factory=dict)
     eigenvalue_gap: float = 0.0
@@ -120,19 +112,19 @@ class MarkovChainAnalyzer:
     # ── State classification ──────────────────────────────────────────────
 
     def classify_returns(self, returns: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Classify returns into 5 states using percentile boundaries.
+        """Classify returns into 2 states: 0=Negativ (<=0), 1=Positiv (>0).
 
         Returns (state_sequence, thresholds).
         """
-        thresholds = np.percentile(returns, PERCENTILE_BOUNDARIES)
-        states = np.digitize(returns, thresholds)  # 0..4
-        return states.astype(int), thresholds
+        thresholds = np.array([0.0])
+        states = (returns > 0).astype(int)
+        return states, thresholds
 
     # ── Transition matrix ─────────────────────────────────────────────────
 
     def build_transition_matrix(self, state_sequence: np.ndarray,
                                 alpha: float = 0.5) -> np.ndarray:
-        """Build 5×5 transition matrix with Jeffreys prior smoothing.
+        """Build 2×2 transition matrix with Jeffreys prior smoothing.
 
         alpha=0.5 is the Jeffreys prior (non-informative).
         """
@@ -206,7 +198,7 @@ class MarkovChainAnalyzer:
                          auto_adjust=True, ignore_tz=True)
 
         if df.empty:
-            return 0.0, 2, last_friday_close  # Flat if no data
+            return 0.0, 0, last_friday_close  # Negativ if no data
 
         close = df['Close']
         if isinstance(close, pd.DataFrame):
@@ -214,11 +206,10 @@ class MarkovChainAnalyzer:
 
         current_price = float(close.iloc[-1])
         if last_friday_close == 0:
-            return 0.0, 2, current_price
+            return 0.0, 0, current_price
 
         intraweek_return = (current_price / last_friday_close) - 1.0
-        state = int(np.digitize([intraweek_return], thresholds)[0])
-        state = min(state, N_MARKOV_STATES - 1)
+        state = 1 if intraweek_return > 0 else 0
         return intraweek_return, state, current_price
 
     # ── State statistics ──────────────────────────────────────────────────
@@ -261,7 +252,8 @@ class MarkovChainAnalyzer:
     # ── Full pipeline ─────────────────────────────────────────────────────
 
     def analyze(self, ticker: str,
-                progress_callback: Optional[Callable] = None) -> MarkovResult:
+                progress_callback: Optional[Callable] = None,
+                skip_intraweek: bool = False) -> MarkovResult:
         """Run the full Markov chain analysis pipeline for a ticker."""
 
         def _progress(pct: int, msg: str):
@@ -304,28 +296,29 @@ class MarkovChainAnalyzer:
 
         # Last Friday close for intraweek tracking
         last_friday_close = 0.0
-        weekly_close_dates = weekly_dates
-        if len(weekly_close_dates) > 0:
-            # Re-fetch to get the actual close value
-            import yfinance as yf
-            end = datetime.now()
-            start = end - timedelta(days=30)
-            recent = yf.download(ticker, start=start.strftime('%Y-%m-%d'),
-                                 end=end.strftime('%Y-%m-%d'),
-                                 progress=False, auto_adjust=True, ignore_tz=True)
-            if not recent.empty:
-                close_col = recent['Close']
-                if isinstance(close_col, pd.DataFrame):
-                    close_col = close_col.iloc[:, 0]
-                weekly_recent = close_col.resample('W-FRI').last().dropna()
-                if len(weekly_recent) > 0:
-                    last_friday_close = float(weekly_recent.iloc[-1])
+        if not skip_intraweek:
+            weekly_close_dates = weekly_dates
+            if len(weekly_close_dates) > 0:
+                # Re-fetch to get the actual close value
+                import yfinance as yf
+                end = datetime.now()
+                start = end - timedelta(days=30)
+                recent = yf.download(ticker, start=start.strftime('%Y-%m-%d'),
+                                     end=end.strftime('%Y-%m-%d'),
+                                     progress=False, auto_adjust=True, ignore_tz=True)
+                if not recent.empty:
+                    close_col = recent['Close']
+                    if isinstance(close_col, pd.DataFrame):
+                        close_col = close_col.iloc[:, 0]
+                    weekly_recent = close_col.resample('W-FRI').last().dropna()
+                    if len(weekly_recent) > 0:
+                        last_friday_close = float(weekly_recent.iloc[-1])
 
         _progress(90, "Tracking intraweek performance...")
         intraweek_ret = 0.0
-        intraweek_state = 2
+        intraweek_state = 0
         current_price = last_friday_close
-        if last_friday_close > 0:
+        if not skip_intraweek and last_friday_close > 0:
             intraweek_ret, intraweek_state, current_price = \
                 self.compute_intraweek_tracking(ticker, thresholds, last_friday_close)
 

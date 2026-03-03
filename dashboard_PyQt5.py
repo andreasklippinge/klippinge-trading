@@ -2662,14 +2662,10 @@ class AnalysisWorker(QObject):
     @Slot()
     def run(self):
         try:
-            import time as _time
-
             self.progress.emit(5, "Initializing engine...")
-            print(f"[Worker] Start: {len(self.tickers)} tickers, period={self.lookback}, config={self.config}")
             engine = PairsTradingEngine(self.config)
 
             self.progress.emit(10, f"Fetching data for {len(self.tickers)} tickers (period={self.lookback})...")
-            t0 = _time.time()
 
             def _fetch_progress(done, total, msg):
                 # Mappa fetch-progress till 10-40% av totalen
@@ -2678,36 +2674,25 @@ class AnalysisWorker(QObject):
                 else:
                     pct = 15
                 self.progress.emit(pct, msg)
-                print(f"[Worker/fetch] {msg}")
 
             engine.fetch_data(self.tickers, self.lookback, progress_callback=_fetch_progress)
-            t1 = _time.time()
-            print(f"[Worker] fetch_data klart på {t1-t0:.1f}s")
 
             if engine.price_data is None or len(engine.price_data.columns) == 0:
                 self.error.emit("No price data loaded")
-                print(f"[Worker] ABORT: Ingen prisdata laddad")
                 return
 
             loaded = len(engine.price_data.columns)
             total = len(self.tickers)
             failed = len(getattr(engine, 'failed_tickers', []))
             fail_msg = f" ({failed} failed)" if failed else ""
-            print(f"[Worker] Laddade {loaded}/{total} tickers{fail_msg}, {len(engine.price_data)} rader data")
             self.progress.emit(40, f"Loaded {loaded}/{total} tickers{fail_msg}, screening pairs...")
 
-            t2 = _time.time()
             engine.screen_pairs(correlation_prefilter=True)
-            t3 = _time.time()
-            viable = len(engine.viable_pairs)
-            print(f"[Worker] screen_pairs klart på {t3-t2:.1f}s — {viable} viable pairs")
 
             self.progress.emit(100, "Complete!")
             self.result.emit(engine)
 
         except Exception as e:
-            import traceback
-            print(f"[Worker] EXCEPTION: {e}\n{traceback.format_exc()}")
             self.error.emit(str(e))
         finally:
             self.finished.emit()
@@ -3302,10 +3287,11 @@ class FuturesImpliedWorker(QObject):
                     first_price = float(series.iloc[0])
                     if first_price > 0 and last_price > 0:
                         # Hämta previousClose för korrekt daglig förändring
+                        # OBS: fast_info ger fel previousClose för futures — använd info
                         try:
                             t = yf.Ticker(ticker)
-                            prev_close = float(t.fast_info.get('previousClose', 0)
-                                               or t.fast_info.get('previous_close', 0) or 0)
+                            prev_close = float(t.info.get('regularMarketPreviousClose', 0)
+                                               or t.info.get('previousClose', 0) or 0)
                         except Exception:
                             prev_close = 0
                         if prev_close > 0:
@@ -3339,6 +3325,71 @@ class MarkovChainWorker(QObject):
             analyzer = MarkovChainAnalyzer()
             res = analyzer.analyze(self.ticker, progress_callback=self.progress.emit)
             self.result.emit(res)
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class MarkovEdgeScanWorker(QObject):
+    """Batch-skannar tickers med Markov chain för att hitta statistisk edge."""
+    finished = Signal()
+    progress = Signal(int, str)      # (pct, message)
+    tick_result = Signal(dict)       # per-ticker result dict
+    error = Signal(str)
+
+    def __init__(self, tickers: list):
+        super().__init__()
+        self._tickers = tickers
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    @Slot()
+    def run(self):
+        try:
+            analyzer = MarkovChainAnalyzer()
+            total = len(self._tickers)
+            for i, ticker in enumerate(self._tickers):
+                if self._is_cancelled:
+                    self.progress.emit(100, "Scan cancelled")
+                    break
+                pct = int((i / total) * 100)
+                self.progress.emit(pct, f"[{i+1}/{total}] Analyzing {ticker}...")
+                try:
+                    result = analyzer.analyze(ticker, skip_intraweek=True)
+                    T = result.transition_matrix
+                    cs = result.current_state
+                    stats = result.state_stats
+
+                    win_rate = float(T[cs, 1])              # P(Positiv | current)
+                    avg_win = stats[1]['avg_return']
+                    avg_loss = stats[0]['avg_return']
+                    payoff = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
+                    edge = win_rate * avg_win + (1 - win_rate) * avg_loss
+                    # Kelly: (p*b - q) / b  where b = |avg_win/avg_loss|
+                    kelly = ((win_rate * payoff) - (1 - win_rate)) / payoff if payoff > 0 else 0.0
+
+                    self.tick_result.emit({
+                        'ticker': ticker,
+                        'state': cs,
+                        'win_rate': win_rate,
+                        'avg_win': avg_win,
+                        'avg_loss': avg_loss,
+                        'payoff': payoff,
+                        'edge': edge,
+                        'kelly': kelly,
+                        'n_obs': result.n_observations,
+                        'markov_result': result,   # cache för dubbelklick
+                    })
+                except Exception as e:
+                    self.tick_result.emit({
+                        'ticker': ticker,
+                        'error': str(e),
+                    })
+            self.progress.emit(100, f"Scan complete — {total} tickers")
         except Exception as e:
             traceback.print_exc()
             self.error.emit(str(e))
@@ -3997,6 +4048,19 @@ class WindowResultRow(QFrame):
                 f"color: {COLORS['warning']}; font-size: 10px; "
                 f"background: transparent; border: none;")
             layout.addWidget(fa_label)
+
+
+class NumericTableItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically via Qt.UserRole data."""
+    def __lt__(self, other):
+        lhs = self.data(Qt.UserRole)
+        rhs = other.data(Qt.UserRole) if other else None
+        if lhs is not None and rhs is not None:
+            try:
+                return float(lhs) < float(rhs)
+            except (ValueError, TypeError):
+                pass
+        return super().__lt__(other)
 
 
 class CompactMetricCard(QFrame):
@@ -5338,6 +5402,28 @@ class EventsCalendarWidget(QWidget):
         self._update_header()
         self._load_data()
 
+        # Timer som kollar om veckan har ändrats (var 60:e sekund)
+        self._date_check_timer = QTimer(self)
+        self._date_check_timer.timeout.connect(self._ensure_current_week)
+        self._date_check_timer.start(60_000)
+
+    def _ensure_current_week(self):
+        """Kontrollera om _week_start fortfarande motsvarar aktuell vecka, annars uppdatera."""
+        from datetime import date, timedelta
+        today = date.today()
+        current_monday = today - timedelta(days=today.weekday())
+        if self._week_start != current_monday:
+            self._week_start = current_monday
+            self._update_header()
+            self._load_data()
+            return True
+        return False
+
+    def refresh(self):
+        """Extern refresh — säkerställ rätt vecka och ladda om data."""
+        if not self._ensure_current_week():
+            self._load_data()
+
     def _update_header(self):
         from datetime import timedelta
         end = self._week_start + timedelta(days=6)
@@ -6512,6 +6598,8 @@ class RightPanelWidget(QWidget):
         }
         if idx in cal_map:
             cal_map[idx].refresh()
+        # Uppdatera events-kalendern (veckoöversikten) vid alla refresh
+        self._events_calendar.refresh()
         # NEWS (idx=0) hanteras av extern koppling via refresh_btn.clicked
 
     # ------ Bakåtkompatibla egenskaper/metoder (news_feed-gränssnitt) ------
@@ -6547,7 +6635,7 @@ class PairsTradingTerminal(QMainWindow):
         # Europe
         '^FTSE': ('London', 'EUROPE'),
         '^FCHI': ('Paris', 'EUROPE'),
-        '^STOXX50E': ('Europe 50', 'EUROPE'),
+        '^STOXX': ('Europe 600', 'EUROPE'),
         '^N100': ('Euronext 100', 'EUROPE'),
         '^GDAXI': ('Frankfurt', 'EUROPE'),
         '^OMX': ('Stockholm', 'EUROPE'),
@@ -6677,6 +6765,12 @@ class PairsTradingTerminal(QMainWindow):
         self._markov_worker = None
         self._markov_running = False
         self._markov_result = None
+
+        # Markov edge scanner state
+        self._markov_scan_thread: Optional[QThread] = None
+        self._markov_scan_worker = None
+        self._markov_scan_running = False
+        self._markov_scan_results: Dict[str, dict] = {}  # ticker → result dict (med MarkovResult)
 
         # OPTIMERING: Metrics initieras som None (skapas i lazy-loaded tabs)
         self.tickers_metric: Optional[QFrame] = None
@@ -10124,9 +10218,10 @@ class PairsTradingTerminal(QMainWindow):
         self.trade_history_table = QTableWidget()
         self.trade_history_table.verticalHeader().setVisible(False)
         self.trade_history_table.verticalHeader().setDefaultSectionSize(40)
-        self.trade_history_table.setColumnCount(10)
+        self.trade_history_table.setColumnCount(14)
         self.trade_history_table.setHorizontalHeaderLabels([
             "PAIR", "DIRECTION", "ENTRY DATE", "CLOSE DATE",
+            "CLOSE Y", "ENTRY Y", "CLOSE X", "ENTRY X",
             "ENTRY Z", "CLOSE Z", "RESULT",
             "REALIZED P/L (SEK)", "REALIZED P/L (%)", "CAPITAL"
         ])
@@ -10155,10 +10250,146 @@ class PairsTradingTerminal(QMainWindow):
                 border-bottom: 2px solid {COLORS['accent']};
             }}
         """)
+        self.trade_history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.trade_history_table.cellDoubleClicked.connect(self._on_trade_history_double_click)
         layout.addWidget(self.trade_history_table)
-        
+
         return tab
-    
+
+    def _on_trade_history_double_click(self, row, column):
+        """Handle double-click on trade history table — open edit dialog for close prices."""
+        # trade_history is displayed in reverse order (newest first)
+        actual_index = len(self.trade_history) - 1 - row
+        if 0 <= actual_index < len(self.trade_history):
+            self._edit_trade_close_prices(actual_index)
+
+    def _edit_trade_close_prices(self, index):
+        """Open dialog to edit close prices for a closed trade and recalculate P/L."""
+        trade = self.trade_history[index]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Edit Close Prices — {trade.get('pair', '')}")
+        dialog.setMinimumWidth(360)
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {COLORS['bg_card']};
+                color: {COLORS['text_primary']};
+            }}
+            QLabel {{
+                color: {COLORS['text_secondary']};
+                font-size: 13px;
+            }}
+            QDoubleSpinBox {{
+                background-color: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                padding: 6px;
+                font-size: 13px;
+            }}
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Info label
+        info = QLabel(f"Pair: <b>{trade.get('pair', '')}</b>  |  Direction: <b>{trade.get('direction', '')}</b>")
+        info.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px;")
+        layout.addWidget(info)
+
+        form = QGridLayout()
+        form.setSpacing(8)
+
+        # Close Price Y
+        form.addWidget(QLabel("Close Price Y:"), 0, 0)
+        close_y_spin = QDoubleSpinBox()
+        close_y_spin.setDecimals(4)
+        close_y_spin.setRange(0, 999999)
+        close_y_spin.setValue(trade.get('mf_close_price_y') or 0)
+        form.addWidget(close_y_spin, 0, 1)
+
+        # Entry Price Y (read-only reference)
+        form.addWidget(QLabel("Entry Price Y:"), 1, 0)
+        entry_y_label = QLabel(f"{trade.get('mf_entry_price_y') or 0:.4f}")
+        entry_y_label.setStyleSheet(f"color: {COLORS['text_primary']};")
+        form.addWidget(entry_y_label, 1, 1)
+
+        # Close Price X
+        form.addWidget(QLabel("Close Price X:"), 2, 0)
+        close_x_spin = QDoubleSpinBox()
+        close_x_spin.setDecimals(4)
+        close_x_spin.setRange(0, 999999)
+        close_x_spin.setValue(trade.get('mf_close_price_x') or 0)
+        form.addWidget(close_x_spin, 2, 1)
+
+        # Entry Price X (read-only reference)
+        form.addWidget(QLabel("Entry Price X:"), 3, 0)
+        entry_x_label = QLabel(f"{trade.get('mf_entry_price_x') or 0:.4f}")
+        entry_x_label.setStyleSheet(f"color: {COLORS['text_primary']};")
+        form.addWidget(entry_x_label, 3, 1)
+
+        layout.addLayout(form)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn = QPushButton("Save")
+        ok_btn.setDefault(True)
+        ok_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['accent']};
+                color: #000;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 24px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: {COLORS.get('accent_hover', '#e8a04e')}; }}
+        """)
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            new_close_y = close_y_spin.value()
+            new_close_x = close_x_spin.value()
+
+            trade['mf_close_price_y'] = new_close_y
+            trade['mf_close_price_x'] = new_close_x
+
+            # Recalculate P/L
+            entry_y = trade.get('mf_entry_price_y') or 0
+            entry_x = trade.get('mf_entry_price_x') or 0
+            qty_y = trade.get('mf_qty_y', 0)
+            qty_x = trade.get('mf_qty_x', 0)
+
+            pnl_y = (new_close_y - entry_y) * qty_y if entry_y and qty_y else 0
+            pnl_x = (new_close_x - entry_x) * qty_x if entry_x and qty_x else 0
+            realized_pnl_sek = pnl_y + pnl_x
+
+            total_capital = 0
+            if entry_y and qty_y:
+                total_capital += entry_y * qty_y
+            if entry_x and qty_x:
+                total_capital += entry_x * qty_x
+
+            realized_pnl_pct = (realized_pnl_sek / total_capital * 100) if total_capital > 0 else 0
+
+            trade['realized_pnl_sek'] = round(realized_pnl_sek, 2)
+            trade['realized_pnl_pct'] = round(realized_pnl_pct, 2)
+            trade['capital'] = total_capital
+            trade['result'] = "PROFIT" if realized_pnl_sek >= 0 else "LOSS"
+
+            self._save_and_sync_portfolio()
+            self._update_trade_history_display()
+            self.statusBar().showMessage(
+                f"Updated close prices for {trade.get('pair', '')} — P/L: {realized_pnl_sek:+.0f} SEK ({realized_pnl_pct:+.1f}%)"
+            )
+
     def _update_trade_history_display(self):
         """Update the trade history table with closed positions."""
         self.trade_history_table.setRowCount(len(self.trade_history))
@@ -10183,19 +10414,43 @@ class PairsTradingTerminal(QMainWindow):
             
             # CLOSE DATE
             self.trade_history_table.setItem(i, 3, QTableWidgetItem(trade.get('close_date', '')))
-            
+
+            # CLOSE Y
+            cy = trade.get('mf_close_price_y')
+            cy_item = QTableWidgetItem(f"{cy:.4f}" if cy else "-")
+            cy_item.setForeground(QColor("#e8e8e8"))
+            self.trade_history_table.setItem(i, 4, cy_item)
+
+            # ENTRY Y
+            ey = trade.get('mf_entry_price_y')
+            ey_item = QTableWidgetItem(f"{ey:.4f}" if ey else "-")
+            ey_item.setForeground(QColor(COLORS['text_secondary']))
+            self.trade_history_table.setItem(i, 5, ey_item)
+
+            # CLOSE X
+            cx = trade.get('mf_close_price_x')
+            cx_item = QTableWidgetItem(f"{cx:.4f}" if cx else "-")
+            cx_item.setForeground(QColor("#e8e8e8"))
+            self.trade_history_table.setItem(i, 6, cx_item)
+
+            # ENTRY X
+            ex = trade.get('mf_entry_price_x')
+            ex_item = QTableWidgetItem(f"{ex:.4f}" if ex else "-")
+            ex_item.setForeground(QColor(COLORS['text_secondary']))
+            self.trade_history_table.setItem(i, 7, ex_item)
+
             # ENTRY Z
             ez = trade.get('entry_z', 0)
             ez_item = QTableWidgetItem(f"{ez:.2f}")
             ez_item.setForeground(QColor("#e8e8e8"))
-            self.trade_history_table.setItem(i, 4, ez_item)
-            
+            self.trade_history_table.setItem(i, 8, ez_item)
+
             # CLOSE Z
             cz = trade.get('close_z', 0)
             cz_item = QTableWidgetItem(f"{cz:.2f}")
             cz_item.setForeground(QColor("#e8e8e8"))
-            self.trade_history_table.setItem(i, 5, cz_item)
-            
+            self.trade_history_table.setItem(i, 9, cz_item)
+
             # RESULT
             result = trade.get('result', '')
             is_profit = result == 'PROFIT'
@@ -10203,26 +10458,26 @@ class PairsTradingTerminal(QMainWindow):
                 wins += 1
             result_item = QTableWidgetItem(result)
             result_item.setForeground(QColor("#22c55e" if is_profit else "#ef4444"))
-            self.trade_history_table.setItem(i, 6, result_item)
-            
+            self.trade_history_table.setItem(i, 10, result_item)
+
             # REALIZED P/L (SEK)
             pnl_sek = trade.get('realized_pnl_sek', 0)
             total_realized_sek += pnl_sek
             pnl_sek_item = QTableWidgetItem(f"{pnl_sek:+.0f}")
             pnl_sek_item.setForeground(QColor("#22c55e" if pnl_sek >= 0 else "#ef4444"))
-            self.trade_history_table.setItem(i, 7, pnl_sek_item)
-            
+            self.trade_history_table.setItem(i, 11, pnl_sek_item)
+
             # REALIZED P/L (%)
             pnl_pct = trade.get('realized_pnl_pct', 0)
             pnl_pct_item = QTableWidgetItem(f"{pnl_pct:+.1f}%")
             pnl_pct_item.setForeground(QColor("#22c55e" if pnl_pct >= 0 else "#ef4444"))
-            self.trade_history_table.setItem(i, 8, pnl_pct_item)
-            
+            self.trade_history_table.setItem(i, 12, pnl_pct_item)
+
             # CAPITAL
             cap = trade.get('capital', 0)
             cap_item = QTableWidgetItem(f"{cap:,.0f}")
             cap_item.setForeground(QColor("#e8e8e8"))
-            self.trade_history_table.setItem(i, 9, cap_item)
+            self.trade_history_table.setItem(i, 13, cap_item)
         
         # Update summary
         n = len(self.trade_history)
@@ -10336,6 +10591,35 @@ class PairsTradingTerminal(QMainWindow):
 
         main_layout.addWidget(top_bar)
 
+        # ── Mode toggle bar ──────────────────────────────────────────────
+        mode_bar = QFrame()
+        mode_bar.setFixedHeight(36)
+        mode_bar.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_dark']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+            }}
+        """)
+        mode_layout = QHBoxLayout(mode_bar)
+        mode_layout.setContentsMargins(4, 3, 4, 3)
+        mode_layout.setSpacing(4)
+
+        self._markov_mode_single_btn = QPushButton("SINGLE ANALYSIS")
+        self._markov_mode_scan_btn = QPushButton("CASINO EDGE SCAN")
+        for btn in [self._markov_mode_single_btn, self._markov_mode_scan_btn]:
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(28)
+        self._markov_mode_single_btn.clicked.connect(lambda: self._set_markov_mode(0))
+        self._markov_mode_scan_btn.clicked.connect(lambda: self._set_markov_mode(1))
+        mode_layout.addWidget(self._markov_mode_single_btn)
+        mode_layout.addWidget(self._markov_mode_scan_btn)
+        mode_layout.addStretch()
+        main_layout.addWidget(mode_bar)
+
+        # ── QStackedWidget: page 0 = single, page 1 = scanner ────────────
+        self.markov_stack = QStackedWidget()
+
         # ── Splitter: left panel + right charts ───────────────────────────
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(3)
@@ -10378,8 +10662,8 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_matrix_grid.setSpacing(2)
         self.markov_matrix_grid.setContentsMargins(6, 6, 6, 6)
         self.markov_matrix_labels = {}
-        # Create 6×6 grid (header row + header col + 5×5 cells)
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        # Create 3×3 grid (header row + header col + 2×2 cells)
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(N_MARKOV_STATES)] if MARKOV_AVAILABLE else ['NEG', 'POS']
         # Corner
         corner = QLabel("")
         corner.setStyleSheet(f"background:transparent;border:none;")
@@ -10396,7 +10680,7 @@ class PairsTradingTerminal(QMainWindow):
             rh.setAlignment(Qt.AlignCenter)
             rh.setStyleSheet(f"color:{COLORS['accent']};font-size:11px;font-weight:600;background:transparent;border:none;")
             self.markov_matrix_grid.addWidget(rh, i + 1, 0)
-            for j in range(5):
+            for j in range(N_MARKOV_STATES if MARKOV_AVAILABLE else 2):
                 cell = QLabel("-")
                 cell.setAlignment(Qt.AlignCenter)
                 cell.setFixedSize(52, 28)
@@ -10423,14 +10707,14 @@ class PairsTradingTerminal(QMainWindow):
                 info = MARKOV_STATES[s_id]
                 card = CompactMetricCard(f"P({info['short']})", "-")
                 card.setToolTip(f"Probability of {info['name']} next week, based on transition matrix row for current state")
-                card.setFixedWidth(80)
+                card.setFixedWidth(100)
                 forecast_row.addWidget(card)
                 self.markov_forecast_cards[s_id] = card
         else:
-            for s_id in range(5):
-                names = ['SD', 'D', 'F', 'U', 'SU']
+            for s_id in range(2):
+                names = ['NEG', 'POS']
                 card = CompactMetricCard(f"P({names[s_id]})", "-")
-                card.setFixedWidth(80)
+                card.setFixedWidth(100)
                 forecast_row.addWidget(card)
                 self.markov_forecast_cards[s_id] = card
         forecast_row.addStretch()
@@ -10480,8 +10764,8 @@ class PairsTradingTerminal(QMainWindow):
             h.setStyleSheet(f"color:{COLORS['text_muted']};font-size:10px;font-weight:600;text-transform:uppercase;background:transparent;border:none;")
             stats_grid.addWidget(h, 0, col_idx)
         self.markov_stats_labels = {}
-        state_shorts_full = ['SD', 'D', 'F', 'U', 'SU']
-        for row in range(5):
+        state_shorts_full = [MARKOV_STATES[i]['short'] for i in range(N_MARKOV_STATES)] if MARKOV_AVAILABLE else ['NEG', 'POS']
+        for row in range(N_MARKOV_STATES if MARKOV_AVAILABLE else 2):
             name_lbl = QLabel(state_shorts_full[row])
             name_lbl.setAlignment(Qt.AlignCenter)
             clr = MARKOV_STATES[row]['color'] if MARKOV_AVAILABLE else '#888'
@@ -10574,14 +10858,30 @@ class PairsTradingTerminal(QMainWindow):
 
         splitter.addWidget(right_widget)
         splitter.setSizes([280, 700])
-        main_layout.addWidget(splitter, stretch=1)
+
+        # Page 0: single analysis
+        self.markov_stack.addWidget(splitter)
+
+        # Page 1: scanner panel
+        scanner_panel = self._create_markov_scanner_panel()
+        self.markov_stack.addWidget(scanner_panel)
+
+        main_layout.addWidget(self.markov_stack, stretch=1)
+
+        # Default: single analysis mode
+        self._set_markov_mode(0)
 
         return tab
 
     def _populate_markov_tickers(self):
         """Populate the Markov ticker combo from the matched tickers CSV."""
         try:
-            csv_path = find_matched_tickers_csv()
+            # Prioritera GDrive-sökvägen (samma som resten av appen)
+            gdrive_csv = os.path.join(_GDRIVE_TRADING_DIR, "underliggande_matchade_tickers.csv")
+            csv_path = gdrive_csv if os.path.exists(gdrive_csv) else find_matched_tickers_csv()
+            if not os.path.exists(csv_path):
+                print(f"[Markov] CSV not found: {csv_path}")
+                return
             df = pd.read_csv(csv_path, sep=';', encoding='utf-8-sig')
             items = []
             if 'Ticker' in df.columns and 'Underliggande tillgång' in df.columns:
@@ -10598,6 +10898,363 @@ class PairsTradingTerminal(QMainWindow):
                 self.markov_ticker_combo.addItems(sorted(items))
         except Exception as e:
             print(f"[Markov] Error loading tickers: {e}")
+
+    # ── Scanner panel builder ────────────────────────────────────────────
+
+    def _create_markov_scanner_panel(self) -> QWidget:
+        """Build the Casino Edge Scanner panel (page 1 of markov_stack)."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+
+        # Controls row
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        self._markov_scan_btn = QPushButton("SCAN ALL")
+        self._markov_scan_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none; border-radius: 4px;
+                padding: 6px 20px; font-weight: 600;
+                font-size: 12px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_bright']}; }}
+            QPushButton:disabled {{ background: {COLORS['text_disabled']}; color: {COLORS['text_muted']}; }}
+        """)
+        self._markov_scan_btn.clicked.connect(self.run_markov_edge_scan)
+        ctrl_row.addWidget(self._markov_scan_btn)
+
+        self._markov_cancel_btn = QPushButton("CANCEL")
+        self._markov_cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['negative']};
+                color: #fff; border: none; border-radius: 4px;
+                padding: 6px 16px; font-weight: 600;
+                font-size: 12px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: #dc2626; }}
+        """)
+        self._markov_cancel_btn.hide()
+        self._markov_cancel_btn.clicked.connect(self._cancel_markov_scan)
+        ctrl_row.addWidget(self._markov_cancel_btn)
+
+        self._markov_scan_status = QLabel("")
+        self._markov_scan_status.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;")
+        ctrl_row.addWidget(self._markov_scan_status)
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        # Progress bar
+        self._markov_scan_progress = QProgressBar()
+        self._markov_scan_progress.setFixedHeight(4)
+        self._markov_scan_progress.setTextVisible(False)
+        self._markov_scan_progress.setStyleSheet(f"""
+            QProgressBar {{
+                background: {COLORS['bg_dark']};
+                border: none; border-radius: 2px;
+            }}
+            QProgressBar::chunk {{
+                background: {COLORS['accent']};
+                border-radius: 2px;
+            }}
+        """)
+        self._markov_scan_progress.hide()
+        layout.addWidget(self._markov_scan_progress)
+
+        # Summary cards row
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(8)
+        self._scan_card_scanned = CompactMetricCard("SCANNED", "0")
+        self._scan_card_positive = CompactMetricCard("POSITIVE EDGE", "0")
+        self._scan_card_avg_edge = CompactMetricCard("AVG EDGE %", "-")
+        self._scan_card_best_kelly = CompactMetricCard("BEST KELLY", "-")
+        for c in [self._scan_card_scanned, self._scan_card_positive,
+                  self._scan_card_avg_edge, self._scan_card_best_kelly]:
+            c.setFixedWidth(150)
+            cards_row.addWidget(c)
+        cards_row.addStretch()
+        layout.addLayout(cards_row)
+
+        # Results table
+        self._markov_scan_table = QTableWidget()
+        self._markov_scan_table.setColumnCount(9)
+        headers = ["TICKER", "STATE", "WIN RATE", "AVG WIN", "AVG LOSS",
+                    "PAYOFF", "EDGE %", "KELLY %", "OBS"]
+        self._markov_scan_table.setHorizontalHeaderLabels(headers)
+        self._markov_scan_table.setSortingEnabled(True)
+        self._markov_scan_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._markov_scan_table.setSelectionMode(QTableWidget.SingleSelection)
+        self._markov_scan_table.setAlternatingRowColors(False)
+        self._markov_scan_table.verticalHeader().setVisible(False)
+        self._markov_scan_table.horizontalHeader().setStretchLastSection(True)
+        self._markov_scan_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {COLORS['bg_card']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                gridline-color: {COLORS['border_subtle']};
+                font-family: 'JetBrains Mono', 'Consolas', monospace;
+                font-size: 11px;
+            }}
+            QTableWidget::item {{
+                padding: 4px 8px;
+                border-bottom: 1px solid {COLORS['border_subtle']};
+            }}
+            QTableWidget::item:selected {{
+                background: {COLORS['accent_dark']};
+                color: {COLORS['text_primary']};
+            }}
+            QHeaderView::section {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['accent']};
+                border: none;
+                border-bottom: 2px solid {COLORS['accent_dark']};
+                padding: 6px 8px;
+                font-weight: 600;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+        """)
+        # Column widths
+        col_widths = [100, 60, 80, 80, 80, 70, 80, 80, 60]
+        for i, w in enumerate(col_widths):
+            self._markov_scan_table.setColumnWidth(i, w)
+
+        self._markov_scan_table.doubleClicked.connect(self._on_markov_scan_row_double_clicked)
+        layout.addWidget(self._markov_scan_table, stretch=1)
+
+        return panel
+
+    # ── Mode toggle ──────────────────────────────────────────────────────
+
+    def _set_markov_mode(self, mode: int):
+        """Switch between single analysis (0) and scanner (1)."""
+        self.markov_stack.setCurrentIndex(mode)
+        # Style active/inactive buttons
+        active_style = f"""
+            QPushButton {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none; border-radius: 4px;
+                padding: 4px 16px; font-weight: 700;
+                font-size: 11px; letter-spacing: 1px;
+            }}
+        """
+        inactive_style = f"""
+            QPushButton {{
+                background: transparent;
+                color: {COLORS['text_muted']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                padding: 4px 16px; font-weight: 600;
+                font-size: 11px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ color: {COLORS['text_primary']}; border-color: {COLORS['accent']}; }}
+        """
+        self._markov_mode_single_btn.setStyleSheet(active_style if mode == 0 else inactive_style)
+        self._markov_mode_scan_btn.setStyleSheet(active_style if mode == 1 else inactive_style)
+
+    # ── Scanner methods ──────────────────────────────────────────────────
+
+    def _get_markov_ticker_list(self) -> list:
+        """Extract ticker symbols from the combo box."""
+        tickers = []
+        for i in range(self.markov_ticker_combo.count()):
+            raw = self.markov_ticker_combo.itemText(i).strip()
+            if raw:
+                tickers.append(raw.split(" — ")[0].strip())
+        return tickers
+
+    def run_markov_edge_scan(self):
+        """Start batch Markov edge scan of all tickers."""
+        if self._markov_scan_running:
+            return
+        tickers = self._get_markov_ticker_list()
+        if not tickers:
+            self._markov_scan_status.setText("No tickers found")
+            return
+
+        self._markov_scan_running = True
+        self._markov_scan_results.clear()
+        self._markov_scan_table.setRowCount(0)
+        self._markov_scan_table.setSortingEnabled(False)  # disable under insert
+        self._scan_card_scanned.set_value("0")
+        self._scan_card_positive.set_value("0")
+        self._scan_card_avg_edge.set_value("-")
+        self._scan_card_best_kelly.set_value("-")
+
+        self._markov_scan_btn.setEnabled(False)
+        self._markov_cancel_btn.show()
+        self._markov_scan_progress.show()
+        self._markov_scan_progress.setValue(0)
+
+        self._markov_scan_thread = QThread()
+        self._markov_scan_worker = MarkovEdgeScanWorker(tickers)
+        self._markov_scan_worker.moveToThread(self._markov_scan_thread)
+
+        self._markov_scan_thread.started.connect(self._markov_scan_worker.run)
+        self._markov_scan_worker.progress.connect(self._on_markov_scan_progress)
+        self._markov_scan_worker.tick_result.connect(self._on_markov_scan_tick)
+        self._markov_scan_worker.error.connect(self._on_markov_scan_error)
+        self._markov_scan_worker.finished.connect(self._on_markov_scan_finished)
+        self._markov_scan_worker.finished.connect(self._markov_scan_thread.quit)
+
+        self._markov_scan_thread.start()
+
+    def _cancel_markov_scan(self):
+        if self._markov_scan_worker:
+            self._markov_scan_worker.cancel()
+        self._markov_scan_status.setText("Cancelling...")
+
+    def _on_markov_scan_progress(self, pct: int, msg: str):
+        self._markov_scan_progress.setValue(pct)
+        self._markov_scan_status.setText(msg)
+
+    def _on_markov_scan_tick(self, data: dict):
+        """Handle a single ticker result — append row to table + update cards."""
+        ticker = data['ticker']
+        if 'error' in data:
+            # Skip failed tickers silently
+            return
+
+        self._markov_scan_results[ticker] = data
+        self._append_scanner_row(data)
+
+        # Update summary cards
+        results = [r for r in self._markov_scan_results.values() if 'error' not in r]
+        n_scanned = len(results)
+        n_positive = sum(1 for r in results if r['edge'] > 0)
+        edges = [r['edge'] for r in results]
+        kellys = [r['kelly'] for r in results]
+        avg_edge = np.mean(edges) if edges else 0
+        best_kelly = max(kellys) if kellys else 0
+
+        self._scan_card_scanned.set_value(str(n_scanned))
+        self._scan_card_positive.set_value(str(n_positive),
+            COLORS['positive'] if n_positive > 0 else COLORS['text_primary'])
+        self._scan_card_avg_edge.set_value(f"{avg_edge*100:.2f}%",
+            COLORS['positive'] if avg_edge > 0 else COLORS['negative'])
+        self._scan_card_best_kelly.set_value(f"{best_kelly*100:.1f}%",
+            COLORS['positive'] if best_kelly > 0 else COLORS['text_muted'])
+
+    def _on_markov_scan_error(self, msg: str):
+        self._markov_scan_status.setText(f"Error: {msg}")
+        self._markov_scan_status.setStyleSheet(f"color:{COLORS['negative']};font-size:11px;")
+
+    def _on_markov_scan_finished(self):
+        self._markov_scan_running = False
+        self._markov_scan_btn.setEnabled(True)
+        self._markov_cancel_btn.hide()
+        self._markov_scan_progress.hide()
+        self._markov_scan_table.setSortingEnabled(True)
+        self._cleanup_markov_scan_worker()
+        # Sort by edge % descending
+        self._markov_scan_table.sortItems(6, Qt.DescendingOrder)
+
+    def _append_scanner_row(self, data: dict):
+        """Insert a row into the scanner table."""
+        table = self._markov_scan_table
+        row = table.rowCount()
+        table.insertRow(row)
+
+        def _make_item(text, sort_val=None, color=None, bg=None):
+            """Create a NumericTableItem with numeric sort support."""
+            item = NumericTableItem()
+            item.setText(text)
+            if sort_val is not None:
+                item.setData(Qt.UserRole, sort_val)
+            flags = item.flags()
+            flags &= ~Qt.ItemIsEditable
+            item.setFlags(flags)
+            if color:
+                item.setForeground(QColor(color))
+            if bg:
+                item.setBackground(QColor(bg))
+            return item
+
+        # 0: TICKER
+        table.setItem(row, 0, _make_item(data['ticker']))
+
+        # 1: STATE
+        state = data['state']
+        state_txt = "POS" if state == 1 else "NEG"
+        state_clr = '#22c55e' if state == 1 else '#ef4444'
+        table.setItem(row, 1, _make_item(state_txt, state, state_clr))
+
+        # 2: WIN RATE
+        wr = data['win_rate']
+        wr_clr = '#22c55e' if wr > 0.55 else COLORS['text_primary']
+        table.setItem(row, 2, _make_item(f"{wr:.1%}", wr, wr_clr))
+
+        # 3: AVG WIN
+        aw = data['avg_win']
+        table.setItem(row, 3, _make_item(f"{aw*100:+.2f}%", aw, '#22c55e'))
+
+        # 4: AVG LOSS
+        al = data['avg_loss']
+        table.setItem(row, 4, _make_item(f"{al*100:+.2f}%", al, '#ef4444'))
+
+        # 5: PAYOFF
+        po = data['payoff']
+        po_clr = '#22c55e' if po >= 1.0 else COLORS['text_primary']
+        table.setItem(row, 5, _make_item(f"{po:.2f}", po, po_clr))
+
+        # 6: EDGE %
+        edge = data['edge']
+        edge_clr = '#22c55e' if edge > 0 else '#ef4444'
+        edge_bg = '#0d2818' if edge > 0 else '#2d0a0a'
+        table.setItem(row, 6, _make_item(f"{edge*100:+.2f}%", edge, edge_clr, edge_bg))
+
+        # 7: KELLY %
+        kelly = data['kelly']
+        if kelly > 0.15:
+            kelly_clr = '#22c55e'
+        elif kelly > 0:
+            kelly_clr = '#f59e0b'  # amber
+        else:
+            kelly_clr = '#ef4444'
+        table.setItem(row, 7, _make_item(f"{kelly*100:.1f}%", kelly, kelly_clr))
+
+        # 8: OBS
+        obs = data['n_obs']
+        table.setItem(row, 8, _make_item(str(obs), obs, COLORS['text_muted']))
+
+    def _on_markov_scan_row_double_clicked(self, index):
+        """Dubbelklick → switch to single analysis with cached result."""
+        row = index.row()
+        ticker_item = self._markov_scan_table.item(row, 0)
+        if ticker_item is None:
+            return
+        ticker = ticker_item.text()
+        cached = self._markov_scan_results.get(ticker)
+        if cached is None or 'markov_result' not in cached:
+            return
+
+        # Switch to single analysis mode
+        self._set_markov_mode(0)
+
+        # Set combo to this ticker
+        for i in range(self.markov_ticker_combo.count()):
+            if self.markov_ticker_combo.itemText(i).startswith(ticker):
+                self.markov_ticker_combo.setCurrentIndex(i)
+                break
+
+        # Use cached MarkovResult directly (noll nätverksanrop)
+        self._on_markov_result(cached['markov_result'])
+
+    def _cleanup_markov_scan_worker(self):
+        """Clean up scan worker to prevent memory leaks."""
+        if self._markov_scan_worker is not None:
+            self._markov_scan_worker.deleteLater()
+            self._markov_scan_worker = None
+        if self._markov_scan_thread is not None:
+            self._markov_scan_thread.deleteLater()
+            self._markov_scan_thread = None
 
     # ── Analysis runner ───────────────────────────────────────────────────
 
@@ -10675,8 +11332,8 @@ class PairsTradingTerminal(QMainWindow):
     def _update_markov_matrix(self, r):
         """Update transition matrix grid cells with intensity coloring."""
         T = r.transition_matrix
-        for i in range(5):
-            for j in range(5):
+        for i in range(N_MARKOV_STATES):
+            for j in range(N_MARKOV_STATES):
                 val = T[i, j]
                 cell = self.markov_matrix_labels.get((i, j))
                 if cell is None:
@@ -10699,7 +11356,7 @@ class PairsTradingTerminal(QMainWindow):
 
     def _update_markov_forecast(self, r):
         """Update forecast probability cards."""
-        for s_id in range(5):
+        for s_id in range(N_MARKOV_STATES):
             card = self.markov_forecast_cards.get(s_id)
             if card is None:
                 continue
@@ -10742,7 +11399,7 @@ class PairsTradingTerminal(QMainWindow):
 
     def _update_markov_state_stats(self, r):
         """Update state statistics table."""
-        for s_id in range(5):
+        for s_id in range(N_MARKOV_STATES):
             st = r.state_stats.get(s_id, {})
             avg_ret = st.get('avg_return', 0)
             vol = st.get('volatility', 0)
@@ -10768,9 +11425,9 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_diag_range.set_value(f"{r.data_start}\n{r.data_end}")
         # Stationary dist compact
         if MARKOV_AVAILABLE:
-            parts = [f"{MARKOV_STATES[i]['short']}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+            parts = [f"{MARKOV_STATES[i]['short']}:{r.stationary_dist[i]:.0%}" for i in range(N_MARKOV_STATES)]
         else:
-            parts = [f"S{i}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+            parts = [f"S{i}:{r.stationary_dist[i]:.0%}" for i in range(2)]
         self.markov_diag_stat.set_value(" ".join(parts))
 
     # ── Chart rendering ───────────────────────────────────────────────────
@@ -10807,13 +11464,11 @@ class PairsTradingTerminal(QMainWindow):
         )
 
         # Scatter by state
-        state_colors = {
-            0: '#ef4444', 1: '#f59e0b', 2: '#a0a0a0', 3: '#22c55e', 4: '#3b82f6'
-        }
+        state_colors = {0: '#ef4444', 1: '#22c55e'}
         if MARKOV_AVAILABLE:
             state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
 
-        for s_id in range(5):
+        for s_id in range(N_MARKOV_STATES):
             mask = states == s_id
             if not mask.any():
                 continue
@@ -10867,8 +11522,9 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_heatmap_texts = []
 
         # Add text annotations
-        for i in range(5):
-            for j in range(5):
+        n = N_MARKOV_STATES
+        for i in range(n):
+            for j in range(n):
                 txt = pg.TextItem(f"{T[i, j]:.0%}", color='#ffffff', anchor=(0.5, 0.5))
                 txt.setPos(j + 0.5, i + 0.5)
                 txt.setFont(QFont('JetBrains Mono', 9))
@@ -10876,13 +11532,13 @@ class PairsTradingTerminal(QMainWindow):
                 self.markov_heatmap_texts.append(txt)
 
         # Axis labels
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n)] if MARKOV_AVAILABLE else ['NEG', 'POS']
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
         y_axis = plot.getAxis('left')
         y_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(0, 5)
-        plot.setYRange(0, 5)
+        plot.setXRange(0, n)
+        plot.setYRange(0, n)
 
     def _render_markov_forecast_bars(self, r, pg):
         """Chart 3: Next week forecast bar chart."""
@@ -10890,13 +11546,12 @@ class PairsTradingTerminal(QMainWindow):
         plot.clear()
 
         probs = r.forecast_probs * 100  # percent
-        state_colors = {
-            0: '#ef4444', 1: '#f59e0b', 2: '#a0a0a0', 3: '#22c55e', 4: '#3b82f6'
-        }
+        state_colors = {0: '#ef4444', 1: '#22c55e'}
         if MARKOV_AVAILABLE:
             state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
 
-        for i in range(5):
+        n = N_MARKOV_STATES
+        for i in range(n):
             bar = pg.BarGraphItem(
                 x=[i], height=[probs[i]], width=0.6,
                 brush=pg.mkBrush(state_colors.get(i, '#888')),
@@ -10909,13 +11564,13 @@ class PairsTradingTerminal(QMainWindow):
             txt.setFont(QFont('JetBrains Mono', 9))
             plot.addItem(txt)
 
-        # Baseline at 20% (uniform)
-        plot.addLine(y=20, pen=pg.mkPen('#666666', width=1, style=Qt.DashLine))
+        # Baseline at 50% (uniform for 2 states)
+        plot.addLine(y=50, pen=pg.mkPen('#666666', width=1, style=Qt.DashLine))
 
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n)] if MARKOV_AVAILABLE else ['NEG', 'POS']
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(-0.5, 4.5)
+        plot.setXRange(-0.5, n - 0.5)
         plot.setYRange(0, max(probs) * 1.2 + 5)
 
     def _render_markov_horizon_chart(self, r, pg):
@@ -10932,8 +11587,9 @@ class PairsTradingTerminal(QMainWindow):
         offsets = [-bar_width, 0, bar_width]
         horizon_colors = [COLORS['accent'], COLORS['info'], COLORS['text_muted']]
 
+        n = N_MARKOV_STATES
         for h_idx, (label, probs) in enumerate(horizons):
-            x = np.arange(5) + offsets[h_idx]
+            x = np.arange(n) + offsets[h_idx]
             bar = pg.BarGraphItem(
                 x=x, height=probs * 100, width=bar_width,
                 brush=pg.mkBrush(horizon_colors[h_idx]),
@@ -10942,10 +11598,10 @@ class PairsTradingTerminal(QMainWindow):
             )
             plot.addItem(bar)
 
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n)] if MARKOV_AVAILABLE else ['NEG', 'POS']
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(-0.5, 4.5)
+        plot.setXRange(-0.5, n - 0.5)
         max_val = max(r.forecast_probs.max(), r.forecast_2w.max(), r.forecast_4w.max()) * 100
         plot.setYRange(0, max_val * 1.2 + 5)
         plot.addLegend(offset=(10, 10))
@@ -10982,7 +11638,7 @@ class PairsTradingTerminal(QMainWindow):
             '^GSPC': 50, '^NDX': 25, '^DJI': 15, '^RUT': 3,
             '^GSPTSE': 3, '^BVSP': 1,
             # Europe
-            '^FTSE': 3, '^FCHI': 3.5, '^STOXX50E': 10, '^N100': 5,
+            '^FTSE': 3, '^FCHI': 3.5, '^STOXX': 10, '^N100': 5,
             '^GDAXI': 2.5, '^OMX': 1,
             'OBX.OL': 0.4, '^OMXC25': 0.6, '^OMXH25': 0.3,
             # Asia
@@ -12064,6 +12720,13 @@ class PairsTradingTerminal(QMainWindow):
                 new_positions = load_portfolio(PORTFOLIO_FILE)
                 
                 if new_positions is not None:
+                    # Skydda mot att skriva tillbaka tom portfolio om filen hade data
+                    if not new_positions and self.portfolio:
+                        # Filen laddades som tom men vi har positioner i minnet — ignorera
+                        print("[Portfolio Sync] File loaded empty but memory has positions — skipping")
+                        self._portfolio_file_mtime = current_mtime
+                        return
+
                     # Merge trade_history: keep local + file entries
                     file_history = load_trade_history(PORTFOLIO_FILE)
                     merged_history = list(self.trade_history)
@@ -12074,7 +12737,7 @@ class PairsTradingTerminal(QMainWindow):
                             merged_history.append(fh)
                             local_keys.add(key)
                     self.trade_history = merged_history
-                    
+
                     # Filter out positions that are CLOSED in trade_history
                     closed_keys = {(t['pair'], t.get('entry_date', ''))
                                    for t in self.trade_history
@@ -12082,11 +12745,17 @@ class PairsTradingTerminal(QMainWindow):
                                    and t.get('close_date')}
                     filtered = [p for p in new_positions
                                 if (p['pair'], p.get('entry_date', '')) not in closed_keys]
-                    self.portfolio = filtered
+
+                    # Skydda mot att tömma portfolio om filen hade positioner
+                    if not filtered and new_positions:
+                        print(f"[Portfolio Sync] All {len(new_positions)} positions filtered out — skipping save")
+                        self.portfolio = new_positions  # Behåll ofiltrerat
+                    else:
+                        self.portfolio = filtered
+                        # Re-save so other computers see the close
+                        self._save_and_sync_portfolio()
+
                     self._portfolio_file_mtime = current_mtime
-                    
-                    # Re-save so other computers see the close
-                    self._save_and_sync_portfolio()
                     self.update_portfolio_display()
                     self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
                     self.statusBar().showMessage(f"Portfolio synced: {len(self.portfolio)} position(s) from another device")

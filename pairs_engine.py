@@ -2004,27 +2004,20 @@ class PairsTradingEngine:
         all_data = {}
         too_few_data = []
 
-        import time as _time
-
-        print(f"[Data] === START fetch_data: {len(tickers)} tickers, period={period} ===")
-
         # Batcha i grupper om 50 för att undvika att yf.download hänger sig
         batch_size = 50
         total_batches = (len(tickers) + batch_size - 1) // batch_size
-        t0 = _time.time()
 
         for batch_idx in range(total_batches):
             batch_start = batch_idx * batch_size
             batch = tickers[batch_start:batch_start + batch_size]
             batch_num = batch_idx + 1
 
-            msg = f"Batch {batch_num}/{total_batches}: {len(batch)} tickers..."
-            print(f"[Data] {msg}")
             if progress_callback:
-                progress_callback(batch_num, total_batches + 1, msg)
+                progress_callback(batch_num, total_batches + 1,
+                    f"Batch {batch_num}/{total_batches}: {len(batch)} tickers...")
 
             try:
-                t_b = _time.time()
                 raw_data = yf.download(
                     batch,
                     period=period,
@@ -2035,14 +2028,10 @@ class PairsTradingEngine:
                     group_by='ticker',
                     ignore_tz=True
                 )
-                dt = _time.time() - t_b
-                print(f"[Data] Batch {batch_num} klart på {dt:.1f}s — shape={raw_data.shape if raw_data is not None else 'None'}")
-            except Exception as e:
-                print(f"[Data] Batch {batch_num} EXCEPTION: {e}")
+            except Exception:
                 continue
 
             if raw_data is None or raw_data.empty:
-                print(f"[Data] Batch {batch_num}: tom data!")
                 continue
 
             if len(batch) == 1:
@@ -2051,8 +2040,7 @@ class PairsTradingEngine:
                     raw_data.columns = raw_data.columns.droplevel(1)
                 if 'Close' in raw_data.columns:
                     series = raw_data['Close'].copy()
-                    valid = series.notna().sum()
-                    if valid > 50:
+                    if series.notna().sum() > 50:
                         all_data[ticker] = series
                     else:
                         too_few_data.append(ticker)
@@ -2064,28 +2052,21 @@ class PairsTradingEngine:
                             ticker_df = raw_data[ticker]
                             if 'Close' in ticker_df.columns:
                                 series = ticker_df['Close'].copy()
-                                valid = series.notna().sum()
-                                if valid > 50:
+                                if series.notna().sum() > 50:
                                     all_data[ticker] = series
                                 else:
                                     too_few_data.append(ticker)
-                    except Exception as ex:
-                        print(f"[Data] Fel vid parsing av {ticker}: {ex}")
+                    except Exception:
                         continue
-
-            print(f"[Data] Totalt {len(all_data)} tickers laddade hittills")
-
-        print(f"[Data] Alla batchar klara på {_time.time()-t0:.1f}s — {len(all_data)}/{len(tickers)} OK")
 
         # Retry missade tickers individuellt
         missing = [t for t in tickers if t not in all_data and t not in too_few_data]
         if missing:
-            print(f"[Data] Retry: {len(missing)} tickers individuellt: {missing[:20]}")
             if progress_callback:
-                progress_callback(1, 1, f"Retry: {len(missing)} tickers...")
-            for i, ticker in enumerate(missing):
+                progress_callback(total_batches, total_batches + 1,
+                    f"Retry: {len(missing)} tickers...")
+            for ticker in missing:
                 try:
-                    t_r = _time.time()
                     raw = yf.download(
                         ticker,
                         period=period,
@@ -2095,41 +2076,21 @@ class PairsTradingEngine:
                         threads=False,
                         ignore_tz=True
                     )
-                    dt = _time.time() - t_r
                     if raw is not None and not raw.empty:
                         if isinstance(raw.columns, pd.MultiIndex):
                             raw.columns = raw.columns.droplevel(1)
                         if 'Close' in raw.columns:
                             series = raw['Close'].copy()
-                            valid = series.notna().sum()
-                            if valid > 50:
+                            if series.notna().sum() > 50:
                                 all_data[ticker] = series
-                                print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} OK ({valid} pts, {dt:.1f}s)")
                             else:
                                 too_few_data.append(ticker)
-                                print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} för lite data ({valid} pts)")
-                        else:
-                            print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} ingen Close-kolumn")
-                    else:
-                        print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} tom data ({dt:.1f}s)")
-                except Exception as ex:
-                    print(f"[Data] Retry {i+1}/{len(missing)}: {ticker} EXCEPTION: {ex}")
+                except Exception:
                     continue
 
         # Sammanställ misslyckade tickers
         final_missing = [t for t in tickers if t not in all_data]
-        no_data_tickers = [t for t in final_missing if t not in too_few_data]
-        self.failed_tickers = final_missing
-
-        if final_missing:
-            print(f"[Data] === MISSLYCKADE TICKERS: {len(final_missing)} av {len(tickers)} ===")
-            if no_data_tickers:
-                print(f"[Data]   Ingen data: {no_data_tickers[:20]}{'...' if len(no_data_tickers) > 20 else ''}")
-            if too_few_data:
-                print(f"[Data]   För lite data (<50 punkter): {too_few_data[:20]}{'...' if len(too_few_data) > 20 else ''}")
-        else:
-            self.failed_tickers = []
-            print(f"[Data] Alla {len(tickers)} tickers laddade OK")
+        self.failed_tickers = final_missing if final_missing else []
 
         if not all_data:
             print(f"[Data] Ingen data laddad. Alla {len(tickers)} tickers misslyckades.")
@@ -3100,12 +3061,9 @@ class PairsTradingEngine:
                 raise ValueError("No price data loaded. Call fetch_data first or provide tickers.")
             self.fetch_data(tickers)
         
-        import time as _time
-
         data = self.price_data
         available_tickers = data.columns.tolist()
         available_tickers_set = set(available_tickers)
-        print(f"[Scan] === START screen_pairs: {len(available_tickers)} tickers, {len(data)} rader ===")
 
         if progress_callback:
             progress_callback('grouping', 0, 0, f"Starting with {len(available_tickers)} tickers")
@@ -3140,26 +3098,13 @@ class PairsTradingEngine:
 
                 valid_tickers = [t for t in group_tickers
                                if t in returns.columns and valid_return_counts.get(t, 0) >= min_obs_for_corr]
-                print(f"[Scan] Grupp '{group_name}': {len(group_tickers)} tickers, {len(valid_tickers)} med >= {min_obs_for_corr} obs")
                 if len(valid_tickers) < 2:
                     continue
 
                 group_returns = returns[valid_tickers]
-                t_corr = _time.time()
                 corr_matrix = group_returns.corr(min_periods=min_obs_for_corr)
-                dt_corr = _time.time() - t_corr
 
-                # Debug: visa korrelationsmatris-statistik
                 corr_values = corr_matrix.values
-                upper_tri = corr_values[np.triu_indices_from(corr_values, k=1)]
-                valid_corrs = upper_tri[~np.isnan(upper_tri)]
-                print(f"[Scan] Korrelationsmatris: {corr_matrix.shape}, {len(valid_corrs)} giltiga par, "
-                      f"NaN={np.isnan(upper_tri).sum()}, "
-                      f"beräknad på {dt_corr:.1f}s")
-                if len(valid_corrs) > 0:
-                    print(f"[Scan] Korrelationer: min={valid_corrs.min():.3f}, max={valid_corrs.max():.3f}, "
-                          f"mean={valid_corrs.mean():.3f}, median={np.median(valid_corrs):.3f}, "
-                          f">0.7: {(valid_corrs >= 0.7).sum()}, >0.5: {(valid_corrs >= 0.5).sum()}")
 
                 if progress_callback:
                     progress_callback('correlation', group_idx + 1, len(groups),
@@ -3185,12 +3130,6 @@ class PairsTradingEngine:
                         t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                         candidate_pairs.append((t1, t2, group_name, None))
 
-        print(f"[Scan] Korrelationsfilter: {len(candidate_pairs)} par klarade min_corr={self.config['min_correlation']}")
-        if candidate_pairs:
-            top5 = sorted(candidate_pairs, key=lambda x: x[3] if x[3] else 0, reverse=True)[:5]
-            for t1, t2, g, c in top5:
-                print(f"[Scan]   Top: {t1}/{t2} corr={c:.3f}")
-        
         if progress_callback:
             progress_callback('screening', 0, max(1, len(candidate_pairs)), 
                             f"Testing {len(candidate_pairs)} candidate pairs...")
@@ -3229,19 +3168,6 @@ class PairsTradingEngine:
                 results.append(result)
 
         results_df = pd.DataFrame(results)
-
-        # Debug: visa varför par failade
-        if len(results) > 0:
-            viable_count = sum(1 for r in results if r.get('is_viable'))
-            print(f"[Scan] Testade {len(results)} par, {viable_count} viable")
-            # Visa fail-orsaker
-            fail_reasons = {}
-            for r in results:
-                if not r.get('is_viable'):
-                    reason = r.get('failed_at', 'unknown')
-                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-            if fail_reasons:
-                print(f"[Scan] Fail-orsaker: {dict(sorted(fail_reasons.items(), key=lambda x: -x[1]))}")
 
         # Extract window_details into separate dict before sorting
         self._window_details = {}
