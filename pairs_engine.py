@@ -9,6 +9,7 @@ and risk management.
 Author: Andreas
 """
 
+import socket
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -24,6 +25,7 @@ from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -33,6 +35,13 @@ try:
     ARCH_AVAILABLE = True
 except ImportError:
     ARCH_AVAILABLE = False
+
+# Optional: hmmlearn for HMM regime detection
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HMM_AVAILABLE = True
+except ImportError:
+    HMM_AVAILABLE = False
 
 # Number of workers for parallel processing
 N_WORKERS = min(8, multiprocessing.cpu_count())
@@ -86,6 +95,8 @@ class TradeSignal:
     avg_holding_days: float
     confidence: str       # 'HIGH', 'MEDIUM', 'LOW'
     optimal_z_entry: float = 0.0  # Optimal entry z-score (profit-maximizing)
+    hmm_p_mean_reverting: float = 1.0
+    hmm_regime_label: str = "N/A"   # "Mean-Reverting", "Trending", "Crisis"
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -398,12 +409,13 @@ class OUProcess:
                               z_stop: float = 3.5,
                               transaction_cost_z: float = 0.05,
                               z_min: float = 1.0, z_max: float = 4.0,
-                              n_grid: int = 40,
                               garch_persistence: float = 0.0,
                               fractional_d: float = 0.5,
-                              hurst: float = 0.5) -> Dict:
+                              hurst: float = 0.5,
+                              **kwargs) -> Dict:
         """
-        Find optimal entry z-score maximizing the trade Sharpe ratio.
+        Find optimal entry z-score maximizing the trade Sharpe ratio
+        using Brent's method (scipy.optimize.minimize_scalar).
 
         Key insight: for pure OU in z-space, the scale function is exp(z²/2)
         which is universal (parameter-free). To get pair-specific optima, we
@@ -418,78 +430,65 @@ class OUProcess:
         Returns:
             Dict with optimal_z, expected_profit_per_day, roundtrip_days
         """
-        best_z = 1.5  # fallback
-        best_score = -np.inf
-        best_rt_days = np.inf
-
         # --- Pair-specific adjustments ---
 
         # 1. GARCH: high persistence → vol clustering → effective stop is closer
-        #    (a vol spike can push spread further before reverting)
-        #    Shrink z_stop for high-persistence pairs
         garch_penalty = garch_persistence ** 2  # quadratic: 0.9→0.81, 0.7→0.49
         z_stop_eff = z_stop - 0.8 * garch_penalty  # max ~0.8σ tighter stop
         z_stop_eff = max(z_stop_eff, 2.0)  # floor at 2.0
 
         # 2. Fractional d: d > 0.5 means less mean-reverting than pure OU
-        #    Discount win probability (OU overestimates reversion strength)
-        #    d=0.3 → strong MR, no discount; d=0.5 → moderate; d=0.9 → heavy discount
         d_discount = max(0.0, (fractional_d - 0.3)) * 0.4  # 0 to 0.24
         # Also factor in Hurst: lower = more mean-reverting
         h_discount = max(0.0, (hurst - 0.35)) * 0.3  # 0 to ~0.05
 
-        z_grid = np.linspace(z_min, min(z_max, z_stop_eff - 0.3), n_grid)
-
-        # Universal OU scale function in z-space: s(z) = ∫exp(u²/2)du
-        # Pre-compute on a fine grid
-        z_fine = np.linspace(-0.5, z_stop_eff + 0.5, 500)
-        s_vals = np.exp(z_fine**2 / 2)
-        s_cum = np.cumsum(s_vals) * (z_fine[1] - z_fine[0])
+        # Universal OU scale function: s(z) = ∫₀ᶻ exp(u²/2) du
+        # Use scipy.integrate for accurate evaluation
+        from scipy.special import erfi
+        SQRT_PI_OVER_2 = np.sqrt(np.pi / 2)
 
         def s_at(z_val):
-            idx = int(np.clip(np.searchsorted(z_fine, z_val), 0, len(z_fine) - 1))
-            return s_cum[idx]
+            # ∫₀ᶻ exp(u²/2) du = √(π/2) · erfi(z/√2)
+            return SQRT_PI_OVER_2 * erfi(z_val / np.sqrt(2))
 
-        for z_entry in z_grid:
+        s_stop = s_at(z_stop_eff)
+        s_exit = s_at(z_exit)
+        denom = s_stop - s_exit
+
+        z_upper = min(z_max, z_stop_eff - 0.3)
+        # Ensure valid search bounds
+        if z_upper <= z_min + 0.01 or abs(denom) < 1e-15:
+            return {'optimal_z': 1.5, 'expected_profit_per_day': 0.0, 'roundtrip_days': 0.0}
+
+        def neg_sharpe(z_entry):
             profit_z = z_entry - z_exit - 2 * transaction_cost_z
             loss_z = z_stop_eff - z_entry + 2 * transaction_cost_z
             if profit_z <= 0 or loss_z <= 0:
-                continue
+                return 0.0  # infeasible → Sharpe = 0
 
-            # OU win probability in z-space (universal)
-            # P(hit z_exit before z_stop | start z_entry)
-            denom = s_at(z_stop_eff) - s_at(z_exit)
-            if abs(denom) < 1e-15:
-                p_win_ou = 0.5
-            else:
-                p_win_ou = (s_at(z_stop_eff) - s_at(z_entry)) / denom
-
-            # Apply pair-specific discounts to win probability
+            # OU win probability: P(hit exit before stop | entry)
+            p_win_ou = (s_stop - s_at(z_entry)) / denom
             p_win = p_win_ou * (1 - d_discount) * (1 - h_discount)
             p_win = float(np.clip(p_win, 0.05, 0.99))
 
-            # Expected PnL and variance per trade
             e_pnl = p_win * profit_z - (1 - p_win) * loss_z
             var_pnl = (p_win * (profit_z - e_pnl)**2 +
                        (1 - p_win) * (-loss_z - e_pnl)**2)
             std_pnl = np.sqrt(max(var_pnl, 1e-12))
+            return -(e_pnl / std_pnl)  # negate for minimization
 
-            # Trade Sharpe ratio
-            sharpe = e_pnl / std_pnl
+        result = minimize_scalar(neg_sharpe, bounds=(z_min, z_upper), method='bounded')
+        best_z = result.x
+        best_score = -result.fun
 
-            # Expected roundtrip time (for reporting)
-            S_entry = self.spread_from_z(z_entry)
+        # Expected roundtrip time
+        try:
+            S_entry = self.spread_from_z(best_z)
             S_exit = self.spread_from_z(z_exit)
-            try:
-                t_hit = self.expected_hitting_time(S_entry, S_exit)
-                rt_days = t_hit * 252
-            except Exception:
-                rt_days = self.half_life_days() * 2
-
-            if sharpe > best_score:
-                best_score = sharpe
-                best_z = z_entry
-                best_rt_days = rt_days
+            t_hit = self.expected_hitting_time(S_entry, S_exit)
+            best_rt_days = t_hit * 252
+        except Exception:
+            best_rt_days = self.half_life_days() * 2
 
         return {
             'optimal_z': float(round(best_z, 2)),
@@ -542,6 +541,245 @@ class KalmanOUResult:
     theta_lower: Optional[np.ndarray] = None   # 95% CI lower
     mu_upper: Optional[np.ndarray] = None
     mu_lower: Optional[np.ndarray] = None
+
+
+@dataclass
+class HMMRegimeResult:
+    """Result from HMM 3-state regime detection."""
+    hmm_regime_probs: np.ndarray        # [P(MR), P(Trending), P(Crisis)]
+    hmm_current_state: int              # 0=MR, 1=Trending, 2=Crisis (after relabeling)
+    hmm_regime_stability: float         # Fraction of recent days in current state
+    hmm_transition_matrix: np.ndarray   # 3x3 transition matrix
+    hmm_state_sequence: np.ndarray      # Full state sequence
+    hmm_p_mean_reverting: float         # Shortcut: P(MR) for current observation
+    hmm_valid: bool = True
+    hmm_reason: str = ""
+
+
+class HMMRegimeDetector:
+    """
+    3-state Hidden Markov Model for regime detection on spread series.
+
+    States (after semantic relabeling):
+        0 = Mean-reverting (negative autocorrelation, low vol)
+        1 = Trending (positive autocorrelation)
+        2 = Crisis (highest volatility)
+
+    Features:
+        1. spread_returns — first difference of spread
+        2. log_rolling_vol — log(rolling 20d std of returns)
+        3. rolling_autocorr_lag1 — rolling 20d lag-1 autocorrelation
+    """
+
+    def __init__(self, n_states: int = 3, n_iter: int = 100,
+                 covariance_type: str = "full", random_state: int = 42,
+                 n_fits: int = 10):
+        self.n_states = n_states
+        self.n_iter = n_iter
+        self.covariance_type = covariance_type
+        self.random_state = random_state
+        self.n_fits = n_fits
+
+    def _build_features(self, spread: pd.Series) -> Optional[np.ndarray]:
+        """Build 3D feature matrix from spread series."""
+        returns = spread.diff()
+
+        # Rolling 20-day volatility (log-transformed)
+        roll_vol = returns.rolling(20).std()
+        log_vol = np.log(roll_vol.clip(lower=1e-10))
+
+        # Rolling 20-day lag-1 autocorrelation
+        def _rolling_autocorr(s, window=20):
+            out = pd.Series(np.nan, index=s.index)
+            vals = s.values
+            for i in range(window, len(vals)):
+                chunk = vals[i - window:i]
+                if np.std(chunk) < 1e-12:
+                    out.iloc[i] = 0.0
+                else:
+                    out.iloc[i] = np.corrcoef(chunk[:-1], chunk[1:])[0, 1]
+            return out
+
+        autocorr = _rolling_autocorr(returns)
+
+        # Combine and drop NaN rows
+        features = pd.DataFrame({
+            'returns': returns,
+            'log_vol': log_vol,
+            'autocorr': autocorr,
+        }).dropna()
+
+        if len(features) < 60:
+            return None
+
+        return features.values
+
+    def _label_states(self, model, features: np.ndarray) -> Dict[int, int]:
+        """
+        Map arbitrary HMM state indices to semantic labels using a
+        scoring-based approach for robustness against label switching.
+
+        Returns mapping: {hmm_state_idx: semantic_label}
+        where semantic_label: 0=MR, 1=Trending, 2=Crisis
+
+        Scoring: each state gets a score for each role based on multiple features.
+        Crisis: high log_vol, low autocorr magnitude
+        MR:     low log_vol, negative autocorr
+        Trending: positive autocorr, medium vol
+        """
+        means = model.means_  # shape (n_states, n_features)
+        # Feature indices: 0=returns, 1=log_vol, 2=autocorr
+
+        n = means.shape[0]
+        # Normalize features to z-scores for comparable scoring
+        vol_vals = means[:, 1]
+        ac_vals = means[:, 2]
+        vol_z = (vol_vals - vol_vals.mean()) / (vol_vals.std() + 1e-10)
+        ac_z = (ac_vals - ac_vals.mean()) / (ac_vals.std() + 1e-10)
+
+        # Score each state for each role (higher = better fit)
+        scores = np.zeros((n, 3))  # [state, role] where role: 0=MR, 1=Trend, 2=Crisis
+        for i in range(n):
+            # MR: low vol + negative autocorr
+            scores[i, 0] = -vol_z[i] - ac_z[i]
+            # Trending: positive autocorr (vol doesn't matter much)
+            scores[i, 1] = ac_z[i]
+            # Crisis: high vol
+            scores[i, 2] = vol_z[i]
+
+        # Greedy assignment: assign highest-scoring state to each role
+        mapping = {}
+        used_states = set()
+        used_roles = set()
+        flat_indices = np.argsort(-scores.ravel())  # descending
+        for flat_idx in flat_indices:
+            state = flat_idx // 3
+            role = flat_idx % 3
+            if state not in used_states and role not in used_roles:
+                mapping[state] = role
+                used_states.add(state)
+                used_roles.add(role)
+            if len(mapping) == n:
+                break
+
+        return mapping
+
+    def fit(self, spread: pd.Series) -> HMMRegimeResult:
+        """Fit HMM to spread series and return regime result."""
+        _default = HMMRegimeResult(
+            hmm_regime_probs=np.array([1.0, 0.0, 0.0]),
+            hmm_current_state=0,
+            hmm_regime_stability=1.0,
+            hmm_transition_matrix=np.eye(3),
+            hmm_state_sequence=np.array([]),
+            hmm_p_mean_reverting=1.0,
+            hmm_valid=False,
+            hmm_reason="",
+        )
+
+        if not HMM_AVAILABLE:
+            _default.hmm_reason = "hmmlearn not installed"
+            return _default
+
+        if len(spread) < 80:
+            _default.hmm_reason = f"Too few observations ({len(spread)})"
+            return _default
+
+        try:
+            features = self._build_features(spread)
+            if features is None:
+                _default.hmm_reason = "Feature construction failed (<60 valid obs)"
+                return _default
+
+            # Domain-informed initial means for the 3 states:
+            #   Feature 0: returns, Feature 1: log_vol, Feature 2: autocorr
+            # State 0 (MR):       ~zero returns, low vol, negative autocorr
+            # State 1 (Trending): ~zero returns, medium vol, positive autocorr
+            # State 2 (Crisis):   ~zero returns, high vol, ~zero autocorr
+            feat_std = features.std(axis=0)
+            feat_mean = features.mean(axis=0)
+            init_means = np.array([
+                [feat_mean[0], feat_mean[1] - 0.5 * feat_std[1], -0.15],  # MR
+                [feat_mean[0], feat_mean[1],                      +0.10],  # Trending
+                [feat_mean[0], feat_mean[1] + 0.8 * feat_std[1],   0.0],  # Crisis
+            ])
+
+            # Run multiple fits: half with domain init, half with random init
+            import logging as _logging
+            _hmm_logger = _logging.getLogger('hmmlearn.base')
+            _hmm_prev_level = _hmm_logger.level
+            _hmm_logger.setLevel(_logging.ERROR)  # suppress convergence warnings
+            best_model = None
+            best_score = -np.inf
+            for i in range(self.n_fits):
+                m = GaussianHMM(
+                    n_components=self.n_states,
+                    covariance_type=self.covariance_type,
+                    n_iter=self.n_iter,
+                    random_state=self.random_state + i,
+                    tol=1e-4,
+                    init_params='stc' if i < self.n_fits // 2 else 'stmc',
+                )
+                # Domain-informed means for first half of fits
+                if i < self.n_fits // 2:
+                    m.means_init = init_means
+                m.fit(features)
+                try:
+                    score = m.score(features)
+                except Exception:
+                    score = -np.inf
+                if score > best_score:
+                    best_score = score
+                    best_model = m
+            _hmm_logger.setLevel(_hmm_prev_level)  # restore log level
+            model = best_model
+
+            # Get state sequence and current probabilities
+            state_seq_raw = model.predict(features)
+            probs_raw = model.predict_proba(features)
+
+            # Relabel states semantically
+            mapping = self._label_states(model, features)
+            inv_mapping = {v: k for k, v in mapping.items()}
+
+            # Remap state sequence
+            state_seq = np.array([mapping[s] for s in state_seq_raw])
+
+            # Current state probabilities (last observation), reordered
+            current_probs = np.array([
+                probs_raw[-1, inv_mapping[0]],  # P(MR)
+                probs_raw[-1, inv_mapping[1]],  # P(Trending)
+                probs_raw[-1, inv_mapping[2]],  # P(Crisis)
+            ])
+
+            current_state = state_seq[-1]
+
+            # Regime stability: fraction of last 60 days in current state
+            lookback = min(60, len(state_seq))
+            recent = state_seq[-lookback:]
+            stability = float(np.mean(recent == current_state))
+
+            # Remap transition matrix
+            trans_raw = model.transmat_
+            trans = np.zeros((3, 3))
+            for i_from in range(3):
+                for i_to in range(3):
+                    trans[i_from, i_to] = trans_raw[inv_mapping[i_from], inv_mapping[i_to]]
+
+            return HMMRegimeResult(
+                hmm_regime_probs=current_probs,
+                hmm_current_state=int(current_state),
+                hmm_regime_stability=stability,
+                hmm_transition_matrix=trans,
+                hmm_state_sequence=state_seq,
+                hmm_p_mean_reverting=float(current_probs[0]),
+                hmm_valid=True,
+                hmm_reason="OK",
+            )
+
+        except Exception as e:
+            _default.hmm_reason = f"HMM fit failed: {str(e)[:80]}"
+            return _default
 
 
 class KalmanOUEstimator:
@@ -777,10 +1015,12 @@ class KalmanOUEstimator:
         
         theta = -np.log(b_final) / dt
         mu = a_final / (1 - b_final)
-        
-        # Estimate sigma from innovation sequence (last 100 points)
-        recent_n = min(100, len(innovations))
-        residual_std = np.std(innovations[-recent_n:])
+
+        # Estimate sigma from OU residuals (NOT Kalman innovations, which → 0
+        # with adaptive Q). OU residuals: e_t = S_t - a - b * S_{t-1}
+        ou_residuals = S[1:] - a_final - b_final * S[:-1]
+        recent_n = min(200, len(ou_residuals))
+        residual_std = np.std(ou_residuals[-recent_n:])
         sigma = residual_std * np.sqrt(2 * theta / (1 - b_final ** 2))
         eq_std = sigma / np.sqrt(2 * theta) if theta > 0 else 0
         half_life = np.log(2) / theta * 252 if theta > 0 else np.inf
@@ -811,12 +1051,12 @@ class KalmanOUEstimator:
         theta_hist = -np.log(b_hist_safe) / dt
         mu_hist = a_hist / (1 - b_hist_safe)
         
-        # Rolling sigma from innovations
+        # Rolling sigma from OU residuals (not Kalman innovations)
         sigma_hist = np.full(len(x_final_hist), np.nan)
-        roll_win = min(30, len(innovations) // 3)
+        roll_win = min(30, len(ou_residuals) // 3)
         if roll_win >= 5:
-            for i in range(roll_win, len(innovations)):
-                local_std = np.std(innovations[i - roll_win:i])
+            for i in range(roll_win, len(ou_residuals)):
+                local_std = np.std(ou_residuals[i - roll_win:i])
                 local_b = b_hist_safe[i]
                 local_theta = theta_hist[i]
                 if local_theta > 0 and (1 - local_b ** 2) > 0:
@@ -884,29 +1124,38 @@ class KalmanOUEstimator:
         else:
             param_stability = 0.0
         
-        # ── REGIME CHANGE DETECTION (CUSUM on normalized innovations) ──
-        if len(norm_innovations) > self.min_warmup:
-            # Two-sided CUSUM on squared normalized innovations
-            # Under H0 (no change): E[v²] = 1
-            v2 = norm_innovations[self.min_warmup:] ** 2
+        # ── REGIME CHANGE DETECTION (CUSUM on OU residuals) ──
+        # Use OU residuals instead of Kalman innovations (adaptive Q drives
+        # innovations → 0, making CUSUM accumulate false regime signals).
+        if len(ou_residuals) > self.min_warmup:
+            # Standardize OU residuals; under H0 (stationary OU), E[z²] = 1
+            ou_res_std = np.std(ou_residuals)
+            if ou_res_std > 1e-10:
+                z_ou = ou_residuals[self.min_warmup:] / ou_res_std
+                v2 = z_ou ** 2
+            else:
+                v2 = np.zeros(len(ou_residuals) - self.min_warmup)
             cusum_plus = 0.0
             cusum_minus = 0.0
             max_cusum = 0.0
             k = 0.5  # Allowance parameter (slack)
-            
+
             for vi in v2:
                 cusum_plus = max(0, cusum_plus + vi - 1 - k)
                 cusum_minus = max(0, cusum_minus - vi + 1 - k)
                 max_cusum = max(max_cusum, cusum_plus, cusum_minus)
-            
+
             # Normalize by √N so threshold is comparable across series lengths
             regime_change_score = max_cusum / np.sqrt(len(v2))
         else:
             regime_change_score = 0.0
-        
+
         # ── INNOVATION DIAGNOSTICS ──
-        recent_norm = norm_innovations[-min(100, len(norm_innovations)):]
-        innovation_ratio = np.mean(recent_norm ** 2) if len(recent_norm) > 0 else 0
+        # Use OU residuals for innovation ratio (Kalman innovations → 0 with adaptive Q)
+        recent_ou = ou_residuals[-min(100, len(ou_residuals)):]
+        ou_res_recent_std = np.std(recent_ou)
+        overall_std = np.std(ou_residuals) if len(ou_residuals) > 0 else 1.0
+        innovation_ratio = (ou_res_recent_std / overall_std) ** 2 if overall_std > 1e-10 else 0
         
         # Effective sample size (based on autocorrelation of innovations)
         if len(innovations) > 20:
@@ -917,6 +1166,16 @@ class KalmanOUEstimator:
         else:
             ess = float(len(innovations))
         
+        # Save filter state for online updates via update()
+        self._x = x.copy()
+        self._P = P.copy()
+        self._R = R
+        self._Q = Q.copy()
+        self._last_spread = float(S[-1])
+        self._dt = dt
+        self._ou_residuals_buf = list(ou_residuals[-200:])  # Rolling buffer
+        self._fitted = True
+
         return KalmanOUResult(
             theta=float(theta),
             mu=float(mu),
@@ -941,7 +1200,88 @@ class KalmanOUEstimator:
             mu_upper=mu_upper,
             mu_lower=mu_lower,
         )
-    
+
+    def update(self, new_spread: float) -> Dict:
+        """Single Kalman step on new spread observation.
+
+        Must call fit() first to initialize filter state.
+
+        Args:
+            new_spread: New spread value (Y - beta*X - alpha from hedge filter)
+
+        Returns:
+            Dict with keys: theta, mu, sigma, eq_std, z_score, a, b, innov
+        """
+        if not getattr(self, '_fitted', False):
+            raise RuntimeError("Must call fit() before update()")
+
+        # Observation model: S_t = [1, S_{t-1}] @ [a, b] + noise
+        H = np.array([1.0, self._last_spread])
+
+        # Predict
+        x_pred = self._x.copy()
+        P_pred = self._P + self._Q
+
+        # Observe
+        y_pred = H @ x_pred
+        innov = new_spread - y_pred
+        S_inn = H @ P_pred @ H + self._R
+        S_inn = max(S_inn, 1e-20)
+
+        # Update (Joseph form)
+        K = P_pred @ H / S_inn
+        self._x = x_pred + K * innov
+        self._x[1] = np.clip(self._x[1], 0.001, 0.999)  # Stationarity
+
+        IKH = np.eye(2) - np.outer(K, H)
+        self._P = IKH @ P_pred @ IKH.T + self._R * np.outer(K, K)
+
+        # Adaptive R
+        self._R = 0.98 * self._R + 0.02 * innov ** 2
+        self._R = max(self._R, 1e-20)
+
+        # Adaptive Q (Mehra)
+        self._innovations.append(innov)
+        if len(self._innovations) > self._innovation_window:
+            self._innovations.pop(0)
+        if self.adaptive_q and len(self._innovations) >= 20:
+            C_hat = float(np.mean(np.array(self._innovations) ** 2))
+            excess = max(0, C_hat - self._R)
+            q_adapt = self.q_scale + excess * 0.01
+            q_adapt = min(q_adapt, 0.01)
+            self._Q = np.eye(2) * q_adapt
+
+        # Extract OU parameters from updated state
+        a, b = float(self._x[0]), float(self._x[1])
+        dt = self._dt
+        theta = -np.log(b) / dt
+        mu = a / (1 - b)
+
+        # Update OU residuals buffer for eq_std estimation
+        ou_resid = new_spread - a - b * self._last_spread
+        self._ou_residuals_buf.append(ou_resid)
+        if len(self._ou_residuals_buf) > 200:
+            self._ou_residuals_buf.pop(0)
+
+        residual_std = float(np.std(self._ou_residuals_buf))
+        denom = 1 - b ** 2
+        if theta > 0 and denom > 0:
+            sigma = residual_std * np.sqrt(2 * theta / denom)
+        else:
+            sigma = 0.0
+        eq_std = sigma / np.sqrt(2 * theta) if theta > 0 else 0.0
+
+        z_score = (new_spread - mu) / eq_std if eq_std > 0 else 0.0
+
+        # Save for next update
+        self._last_spread = new_spread
+
+        return {
+            'theta': theta, 'mu': mu, 'sigma': sigma,
+            'eq_std': eq_std, 'z_score': z_score,
+            'a': a, 'b': b, 'innov': float(innov),
+        }
+
     def fit_to_ou_parameters(self, spread: pd.Series, dt: float = 1/252) -> OUParameters:
         """
         Convenience method: run Kalman filter and return result as standard
@@ -1092,7 +1432,7 @@ class GARCHModel:
                 valid=True
             )
 
-        # Two-pass grid search: coarse → local refinement
+        # Two-pass: coarse grid → scipy refinement
         best_ll = -np.inf
         best_alpha, best_beta = 0.05, 0.90
 
@@ -1116,19 +1456,27 @@ class GARCHModel:
                     best_ll = ll
                     best_alpha, best_beta = alpha, beta
 
-        # Pass 2: fine grid around best (0.005 steps)
-        a_lo = max(0.005, best_alpha - 0.03)
-        a_hi = min(0.30, best_alpha + 0.03)
-        b_lo = max(0.01, best_beta - 0.03)
-        b_hi = min(0.995, best_beta + 0.03)
-        for alpha in np.arange(a_lo, a_hi, 0.005):
-            for beta in np.arange(b_lo, b_hi, 0.005):
-                if alpha + beta >= 0.999:
-                    continue
-                ll = _garch_ll(alpha, beta)
-                if ll > best_ll:
-                    best_ll = ll
-                    best_alpha, best_beta = alpha, beta
+        # Pass 2: scipy refinement from grid best
+        try:
+            from scipy.optimize import minimize
+
+            def _neg_ll(params):
+                a, b = params
+                if a <= 0 or b <= 0 or a + b >= 0.999:
+                    return 1e20
+                return -_garch_ll(a, b)
+
+            result = minimize(
+                _neg_ll, [best_alpha, best_beta],
+                method='Nelder-Mead',
+                options={'xatol': 1e-5, 'fatol': 1e-5, 'maxiter': 200}
+            )
+            if result.success and result.fun < -best_ll + 1e-10:
+                a_opt, b_opt = result.x
+                if a_opt > 0.001 and b_opt > 0.001 and a_opt + b_opt < 0.999:
+                    best_alpha, best_beta = a_opt, b_opt
+        except ImportError:
+            pass
 
         omega = var_target * (1 - best_alpha - best_beta)
         persistence = best_alpha + best_beta
@@ -1276,6 +1624,13 @@ class KalmanHedgeRatio:
         else:
             stability = 0.0
 
+        # Save filter state for online updates via update()
+        self._x_state = x_state.copy()
+        self._P = P.copy()
+        self._R = R
+        self._Q = Q.copy()
+        self._fitted = True
+
         return KalmanHedgeResult(
             beta_current=float(x_state[1]),
             beta_std=float(np.sqrt(max(P[1, 1], 0))),
@@ -1287,6 +1642,44 @@ class KalmanHedgeRatio:
             beta_lower=beta_lower,
             valid=True
         )
+
+    def update(self, new_y: float, new_x: float) -> Tuple[float, float]:
+        """Single Kalman step with new price observation.
+
+        Must call fit() first to initialize filter state.
+
+        Args:
+            new_y: New Y price (dependent)
+            new_x: New X price (independent)
+
+        Returns:
+            Tuple (alpha, beta) — updated intercept and hedge ratio
+        """
+        if not getattr(self, '_fitted', False):
+            raise RuntimeError("Must call fit() before update()")
+
+        # Predict
+        x_pred = self._x_state
+        P_pred = self._P + self._Q
+
+        # Observe
+        H = np.array([1.0, new_x])
+        y_pred = H @ x_pred
+        innov = new_y - y_pred
+        S = H @ P_pred @ H + self._R
+        S = max(S, 1e-20)
+
+        # Update (Joseph form)
+        K = P_pred @ H / S
+        self._x_state = x_pred + K * innov
+        IKH = np.eye(2) - np.outer(K, H)
+        self._P = IKH @ P_pred @ IKH.T + self._R * np.outer(K, K)
+
+        # Adaptive R
+        self._R = 0.98 * self._R + 0.02 * innov ** 2
+        self._R = max(self._R, 1e-20)
+
+        return float(self._x_state[0]), float(self._x_state[1])
 
 
 # ============================================================================
@@ -1921,7 +2314,7 @@ class PairsTradingEngine:
         
         Config options:
             lookback_period: Data lookback (default '2y')
-            min_half_life: Minimum half-life in days (default 5)
+            min_half_life: Minimum half-life in days (default 0)
             max_half_life: Maximum half-life in days (default 30)
             max_adf_pvalue: Maximum ADF p-value for cointegration (default 0.10)
             entry_zscore: Z-score threshold for entry (default 2.0)
@@ -1943,26 +2336,24 @@ class PairsTradingEngine:
         self.signals = {}
         self.positions = {}
         self._ou_params_cache = {}  # pair -> {ou, spread, z, data_len}
-        self._window_details = {}  # pair -> list of per-window result dicts
     
     def _set_defaults(self):
         """Set default configuration values."""
         defaults = {
             'lookback_period': '2y',
-            'min_half_life': 1,
+            'min_half_life': 0,
             'max_half_life': 60,
             'max_adf_pvalue': 0.05,
             'entry_zscore': 2.0,
             'exit_zscore': 0.0,
             'stop_zscore': 3.5,
             'min_win_prob': 0.55,
-            'min_correlation': 0.8,
+            'min_correlation': 0.6,
             'max_hurst': 0.5,
             'fractional_kelly': 0.25,
             'max_position_pct': 0.10,
             'max_sector_exposure': 0.30,
             'drawdown_limit': 0.15,
-            'max_data_points': 600,
         }
         for key, value in defaults.items():
             if key not in self.config:
@@ -1974,156 +2365,312 @@ class PairsTradingEngine:
     
     def fetch_data(self, tickers: List[str], period: str = None, progress_callback=None) -> pd.DataFrame:
         """
-        Fetch adjusted close prices via ett enda yf.download()-anrop.
-
+        Fetch adjusted close prices for tickers with proper batch handling.
+        
         Args:
             tickers: List of ticker symbols
             period: Data period (1y, 2y, 5y, 10y, max)
             progress_callback: Optional function(batch_num, total_batches, message)
         """
         period = period or self.config['lookback_period']
+        print(f"\n{'='*70}")
+        print(f"[FETCH] Starting data fetch: {len(tickers)} tickers, period='{period}'")
+        print(f"{'='*70}")
+
+        # Prevent yfinance from hanging indefinitely
+        socket.setdefaulttimeout(30)
 
         # Map period to approximate trading days for truncation
-        period_to_days = {
-            '1y': 252,
-            '2y': 504,
-            '5y': 1260,
-            '10y': 2520,
-            'max': None
-        }
-        max_days = period_to_days.get(period, None)
-
+        # yfinance batch downloads return union of all dates across tickers,
+        # so we need to truncate to the requested period
         # Clean tickers
         tickers = [str(t).strip() for t in tickers if t and str(t).strip()]
-
+        
         if not tickers:
             self.price_data = pd.DataFrame()
-            self.failed_tickers = []
             return self.price_data
-
+        
+        # Download in batches — only extract Close prices
+        batch_size = 200
         all_data = {}
-        too_few_data = []
+        failed_count = 0
 
-        # Batcha i grupper om 50 för att undvika att yf.download hänger sig
-        batch_size = 50
         total_batches = (len(tickers) + batch_size - 1) // batch_size
 
-        for batch_idx in range(total_batches):
-            batch_start = batch_idx * batch_size
-            batch = tickers[batch_start:batch_start + batch_size]
-            batch_num = batch_idx + 1
+        for batch_idx in range(0, len(tickers), batch_size):
+            batch = tickers[batch_idx:batch_idx + batch_size]
+            batch_num = batch_idx // batch_size + 1
 
             if progress_callback:
-                progress_callback(batch_num, total_batches + 1,
-                    f"Batch {batch_num}/{total_batches}: {len(batch)} tickers...")
+                progress_callback(batch_num, total_batches, f"Batch {batch_num}/{total_batches}: {len(batch)} tickers")
 
             try:
-                raw_data = yf.download(
+                # multi_level_index=False → flat columns for single ticker,
+                # DataFrame with ticker columns for multiple tickers
+                close_data = yf.download(
                     batch,
                     period=period,
                     interval='1d',
                     auto_adjust=True,
                     progress=False,
-                    threads=True,
-                    group_by='ticker',
-                    ignore_tz=True
-                )
-            except Exception:
-                continue
+                    threads=False,
+                    ignore_tz=True,
+                    multi_level_index=False,
+                )['Close']
 
-            if raw_data is None or raw_data.empty:
-                continue
-
-            if len(batch) == 1:
-                ticker = batch[0]
-                if isinstance(raw_data.columns, pd.MultiIndex):
-                    raw_data.columns = raw_data.columns.droplevel(1)
-                if 'Close' in raw_data.columns:
-                    series = raw_data['Close'].copy()
-                    if series.notna().sum() > 50:
-                        all_data[ticker] = series
-                    else:
-                        too_few_data.append(ticker)
-            else:
-                level0 = set(raw_data.columns.get_level_values(0).unique())
-                for ticker in batch:
-                    try:
-                        if ticker in level0:
-                            ticker_df = raw_data[ticker]
-                            if 'Close' in ticker_df.columns:
-                                series = ticker_df['Close'].copy()
-                                if series.notna().sum() > 50:
-                                    all_data[ticker] = series
-                                else:
-                                    too_few_data.append(ticker)
-                    except Exception:
-                        continue
-
-        # Retry missade tickers individuellt
-        missing = [t for t in tickers if t not in all_data and t not in too_few_data]
-        if missing:
-            if progress_callback:
-                progress_callback(total_batches, total_batches + 1,
-                    f"Retry: {len(missing)} tickers...")
-            for ticker in missing:
-                try:
-                    raw = yf.download(
-                        ticker,
-                        period=period,
-                        interval='1d',
-                        auto_adjust=True,
-                        progress=False,
-                        threads=False,
-                        ignore_tz=True
-                    )
-                    if raw is not None and not raw.empty:
-                        if isinstance(raw.columns, pd.MultiIndex):
-                            raw.columns = raw.columns.droplevel(1)
-                        if 'Close' in raw.columns:
-                            series = raw['Close'].copy()
-                            if series.notna().sum() > 50:
-                                all_data[ticker] = series
-                            else:
-                                too_few_data.append(ticker)
-                except Exception:
+                if close_data is None or (hasattr(close_data, 'empty') and close_data.empty):
+                    print(f"[FETCH] Batch {batch_num}/{total_batches}: 0/{len(batch)} tickers loaded (empty response)")
+                    failed_count += len(batch)
                     continue
 
-        # Sammanställ misslyckade tickers
-        final_missing = [t for t in tickers if t not in all_data]
-        self.failed_tickers = final_missing if final_missing else []
+                if isinstance(close_data, pd.Series):
+                    # Single ticker → Series
+                    ticker = batch[0]
+                    if close_data.notna().sum() > 50:
+                        all_data[ticker] = close_data
+                        print(f"[FETCH] Batch {batch_num}/{total_batches}: 1/1 tickers loaded")
+                    else:
+                        failed_count += 1
+                        print(f"[FETCH] Batch {batch_num}/{total_batches}: 0/1 tickers loaded (insufficient data)")
+                else:
+                    # Multiple tickers → DataFrame with ticker columns
+                    # Filter to only requested tickers (yf can return extras)
+                    batch_set = set(batch)
+                    valid_counts = close_data.notna().sum()
+                    good_tickers = [t for t in valid_counts[valid_counts > 50].index if t in batch_set]
+                    for t in good_tickers:
+                        all_data[t] = close_data[t]
+                    batch_failed = len(batch) - len(good_tickers)
+                    failed_count += batch_failed
+                    print(f"[FETCH] Batch {batch_num}/{total_batches}: {len(good_tickers)}/{len(batch)} tickers loaded")
 
+            except Exception as e:
+                print(f"[FETCH] Batch {batch_num}/{total_batches} failed ({type(e).__name__}): {e}")
+                failed_count += len(batch)
+                continue
+        
         if not all_data:
-            print(f"[Data] Ingen data laddad. Alla {len(tickers)} tickers misslyckades.")
+            print(f"No data loaded. All {len(tickers)} tickers failed.")
             self.price_data = pd.DataFrame()
             self.raw_price_data = pd.DataFrame()
             return self.price_data
 
-        # Combine into DataFrame
+        # --- Multi-round retry for missing tickers ---
+        # yf.download batch can silently drop tickers due to rate limits, timeouts, etc.
+        import time as _time
+
+        missing = [t for t in tickers if t not in all_data]
+        if missing:
+            print(f"\n[FETCH] {len(missing)} tickers missing after initial download, starting retry...")
+
+            # Round 1: Small batch retry (10 per batch, 1s pause between)
+            print(f"[FETCH] === Retry Round 1/3: batch retry ({len(missing)} tickers, batches of 10) ===")
+            if progress_callback:
+                progress_callback(total_batches, total_batches, f"Retry round 1: {len(missing)} missing tickers...")
+            retry_batch_size = 10
+            round1_ok = 0
+            for i in range(0, len(missing), retry_batch_size):
+                retry_batch = missing[i:i + retry_batch_size]
+                try:
+                    close_data = yf.download(
+                        retry_batch, period=period, interval='1d',
+                        auto_adjust=True, progress=False, threads=False,
+                        ignore_tz=True, multi_level_index=False,
+                    )['Close']
+                    if close_data is not None and not (hasattr(close_data, 'empty') and close_data.empty):
+                        if isinstance(close_data, pd.Series):
+                            t = retry_batch[0]
+                            if close_data.notna().sum() > 50:
+                                all_data[t] = close_data
+                                round1_ok += 1
+                        else:
+                            retry_set = set(retry_batch)
+                            valid_counts = close_data.notna().sum()
+                            good = [t for t in valid_counts[valid_counts > 50].index if t in retry_set]
+                            for t in good:
+                                all_data[t] = close_data[t]
+                            round1_ok += len(good)
+                except Exception as e:
+                    print(f"[FETCH] Retry batch failed ({type(e).__name__}): {e}")
+                _time.sleep(1)
+
+            missing = [t for t in tickers if t not in all_data]
+            print(f"[FETCH] Round 1 result: {round1_ok} recovered, {len(missing)} still missing")
+
+            # Helper: extract single-ticker series from yf.download result
+            def _extract_single(close_data, ticker):
+                """Extract a valid Series for a single ticker, handling both Series and DataFrame returns."""
+                if close_data is None:
+                    return None
+                if isinstance(close_data, pd.DataFrame):
+                    if ticker in close_data.columns:
+                        s = close_data[ticker].dropna()
+                    elif len(close_data.columns) == 1:
+                        s = close_data.iloc[:, 0].dropna()
+                    else:
+                        return None
+                elif isinstance(close_data, pd.Series):
+                    s = close_data.dropna()
+                else:
+                    return None
+                return s if len(s) > 50 else None
+
+            # Round 2: Individual retry
+            if missing:
+                print(f"[FETCH] === Retry Round 2/3: individual retry ({len(missing)} tickers) ===")
+                if progress_callback:
+                    progress_callback(total_batches, total_batches, f"Retry round 2: {len(missing)} missing tickers...")
+                round2_ok = 0
+                for ticker in missing:
+                    try:
+                        close_data = yf.download(
+                            [ticker], period=period, interval='1d',
+                            auto_adjust=True, progress=False, threads=False,
+                            ignore_tz=True, multi_level_index=False,
+                        )['Close']
+                        s = _extract_single(close_data, ticker)
+                        if s is not None:
+                            all_data[ticker] = s
+                            round2_ok += 1
+                    except Exception as e:
+                        print(f"[FETCH] {ticker} failed ({type(e).__name__}): {e}")
+                missing = [t for t in tickers if t not in all_data]
+                print(f"[FETCH] Round 2 result: {round2_ok} recovered, {len(missing)} still missing")
+
+            # Round 3: Individual retry with extended timeout
+            if missing:
+                print(f"[FETCH] === Retry Round 3/3: individual retry with 60s timeout ({len(missing)} tickers) ===")
+                if progress_callback:
+                    progress_callback(total_batches, total_batches, f"Retry round 3: {len(missing)} missing tickers...")
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(60)
+                round3_ok = 0
+                for ticker in missing:
+                    try:
+                        close_data = yf.download(
+                            [ticker], period=period, interval='1d',
+                            auto_adjust=True, progress=False, threads=False,
+                            ignore_tz=True, multi_level_index=False,
+                        )['Close']
+                        s = _extract_single(close_data, ticker)
+                        if s is not None:
+                            all_data[ticker] = s
+                            round3_ok += 1
+                    except Exception as e:
+                        print(f"[FETCH] {ticker} failed ({type(e).__name__}): {e}")
+                    _time.sleep(0.5)
+                socket.setdefaulttimeout(old_timeout if old_timeout else 30)
+                missing = [t for t in tickers if t not in all_data]
+                print(f"[FETCH] Round 3 result: {round3_ok} recovered, {len(missing)} still missing")
+
+            # Final report
+            if missing:
+                print(f"[FETCH] {len(missing)} tickers failed after all retries: {missing[:20]}")
+                if len(missing) > 20:
+                    print(f"[FETCH] ... and {len(missing) - 20} more")
+
+        # Normalize all series to tz-naive daily dates before combining.
+        # Different exchanges return different timezone-aware DatetimeIndex objects;
+        # combining them directly creates duplicate rows for the same calendar date.
+        ticker_set = set(tickers)
+        for t in list(all_data.keys()):
+            if t not in ticker_set:
+                del all_data[t]
+                continue
+            s = all_data[t]
+            if hasattr(s.index, 'tz') and s.index.tz is not None:
+                s = s.copy()
+                s.index = s.index.tz_localize(None)
+            # Normalize to date-only (remove any intraday timestamps)
+            s.index = pd.to_datetime(s.index.date)
+            # Drop any duplicate dates (keep last)
+            s = s[~s.index.duplicated(keep='last')]
+            all_data[t] = s
         data = pd.DataFrame(all_data)
 
-        # Truncate to requested period
-        if max_days is not None and len(data) > max_days:
-            data = data.iloc[-max_days:]
+        # Deduplicate index (safety net)
+        if data.index.duplicated().any():
+            n_dups = data.index.duplicated().sum()
+            print(f"[FETCH] Removed {n_dups} duplicate date rows")
+            data = data[~data.index.duplicated(keep='last')]
+        data = data.sort_index()
+
+        # IMPORTANT: Truncate by DATE, not row count.
+        # Crypto tickers (BTC-USD etc.) trade 7 days/week, inflating the union
+        # index with weekend/holiday rows. Row-based iloc[-504:] would discard
+        # the early portion of equity data. Instead, compute a calendar cutoff
+        # from the requested period and filter by date.
+        period_to_calendar_days = {
+            '1y': 365, '2y': 730, '5y': 1825, '10y': 3650, 'max': None
+        }
+        calendar_days = period_to_calendar_days.get(period, None)
+        pre_trunc_len = len(data)
+        if calendar_days is not None and len(data) > 0:
+            cutoff_date = data.index[-1] - pd.Timedelta(days=calendar_days)
+            data = data[data.index >= cutoff_date]
+            if len(data) < pre_trunc_len:
+                print(f"[FETCH] Truncated: {pre_trunc_len} → {len(data)} rows (cutoff {cutoff_date.strftime('%Y-%m-%d')})")
 
         # Safety cap: truncate to max_data_points
         max_pts = self.config.get('max_data_points')
         if max_pts and len(data) > max_pts:
             data = data.iloc[-max_pts:]
 
+        # Trim phantom rows: yfinance sometimes returns a row for the next
+        # trading day (with NaN/stale prices) when downloaded near midnight.
+        # Detect by checking if the last row(s) have very low non-NaN coverage
+        # compared to the row before.  Also trim any row dated in the future.
+        from datetime import date as _date_cls
+        today = pd.Timestamp(_date_cls.today())
+        if len(data) > 2:
+            # Remove rows strictly after today (future phantom rows)
+            future_mask = data.index > today
+            if future_mask.any():
+                n_future = future_mask.sum()
+                print(f"[FETCH] Trimmed {n_future} future-dated row(s): {data.index[future_mask].strftime('%Y-%m-%d').tolist()}")
+                data = data[~future_mask]
+
+            # Check last row: if it has <30% non-NaN coverage vs the row before,
+            # it's likely a phantom bar from a single timezone-shifted ticker
+            if len(data) > 2:
+                last_valid = data.iloc[-1].notna().sum()
+                prev_valid = data.iloc[-2].notna().sum()
+                if prev_valid > 0 and last_valid / prev_valid < 0.3:
+                    trimmed_date = data.index[-1].strftime('%Y-%m-%d')
+                    print(f"[FETCH] Trimmed phantom last row ({trimmed_date}): only {last_valid}/{prev_valid} tickers had data")
+                    data = data.iloc[:-1]
+
         # Forward fill gaps first
         data = data.ffill()
 
-        # Store raw data for pair-specific calculations
+        # Store raw data for pair-specific calculations (read-only reference, no copy needed)
         self.raw_price_data = data
 
         # Keep NaN - correlation uses min_periods, pair testing uses pairwise dropna
         self.price_data = data
 
-        if progress_callback:
-            progress_callback(2, 2,
-                f"Loaded {len(data.columns)}/{len(tickers)} tickers ({len(data)} days)"
-                + (f" — {len(final_missing)} failed" if final_missing else ""))
+        # --- DEBUG: Data summary ---
+        print(f"\n[FETCH] === DATA SUMMARY ===")
+        print(f"[FETCH] Tickers loaded: {len(data.columns)} / {len(tickers)} requested")
+        print(f"[FETCH] Date range: {data.index[0].strftime('%Y-%m-%d')} to {data.index[-1].strftime('%Y-%m-%d')}")
+        print(f"[FETCH] Total rows: {len(data)}")
+        # Show data coverage per ticker (sample)
+        valid_counts = data.notna().sum().sort_values()
+        print(f"[FETCH] Data points per ticker: min={valid_counts.min()}, median={int(valid_counts.median())}, max={valid_counts.max()}")
+        if len(valid_counts) > 0:
+            low_data = valid_counts[valid_counts < 100]
+            if len(low_data) > 0:
+                print(f"[FETCH] WARNING: {len(low_data)} tickers have <100 data points: {list(low_data.index[:10])}")
+        actual_missing = [t for t in tickers if t not in data.columns]
+        if actual_missing:
+            print(f"[FETCH] Failed/missing tickers ({len(actual_missing)}): {actual_missing[:20]}")
+        else:
+            print(f"[FETCH] All {len(tickers)} requested tickers loaded successfully")
+        print(f"{'='*70}\n")
 
+        if progress_callback:
+            progress_callback(total_batches, total_batches, f"Loaded {len(data.columns)} tickers ({len(data)} days)")
+        
         return data
     
     # ------------------------------------------------------------------------
@@ -2348,6 +2895,8 @@ class PairsTradingEngine:
             'garch_current_vol': 0.0, 'garch_cvar_95': 0.0,
             'fractional_d': 0.5, 'fractional_d_class': 'unknown',
             'kalman_beta': 1.0, 'kalman_beta_stability': 0.0,
+            'hmm_p_mean_reverting': 1.0, 'hmm_p_trending': 0.0, 'hmm_p_crisis': 0.0,
+            'hmm_current_state': 0, 'hmm_regime_stability': 1.0,
         }
 
         # --- 1. Correlation (~0.1ms) ---
@@ -2489,18 +3038,19 @@ class PairsTradingEngine:
         fail['kalman_theta_significant'] = bool(k_theta_sig)
 
         # HARD gates — immediate fail
-        if k_regime >= 4.0:
+        # Threshold 15.0: adaptive Q drives CUSUM to ~10-11 for normal pairs,
+        # so 4.0 was a false-positive trap. 15.0 catches genuine regime breaks.
+        if k_regime >= 15.0:
             fail['failed_at'] = 'regime'
-            return fail
-        if not k_theta_sig:
-            fail['failed_at'] = 'theta_sig'
             return fail
 
         # Soft Kalman checks — all must pass
+        # No lower bound on innovation_ratio: adaptive Q legitimately drives
+        # innovations → 0 for well-fitted pairs. Only cap the upper bound.
         if kalman_res is not None:
             kalman_checks = [
                 k_stability > 0.4,
-                0.4 <= k_inn_ratio <= 2.5,
+                k_inn_ratio <= 3.0,
             ]
             passes_kalman = all(kalman_checks)
         else:
@@ -2509,6 +3059,30 @@ class PairsTradingEngine:
         if not passes_kalman:
             fail['failed_at'] = 'kalman'
             return fail
+
+        # --- HMM 3-state regime detection ---
+        hmm_result = None
+        if HMM_AVAILABLE:
+            try:
+                hmm_detector = HMMRegimeDetector()
+                hmm_result = hmm_detector.fit(spread)
+            except Exception:
+                hmm_result = None
+
+        hmm_p_mr = hmm_result.hmm_p_mean_reverting if (hmm_result and hmm_result.hmm_valid) else 1.0
+        hmm_p_tr = float(hmm_result.hmm_regime_probs[1]) if (hmm_result and hmm_result.hmm_valid) else 0.0
+        hmm_p_cr = float(hmm_result.hmm_regime_probs[2]) if (hmm_result and hmm_result.hmm_valid) else 0.0
+        hmm_state = hmm_result.hmm_current_state if (hmm_result and hmm_result.hmm_valid) else 0
+        hmm_stab = hmm_result.hmm_regime_stability if (hmm_result and hmm_result.hmm_valid) else 1.0
+
+        fail['hmm_p_mean_reverting'] = round(hmm_p_mr, 4)
+        fail['hmm_p_trending'] = round(hmm_p_tr, 4)
+        fail['hmm_p_crisis'] = round(hmm_p_cr, 4)
+        fail['hmm_current_state'] = hmm_state
+        fail['hmm_regime_stability'] = round(hmm_stab, 4)
+
+        # HMM regime: soft metric only (EM convergence is too unstable for hard gating)
+        # P(MR) is stored for display and manual pair selection, not as a viability gate.
 
         # --- 6. Soft metrics (informational, do not gate pass/fail) ---
         # Tail dependence (copula)
@@ -2609,18 +3183,19 @@ class PairsTradingEngine:
             'fractional_d_class': frac_d_class,
             'kalman_beta': round(kb_current, 4),
             'kalman_beta_stability': round(kb_stability, 4),
+            # HMM regime detection
+            'hmm_p_mean_reverting': round(hmm_p_mr, 4),
+            'hmm_p_trending': round(hmm_p_tr, 4),
+            'hmm_p_crisis': round(hmm_p_cr, 4),
+            'hmm_current_state': hmm_state,
+            'hmm_regime_stability': round(hmm_stab, 4),
         }
 
     def _test_pair_multi_window(self, pair_info: Tuple, data: pd.DataFrame,
                                  raw_data: pd.DataFrame) -> Dict:
-        """
-        Test a pair across multiple lookback windows for robustness.
-
-        OU parameters are taken from the shortest passing window (most current).
-        """
+        """Test a pair on full available data (single 2y period)."""
         t1, t2, group_name, precomputed_corr = pair_info
 
-        # Defaults for failure return
         fail_result = {
             'pair': f"{t1}/{t2}", 'ticker_y': t1, 'ticker_x': t2,
             'group': group_name,
@@ -2634,19 +3209,18 @@ class PairsTradingEngine:
             'passes_halflife': False, 'passes_hurst': False, 'passes_kalman': False,
             'kalman_stability': 0.0, 'kalman_innovation_ratio': 0.0,
             'kalman_regime_score': 99.0, 'kalman_theta_significant': False,
-            'data_length': 0, 'is_viable': False,
-            'robustness_score': 0.0, 'windows_passed': 0,
-            'windows_tested': 0, 'passing_windows': [],
-            # Institutional-grade soft metrics
+            'data_length': 0, 'is_viable': False, 'optimal_z': 2.0,
+            'z_score': 0.0, 'last_close_y': 0.0, 'last_close_x': 0.0,
             'tail_dep_lower': 0.0, 'tail_dep_upper': 0.0,
             'garch_alpha': 0.0, 'garch_beta': 0.0, 'garch_persistence': 0.0,
             'garch_current_vol': 0.0, 'garch_cvar_95': 0.0,
             'fractional_d': 0.5, 'fractional_d_class': 'unknown',
             'kalman_beta': 1.0, 'kalman_beta_stability': 0.0,
+            'hmm_p_mean_reverting': 1.0, 'hmm_p_trending': 0.0, 'hmm_p_crisis': 0.0,
+            'hmm_current_state': 0, 'hmm_regime_stability': 1.0,
         }
 
         try:
-            # Align pair data
             if t1 in raw_data.columns and t2 in raw_data.columns:
                 pair_data = raw_data[[t1, t2]].dropna()
             else:
@@ -2657,14 +3231,39 @@ class PairsTradingEngine:
                 fail_result['data_length'] = data_length
                 return fail_result
 
-            # Kör på hela datasetet — inget fönster-loopande
             y = pair_data[t1]
             x = pair_data[t2]
 
             result = self._test_pair_single_window(t1, t2, y, x, data_length)
-            is_viable = result['passed']
 
-            if is_viable:
+            if result['passed']:
+                # Compute optimal entry z-score from cached OU params
+                try:
+                    _ou = OUProcess(result['theta'], result['mu'], result['eq_std'])
+                    _opt_z = _ou.optimal_entry_zscore(
+                        garch_persistence=result.get('garch_persistence', 0.0),
+                        fractional_d=result.get('fractional_d', 0.5),
+                        hurst=result.get('hurst_exponent', 0.5),
+                    ).get('optimal_z', 2.0)
+                except Exception:
+                    _opt_z = 2.0
+
+                # Z-score + last close prices for incremental monitor
+                _kalman_r = result.get('ou_params')
+                _kalman_r = getattr(_kalman_r, '_kalman', None) if _kalman_r else None
+                if (_kalman_r is not None
+                        and getattr(_kalman_r, 'zscore_history', None) is not None
+                        and len(_kalman_r.zscore_history) > 0):
+                    _z_score = float(_kalman_r.zscore_history[-1])
+                elif result['eq_std'] > 0:
+                    _spread_last = float(y.iloc[-1] - result['hedge_ratio'] * x.iloc[-1]
+                                         - result['intercept'])
+                    _z_score = float((_spread_last - result['mu']) / result['eq_std'])
+                else:
+                    _z_score = 0.0
+                _last_close_y = float(y.iloc[-1])
+                _last_close_x = float(x.iloc[-1])
+
                 return {
                     'pair': f"{t1}/{t2}", 'ticker_y': t1, 'ticker_x': t2,
                     'group': group_name,
@@ -2692,12 +3291,10 @@ class PairsTradingEngine:
                     'kalman_theta_significant': result['kalman_theta_significant'],
                     'data_length': data_length,
                     'is_viable': True,
-                    'robustness_score': 1.0,
-                    'windows_passed': 1,
-                    'windows_tested': 1,
-                    'max_consecutive_windows': 1,
-                    'passing_windows': [data_length],
-                    'window_details': [{k: v for k, v in result.items() if k != 'ou_params'}],
+                    'optimal_z': _opt_z,
+                    'z_score': _z_score,
+                    'last_close_y': _last_close_y,
+                    'last_close_x': _last_close_x,
                     'tail_dep_lower': result.get('tail_dep_lower', 0.0),
                     'tail_dep_upper': result.get('tail_dep_upper', 0.0),
                     'garch_alpha': result.get('garch_alpha', 0.0),
@@ -2709,20 +3306,24 @@ class PairsTradingEngine:
                     'fractional_d_class': result.get('fractional_d_class', 'unknown'),
                     'kalman_beta': result.get('kalman_beta', 1.0),
                     'kalman_beta_stability': result.get('kalman_beta_stability', 0.0),
+                    'hmm_p_mean_reverting': result.get('hmm_p_mean_reverting', 1.0),
+                    'hmm_p_trending': result.get('hmm_p_trending', 0.0),
+                    'hmm_p_crisis': result.get('hmm_p_crisis', 0.0),
+                    'hmm_current_state': result.get('hmm_current_state', 0),
+                    'hmm_regime_stability': result.get('hmm_regime_stability', 1.0),
                 }
             else:
                 fail_result['data_length'] = data_length
-                fail_result['windows_tested'] = 1
-                fail_result['robustness_score'] = 0.0
-                fail_result['failed_at'] = result.get('failed_at', 'unknown')
-                # Kopiera diagnostik-värden från single window
+                fail_result['failed_at'] = result.get('failed_at', '')
+                # Kopiera diagnostik som hann beräknas
                 for key in ['correlation', 'hurst_exponent', 'eg_pvalue', 'eg_statistic',
                             'johansen_trace', 'johansen_crit', 'half_life_days',
                             'kalman_stability', 'kalman_innovation_ratio',
-                            'kalman_regime_score', 'kalman_theta_significant']:
+                            'kalman_regime_score', 'kalman_theta_significant',
+                            'hmm_p_mean_reverting', 'hmm_p_trending', 'hmm_p_crisis',
+                            'hmm_current_state', 'hmm_regime_stability']:
                     if result.get(key) is not None:
                         fail_result[key] = result[key]
-                fail_result['window_details'] = [{k: v for k, v in result.items() if k != 'ou_params'}]
                 return fail_result
 
         except Exception as e:
@@ -2898,6 +3499,30 @@ class PairsTradingEngine:
             is_viable = (passes_coint and passes_halflife and ou_valid
                          and passes_hurst and passes_kalman)
 
+            # Compute optimal entry z-score
+            _opt_z = 2.0
+            if is_viable and theta > 0 and eq_std > 0:
+                try:
+                    _ou = OUProcess(theta, mu, eq_std)
+                    _opt_z = _ou.optimal_entry_zscore(
+                        hurst=hurst,
+                    ).get('optimal_z', 2.0)
+                except Exception:
+                    pass
+
+            # Z-score + last close prices for incremental monitor
+            if (kalman_result is not None
+                    and getattr(kalman_result, 'zscore_history', None) is not None
+                    and len(kalman_result.zscore_history) > 0):
+                _z_score = float(kalman_result.zscore_history[-1])
+            elif eq_std > 0:
+                _spread_last = float(y.iloc[-1] - hedge_ratio * x.iloc[-1] - intercept)
+                _z_score = float((_spread_last - mu) / eq_std)
+            else:
+                _z_score = 0.0
+            _last_close_y = float(y.iloc[-1])
+            _last_close_x = float(x.iloc[-1])
+
             return {
                 'pair': f"{t1}/{t2}",
                 'ticker_y': t1,
@@ -2929,7 +3554,11 @@ class PairsTradingEngine:
                 'kalman_regime_score': round(k_regime, 4),
                 'kalman_theta_significant': bool(k_theta_sig),
                 'data_length': data_length,
-                'is_viable': is_viable
+                'is_viable': is_viable,
+                'optimal_z': _opt_z,
+                'z_score': _z_score,
+                'last_close_y': _last_close_y,
+                'last_close_x': _last_close_x,
             }
         except Exception as e:
             return {
@@ -2964,9 +3593,13 @@ class PairsTradingEngine:
                 'kalman_theta_significant': False,
                 'data_length': 0,
                 'is_viable': False,
+                'optimal_z': 2.0,
+                'z_score': 0.0,
+                'last_close_y': 0.0,
+                'last_close_x': 0.0,
                 'error': str(e)[:100]
             }
-    
+
     def _kalman_validate_pair(self, row, data: pd.DataFrame,
                              raw_data: pd.DataFrame) -> dict:
         """Run Kalman filter validation on a viable pair.
@@ -3087,39 +3720,77 @@ class PairsTradingEngine:
                 progress_callback('correlation', 0, 1, "Computing correlation matrix...")
 
             # Compute returns for correlation - DON'T drop NaN globally
+            # pandas .corr() handles pairwise complete observations automatically
             returns = data.pct_change()
 
+            # Fixed min_periods for deterministic results across scan sizes
+            # 100 ≈ ~5 months of daily data — enough for reliable correlation
             min_obs_for_corr = 100
+
+            # Check we have enough data
             valid_return_counts = returns.count()
 
             for group_idx, (group_name, group_tickers) in enumerate(groups.items()):
                 if len(group_tickers) < 2:
                     continue
 
+                # Get returns for this group - only tickers with enough data
                 valid_tickers = [t for t in group_tickers
                                if t in returns.columns and valid_return_counts.get(t, 0) >= min_obs_for_corr]
                 if len(valid_tickers) < 2:
                     continue
 
-                group_returns = returns[valid_tickers]
-                corr_matrix = group_returns.corr(min_periods=min_obs_for_corr)
+                dropped_low_data = len(group_tickers) - len(valid_tickers)
 
-                corr_values = corr_matrix.values
+                group_returns = returns[valid_tickers]
+                # Use pairwise complete observations with scaled min_periods
+                corr_matrix = group_returns.corr(min_periods=min_obs_for_corr)
 
                 if progress_callback:
                     progress_callback('correlation', group_idx + 1, len(groups),
-                                    f"Group: {group_name} ({len(valid_tickers)} tickers)")
+                                    f"Group: {group_name} ({len(valid_tickers)} tickers, min_periods={min_obs_for_corr})")
 
+                # Find pairs above correlation threshold (.values för snabb numpy-access)
+                corr_values = corr_matrix.values
                 corr_columns = corr_matrix.columns
                 min_corr = self.config['min_correlation']
+
+                # --- DEBUG: Correlation distribution ---
+                total_pairs_in_group = len(corr_columns) * (len(corr_columns) - 1) // 2
+                nan_count = 0
+                corr_bins = {'>0.9': 0, '0.8-0.9': 0, '0.7-0.8': 0, '0.6-0.7': 0, '0.5-0.6': 0, '<0.5': 0}
+
                 for i in range(len(corr_columns)):
                     for j in range(i + 1, len(corr_columns)):
                         corr = corr_values[i, j]
+                        if np.isnan(corr):
+                            nan_count += 1
+                        elif corr >= 0.9:
+                            corr_bins['>0.9'] += 1
+                        elif corr >= 0.8:
+                            corr_bins['0.8-0.9'] += 1
+                        elif corr >= 0.7:
+                            corr_bins['0.7-0.8'] += 1
+                        elif corr >= 0.6:
+                            corr_bins['0.6-0.7'] += 1
+                        elif corr >= 0.5:
+                            corr_bins['0.5-0.6'] += 1
+                        else:
+                            corr_bins['<0.5'] += 1
+
                         if not np.isnan(corr) and corr >= min_corr:
                             ticker_a = corr_columns[i]
                             ticker_b = corr_columns[j]
+                            # Always order alphabetically for consistency
                             t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                             candidate_pairs.append((t1, t2, group_name, corr))
+
+                print(f"\n[CORR] === Group '{group_name}' ===")
+                print(f"[CORR] Tickers: {len(group_tickers)} total, {len(valid_tickers)} with >={min_obs_for_corr} data points, {dropped_low_data} dropped")
+                print(f"[CORR] Total possible pairs: {total_pairs_in_group}, NaN correlations: {nan_count}")
+                print(f"[CORR] Correlation threshold: {min_corr}")
+                print(f"[CORR] Distribution: {corr_bins}")
+                print(f"[CORR] Candidate pairs so far: {len(candidate_pairs)}")
         else:
             # No correlation prefilter - generate all pairs within groups
             for group_name, group_tickers in groups.items():
@@ -3127,9 +3798,10 @@ class PairsTradingEngine:
                 for i in range(len(valid_tickers)):
                     for j in range(i + 1, len(valid_tickers)):
                         ticker_a, ticker_b = valid_tickers[i], valid_tickers[j]
+                        # Always order alphabetically for consistency
                         t1, t2 = (ticker_a, ticker_b) if ticker_a < ticker_b else (ticker_b, ticker_a)
                         candidate_pairs.append((t1, t2, group_name, None))
-
+        
         if progress_callback:
             progress_callback('screening', 0, max(1, len(candidate_pairs)), 
                             f"Testing {len(candidate_pairs)} candidate pairs...")
@@ -3169,31 +3841,47 @@ class PairsTradingEngine:
 
         results_df = pd.DataFrame(results)
 
-        # Extract window_details into separate dict before sorting
-        self._window_details = {}
-        if len(results_df) > 0 and 'window_details' in results_df.columns:
-            for _, row in results_df.iterrows():
-                if row.get('pair') and isinstance(row.get('window_details'), list):
-                    self._window_details[row['pair']] = row['window_details']
-            results_df = results_df.drop(columns=['window_details'])
-
         if len(results_df) > 0:
-            # Sort by robustness_score descending (most robust first)
-            if 'robustness_score' in results_df.columns:
-                results_df = results_df.sort_values('robustness_score', ascending=False)
-            else:
-                results_df = results_df.sort_values('half_life_days')
+            results_df = results_df.sort_values('half_life_days')
 
         self.pairs_stats = results_df
-        # O(1) lookup index: pair string → row dict
         self._pair_index = {}
         if len(results_df) > 0:
             for row in results_df.itertuples():
                 self._pair_index[row.pair] = row
         self.viable_pairs = results_df[results_df['is_viable']].copy() if len(results_df) > 0 else pd.DataFrame()
-        self._ou_params_cache = {}  # Invalidate OU cache on new scan
+        self._ou_params_cache = {}
 
-        print(f"[Scan] {len(self.viable_pairs)} viable pairs (Kalman-integrated)")
+        # --- DEBUG: Detailed failure analysis ---
+        print(f"\n{'='*70}")
+        print(f"[SCAN] === PAIR SCREENING RESULTS ===")
+        print(f"{'='*70}")
+        print(f"[SCAN] Total candidates tested: {len(results_df)}")
+        print(f"[SCAN] Viable pairs: {len(self.viable_pairs)}")
+        if len(results_df) > 0 and 'failed_at' in results_df.columns:
+            failed = results_df[~results_df['is_viable']]
+            if len(failed) > 0:
+                # Count failures by stage
+                fail_counts = failed['failed_at'].value_counts()
+                print(f"\n[SCAN] --- Failure breakdown (where pairs were rejected) ---")
+                for stage, count in fail_counts.items():
+                    pct = count / len(results_df) * 100
+                    print(f"[SCAN]   {stage:<25s}: {count:>5d} ({pct:>5.1f}%)")
+                # Show data length stats for failed pairs
+                if 'data_length' in failed.columns:
+                    dl = failed['data_length']
+                    print(f"\n[SCAN] --- Data length for failed pairs ---")
+                    print(f"[SCAN]   min={dl.min()}, median={int(dl.median())}, max={dl.max()}")
+            # Show stats for viable pairs
+            if len(self.viable_pairs) > 0:
+                vp = self.viable_pairs
+                print(f"\n[SCAN] --- Viable pair statistics ---")
+                print(f"[SCAN]   Half-life: {vp['half_life_days'].min():.1f} - {vp['half_life_days'].max():.1f} days")
+                print(f"[SCAN]   Hurst: {vp['hurst_exponent'].min():.3f} - {vp['hurst_exponent'].max():.3f}")
+                print(f"[SCAN]   EG p-value: {vp['eg_pvalue'].min():.4f} - {vp['eg_pvalue'].max():.4f}")
+                print(f"[SCAN]   Correlation: {vp['correlation'].min():.3f} - {vp['correlation'].max():.3f}")
+                print(f"[SCAN]   Data length: {vp['data_length'].min()} - {vp['data_length'].max()}")
+        print(f"{'='*70}\n")
 
         # Build OU models for viable pairs
         for row in self.viable_pairs.itertuples():
@@ -3203,20 +3891,8 @@ class PairsTradingEngine:
                 sigma=row.sigma
             )
 
-        # Calculate quality scores and re-sort viable pairs
-        if len(self.viable_pairs) > 0:
-            try:
-                self.calculate_quality_scores()
-                if 'quality_score' in self.viable_pairs.columns:
-                    self.viable_pairs = self.viable_pairs.sort_values('quality_score', ascending=False)
-                    print(f"[Scan] Quality scores computed, top pair: "
-                          f"{self.viable_pairs.iloc[0]['pair']} "
-                          f"(Q={self.viable_pairs.iloc[0]['quality_score']:.2f})")
-            except Exception as e:
-                print(f"[Scan] Quality score calculation failed: {e}")
-
-        # Detaljerad konsol-rapport
         self._print_scan_report()
+        self._save_scan_report(self.config.get('lookback_period', '2y'))
 
         if progress_callback:
             progress_callback('complete', len(results_df), len(results_df),
@@ -3225,51 +3901,22 @@ class PairsTradingEngine:
         return results_df
 
     def _print_scan_report(self):
-        """Print detailed scan report to console with all institutional-grade metrics."""
+        """Print scan report to console."""
         vp = self.viable_pairs
         if vp is None or len(vp) == 0:
             print("\n[Scan Report] No viable pairs found.\n")
             return
 
-        # Pre-compute z-scores and optimal z* for all viable pairs
-        # Uses get_pair_ou_params() for EG-spread + Kalman z-score consistency
-        pair_live = {}  # pair -> {zscore, opt_z}
-        for row in vp.itertuples():
-            pair = getattr(row, 'pair', '?')
-            z = 0.0
-            oz = 0.0
-            try:
-                ou_live, _, z = self.get_pair_ou_params(pair, use_raw_data=True)
-            except Exception:
-                ou_live = self.ou_models.get(pair)
-            if ou_live is not None:
-                try:
-                    exit_z = self.config.get('exit_zscore', 0.5)
-                    g_p = getattr(row, 'garch_persistence', 0.0)
-                    f_d = getattr(row, 'fractional_d', 0.5)
-                    h_e = getattr(row, 'hurst_exponent', 0.5)
-                    oz_result = ou_live.optimal_entry_zscore(
-                        z_exit=exit_z,
-                        garch_persistence=g_p,
-                        fractional_d=f_d,
-                        hurst=h_e,
-                    )
-                    oz = oz_result.get('optimal_z', 0.0)
-                except Exception:
-                    pass
-            pair_live[pair] = {'zscore': z, 'opt_z': oz}
-
-        sep = "=" * 120
-        thin = "-" * 120
+        sep = "=" * 100
+        thin = "-" * 100
         print(f"\n{sep}")
-        print(f"  PAIRS TRADING SCAN REPORT — {len(vp)} viable pairs")
+        print(f"  PAIRS TRADING SCAN REPORT — {len(vp)} viable pairs (2y period)")
         print(f"{sep}\n")
 
-        # --- SUMMARY TABLE ---
         header = (
-            f"{'#':>2} {'Pair':<22} {'Quality':>7} {'Z-score':>8} {'Half-life':>9} "
+            f"{'#':>2} {'Pair':<22} {'Half-life':>9} "
             f"{'Hurst':>6} {'Frac.d':>7} {'EG p':>7} {'Corr':>6} "
-            f"{'TailL':>6} {'TailU':>6} {'Opt.Z*':>7} {'GARCH p':>7} {'GVol':>6} "
+            f"{'GARCH p':>7} {'TailL':>6} {'TailU':>6} "
             f"{'Kβ':>6} {'Kβ stab':>7}"
         )
         print(header)
@@ -3277,105 +3924,293 @@ class PairsTradingEngine:
 
         for i, row in enumerate(vp.itertuples(), 1):
             pair = getattr(row, 'pair', '?')
-            live = pair_live.get(pair, {})
-            quality = getattr(row, 'quality_score', 0)
-            zscore = live.get('zscore', 0)
             hl = getattr(row, 'half_life_days', 0) or 0
             hurst = getattr(row, 'hurst_exponent', 0) or 0
             frac_d = getattr(row, 'fractional_d', 0.5)
             eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
             corr = getattr(row, 'correlation', 0) or 0
+            garch_p = getattr(row, 'garch_persistence', 0)
             tail_l = getattr(row, 'tail_dep_lower', 0)
             tail_u = getattr(row, 'tail_dep_upper', 0)
-            opt_z = live.get('opt_z', 0)
-            garch_p = getattr(row, 'garch_persistence', 0)
-            garch_v = getattr(row, 'garch_current_vol', 0)
             kb = getattr(row, 'kalman_beta', 1.0)
             kb_s = getattr(row, 'kalman_beta_stability', 0)
 
             print(
-                f"{i:>2} {pair:<22} {quality:>7.3f} {zscore:>+8.3f} {hl:>8.1f}d "
+                f"{i:>2} {pair:<22} {hl:>8.1f}d "
                 f"{hurst:>6.3f} {frac_d:>7.3f} {eg_p:>7.4f} {corr:>6.3f} "
-                f"{tail_l:>6.3f} {tail_u:>6.3f} {opt_z:>7.2f} {garch_p:>7.3f} {garch_v:>6.2f} "
+                f"{garch_p:>7.3f} {tail_l:>6.3f} {tail_u:>6.3f} "
                 f"{kb:>6.3f} {kb_s:>7.3f}"
             )
 
-        print(thin)
-
-        # --- PER-PAIR DETAIL CARDS ---
-        print(f"\n{'=' * 120}")
-        print("  DETAILED METRICS PER PAIR")
-        print(f"{'=' * 120}")
-
-        for row in vp.itertuples():
-            pair = getattr(row, 'pair', '?')
-            live = pair_live.get(pair, {})
-            print(f"\n  ┌─ {pair} {'─' * (80 - len(pair))}")
-
-            # OU Parameters
-            theta = getattr(row, 'theta', 0) or 0
-            mu = getattr(row, 'mu', 0) or 0
-            sigma = getattr(row, 'sigma', 0) or 0
-            hl = getattr(row, 'half_life_days', 0) or 0
-            zscore = live.get('zscore', 0)
-            print(f"  │  OU Process:  θ={theta:.4f}  μ={mu:.4f}  σ={sigma:.4f}  "
-                  f"half-life={hl:.1f}d  z-score={zscore:+.3f}")
-
-            # Cointegration
-            eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
-            eg_s = getattr(row, 'eg_statistic', 0) or 0
-            joh_t = getattr(row, 'johansen_trace', 0) or 0
-            joh_c = getattr(row, 'johansen_crit', 0) or 0
-            hurst = getattr(row, 'hurst_exponent', 0) or 0
-            corr = getattr(row, 'correlation', 0) or 0
-            print(f"  │  Cointeg:    EG p={eg_p:.4f} stat={eg_s:.2f}  "
-                  f"Johansen trace={joh_t:.2f}/crit={joh_c:.2f}  "
-                  f"Hurst={hurst:.3f}  Corr={corr:.3f}")
-
-            # Kalman
-            ks = getattr(row, 'kalman_stability', 0) or 0
-            kir = getattr(row, 'kalman_innovation_ratio', 0) or 0
-            krs = getattr(row, 'kalman_regime_score', 0) or 0
-            kts = getattr(row, 'kalman_theta_significant', False)
-            kb = getattr(row, 'kalman_beta', 1.0)
-            kb_s = getattr(row, 'kalman_beta_stability', 0)
-            print(f"  │  Kalman:     stability={ks:.3f}  innov_ratio={kir:.3f}  "
-                  f"regime_score={krs:.3f}  θ_sig={kts}  "
-                  f"dyn_β={kb:.4f}  β_stab={kb_s:.3f}")
-
-            # GARCH
-            ga = getattr(row, 'garch_alpha', 0)
-            gb = getattr(row, 'garch_beta', 0)
-            gp = getattr(row, 'garch_persistence', 0)
-            gv = getattr(row, 'garch_current_vol', 0)
-            gc = getattr(row, 'garch_cvar_95', 0)
-            garch_method = "arch" if ARCH_AVAILABLE else "grid"
-            garch_note = ""
-            if ga == 0 and gb == 0 and gp == 0:
-                garch_note = "  (no vol clustering)"
-            print(f"  │  GARCH({garch_method}): α={ga:.4f}  β={gb:.4f}  "
-                  f"persistence={gp:.3f}  current_vol={gv:.2f}  CVaR95={gc:.4f}{garch_note}")
-
-            # Tail dependence
-            tl = getattr(row, 'tail_dep_lower', 0)
-            tu = getattr(row, 'tail_dep_upper', 0)
-            print(f"  │  Tail Dep:   λ_lower={tl:.4f}  λ_upper={tu:.4f}  "
-                  f"asymmetry={abs(tu - tl):.4f}")
-
-            # Fractional integration
-            fd = getattr(row, 'fractional_d', 0.5)
-            fdc = getattr(row, 'fractional_d_class', 'unknown')
-            print(f"  │  Frac Integ: d={fd:.4f}  class={fdc}")
-
-            # Quality
-            quality = getattr(row, 'quality_score', 0)
-            dl = getattr(row, 'data_length', 0)
-            opt_z = live.get('opt_z', 0)
-            print(f"  │  Quality:    score={quality:.3f}  data_length={dl}  optimal_z*={opt_z:.2f}")
-
-            print(f"  └{'─' * 90}")
-
         print(f"\n{sep}\n")
+
+    def _save_scan_report(self, period: str):
+        """Save comprehensive scan report to scan_reports/ directory."""
+        os.makedirs('scan_reports', exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath = f'scan_reports/scan_{timestamp}.txt'
+
+        stats = self.pairs_stats
+        vp = self.viable_pairs
+        if not isinstance(stats, pd.DataFrame) or len(stats) == 0:
+            stats = pd.DataFrame()
+        if not isinstance(vp, pd.DataFrame):
+            vp = pd.DataFrame()
+
+        sep = '=' * 110
+        thin = '-' * 110
+        lines = []
+
+        def w(text=''):
+            lines.append(text)
+
+        # === A. Header & Summary ===
+        w(sep)
+        w(f'  PAIRS TRADING SCAN REPORT')
+        w(f'  Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        w(sep)
+        w()
+        n_tested = len(stats)
+        n_viable = len(vp)
+        pass_rate = (n_viable / n_tested * 100) if n_tested > 0 else 0
+        n_tickers = len(self.price_data.columns) if self.price_data is not None else 0
+        w(f'Period: {period}')
+        w(f'Tickers loaded: {n_tickers}')
+        w(f'Pairs tested: {n_tested}')
+        w(f'Viable pairs: {n_viable}')
+        w(f'Pass rate: {pass_rate:.1f}%')
+        w()
+
+        # === B. Data Fetch Summary ===
+        w(sep)
+        w('  DATA FETCH SUMMARY')
+        w(sep)
+        if self.price_data is not None and not self.price_data.empty:
+            pd_data = self.price_data
+            w(f'Date range: {pd_data.index[0].strftime("%Y-%m-%d")} to {pd_data.index[-1].strftime("%Y-%m-%d")}')
+            w(f'Shape: {pd_data.shape[0]} rows x {pd_data.shape[1]} columns')
+            counts = pd_data.count()
+            w(f'Data points per ticker: min={counts.min()}, median={int(counts.median())}, max={counts.max()}')
+            low_data = counts[counts < 100]
+            if len(low_data) > 0:
+                w(f'Tickers with <100 data points ({len(low_data)}): {", ".join(low_data.index.tolist()[:20])}')
+        else:
+            w('No price data available.')
+        w()
+
+        # === C. Failure Breakdown ===
+        w(sep)
+        w('  FAILURE BREAKDOWN')
+        w(sep)
+        if len(stats) > 0 and 'failed_at' in stats.columns:
+            failed = stats[~stats['is_viable']]
+            if len(failed) > 0:
+                fail_counts = failed['failed_at'].value_counts()
+                w(f'{"Stage":<25s} {"Count":>6s} {"% of tested":>11s}')
+                w(thin)
+                for stage, count in fail_counts.items():
+                    pct = count / n_tested * 100
+                    stage_name = stage if stage else '(no stage)'
+                    w(f'{stage_name:<25s} {count:>6d} {pct:>10.1f}%')
+                w(f'{"PASSED":<25s} {n_viable:>6d} {pass_rate:>10.1f}%')
+                w(f'{thin}')
+                w(f'{"TOTAL":<25s} {n_tested:>6d} {"100.0%":>11s}')
+            else:
+                w('All pairs passed.')
+        else:
+            w('No failure data available.')
+        w()
+
+        # === D. Viable Pairs — Full Detail ===
+        w(sep)
+        w(f'  VIABLE PAIRS — FULL DETAIL ({n_viable} pairs)')
+        w(sep)
+        if len(vp) > 0:
+            hdr = (f'{"#":>3} {"Pair":<22} {"Z":>6} {"OptZ":>5} {"HL":>6} {"Hurst":>6} {"Frac.d":>6} '
+                   f'{"EG p":>7} {"EG stat":>8} {"Joh.tr":>7} {"Corr":>6} '
+                   f'{"GARCH":>6} {"TailL":>6} {"TailU":>6} '
+                   f'{"Kb":>6} {"Kb stb":>6} {"K stb":>6} {"K inn":>6} {"K reg":>6} '
+                   f'{"P(MR)":>6} {"HMM":>4} '
+                   f'{"th_sig":>6} {"theta":>9} {"mu":>9} {"sigma":>9}')
+            w(hdr)
+            w(thin)
+            for i, row in enumerate(vp.itertuples(), 1):
+                pair = getattr(row, 'pair', '?')
+                hl = getattr(row, 'half_life_days', 0) or 0
+                hurst = getattr(row, 'hurst_exponent', 0) or 0
+                frac_d = getattr(row, 'fractional_d', 0.5)
+                eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
+                eg_s = getattr(row, 'eg_statistic', 0) or 0
+                joh = getattr(row, 'johansen_trace', 0) or 0
+                corr = getattr(row, 'correlation', 0) or 0
+                garch_p = getattr(row, 'garch_persistence', 0)
+                tail_l = getattr(row, 'tail_dep_lower', 0)
+                tail_u = getattr(row, 'tail_dep_upper', 0)
+                kb = getattr(row, 'kalman_beta', 1.0)
+                kb_s = getattr(row, 'kalman_beta_stability', 0)
+                k_stb = getattr(row, 'kalman_stability', 0)
+                k_inn = getattr(row, 'kalman_innovation_ratio', 0)
+                k_reg = getattr(row, 'kalman_regime_score', 0)
+                th_sig = 'Y' if getattr(row, 'kalman_theta_significant', False) else 'N'
+                hmm_pmr = getattr(row, 'hmm_p_mean_reverting', 1.0)
+                hmm_st_map = {0: 'MR', 1: 'TR', 2: 'CR'}
+                hmm_st = hmm_st_map.get(getattr(row, 'hmm_current_state', 0), '??')
+                theta = getattr(row, 'theta', 0) or 0
+                mu = getattr(row, 'mu', 0) or 0
+                sigma = getattr(row, 'sigma', 0) or 0
+                # Compute z-score and optimal z
+                z_str = '   N/A'
+                oz_str = '  N/A'
+                try:
+                    ou_tmp, _, z_val = self.get_pair_ou_params(pair, use_raw_data=True)
+                    z_str = f'{z_val:>+6.2f}'
+                    try:
+                        opt_res = ou_tmp.optimal_entry_zscore(
+                            garch_persistence=garch_p,
+                            fractional_d=frac_d,
+                            hurst=hurst)
+                        oz_str = f'{opt_res["optimal_z"]:>5.2f}'
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                w(f'{i:>3} {pair:<22} {z_str} {oz_str} {hl:>5.1f}d {hurst:>6.3f} {frac_d:>6.3f} '
+                  f'{eg_p:>7.4f} {eg_s:>8.3f} {joh:>7.2f} {corr:>6.3f} '
+                  f'{garch_p:>6.3f} {tail_l:>6.3f} {tail_u:>6.3f} '
+                  f'{kb:>6.3f} {kb_s:>6.3f} {k_stb:>6.3f} {k_inn:>6.3f} {k_reg:>6.3f} '
+                  f'{hmm_pmr:>6.3f} {hmm_st:>4} '
+                  f'{th_sig:>6} {theta:>9.4f} {mu:>9.4f} {sigma:>9.4f}')
+        else:
+            w('No viable pairs found.')
+        w()
+
+        # === E. All Tested Pairs — Grouped by failure stage ===
+        w(sep)
+        w('  ALL TESTED PAIRS — GROUPED BY FAILURE STAGE')
+        w(sep)
+        if len(stats) > 0 and 'failed_at' in stats.columns:
+            failed = stats[~stats['is_viable']]
+            # Sort keys for each stage
+            sort_keys = {
+                'correlation': ('correlation', False),
+                'hurst': ('hurst_exponent', True),
+                'ols': ('correlation', False),
+                'spread_length': ('data_length', False),
+                'eg_cointegration': ('eg_pvalue', True),
+                'johansen': ('johansen_trace', False),
+                'half_life': ('half_life_days', True),
+                'regime': ('kalman_regime_score', True),
+                'kalman': ('kalman_stability', False),
+                'hmm_regime': ('hmm_p_mean_reverting', False),
+            }
+            col_hdr = (f'  {"Pair":<22} {"Corr":>6} {"Hurst":>6} {"EG p":>7} '
+                       f'{"Joh.tr":>7} {"Joh.cr":>7} {"HL":>7} '
+                       f'{"K stb":>6} {"K inn":>6} {"K reg":>6} {"th_sig":>6} {"Ndata":>6}')
+
+            stages = failed['failed_at'].value_counts().index.tolist()
+            for stage in stages:
+                stage_df = failed[failed['failed_at'] == stage].copy()
+                sort_col, sort_desc = sort_keys.get(stage, ('correlation', False))
+                if sort_col in stage_df.columns:
+                    stage_df = stage_df.sort_values(sort_col, ascending=not sort_desc)
+
+                w(f'\n--- {stage} ({len(stage_df)} pairs) ---')
+                w(col_hdr)
+                w(f'  {thin}')
+                for row in stage_df.itertuples():
+                    pair = getattr(row, 'pair', '?')
+                    corr = getattr(row, 'correlation', 0) or 0
+                    hurst = getattr(row, 'hurst_exponent', 0) or 0
+                    eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
+                    joh_t = getattr(row, 'johansen_trace', 0) or 0
+                    joh_c = getattr(row, 'johansen_crit', 0) or 0
+                    hl = getattr(row, 'half_life_days', 0) or 0
+                    k_stb = getattr(row, 'kalman_stability', 0) or 0
+                    k_inn = getattr(row, 'kalman_innovation_ratio', 0) or 0
+                    k_reg = getattr(row, 'kalman_regime_score', 0) or 0
+                    th_sig = 'Y' if getattr(row, 'kalman_theta_significant', False) else 'N'
+                    dl = getattr(row, 'data_length', 0) or 0
+                    hl_str = f'{hl:>7.1f}' if np.isfinite(hl) else '    inf'
+                    w(f'  {pair:<22} {corr:>6.3f} {hurst:>6.3f} {eg_p:>7.4f} '
+                      f'{joh_t:>7.2f} {joh_c:>7.2f} {hl_str} '
+                      f'{k_stb:>6.3f} {k_inn:>6.3f} {k_reg:>6.3f} {th_sig:>6} {dl:>6}')
+        else:
+            w('No failure data available.')
+        w()
+
+        # === F. Near-Miss Analysis ===
+        w(sep)
+        w('  NEAR-MISS ANALYSIS (failed at regime or kalman stage)')
+        w(sep)
+        if len(stats) > 0 and 'failed_at' in stats.columns:
+            near_miss_stages = ['regime', 'kalman']
+            near_misses = stats[(~stats['is_viable']) &
+                                (stats['failed_at'].isin(near_miss_stages))]
+            if len(near_misses) > 0:
+                w(f'{"Pair":<22} {"Stage":<10} {"Corr":>6} {"Hurst":>6} {"EG p":>7} '
+                  f'{"HL":>7} {"K stb":>6} {"K inn":>6} {"K reg":>6} {"th_sig":>6} {"Delta":>10}')
+                w(thin)
+                for row in near_misses.itertuples():
+                    pair = getattr(row, 'pair', '?')
+                    stage = getattr(row, 'failed_at', '')
+                    corr = getattr(row, 'correlation', 0) or 0
+                    hurst = getattr(row, 'hurst_exponent', 0) or 0
+                    eg_p = getattr(row, 'eg_pvalue', 1.0) or 1.0
+                    hl = getattr(row, 'half_life_days', 0) or 0
+                    k_stb = getattr(row, 'kalman_stability', 0) or 0
+                    k_inn = getattr(row, 'kalman_innovation_ratio', 0) or 0
+                    k_reg = getattr(row, 'kalman_regime_score', 0) or 0
+                    th_sig = 'Y' if getattr(row, 'kalman_theta_significant', False) else 'N'
+                    hl_str = f'{hl:>7.1f}' if np.isfinite(hl) else '    inf'
+                    # Compute delta from threshold
+                    if stage == 'regime':
+                        delta = f'reg:{k_reg:.2f}/4.0'
+                    elif stage == 'kalman':
+                        deltas = []
+                        if k_stb <= 0.4:
+                            deltas.append(f'stb:{k_stb:.2f}/0.40')
+                        if k_inn < 0.4 or k_inn > 2.5:
+                            deltas.append(f'inn:{k_inn:.2f}/[0.4-2.5]')
+                        delta = '; '.join(deltas) if deltas else 'unknown'
+                    else:
+                        delta = ''
+                    w(f'{pair:<22} {stage:<10} {corr:>6.3f} {hurst:>6.3f} {eg_p:>7.4f} '
+                      f'{hl_str} {k_stb:>6.3f} {k_inn:>6.3f} {k_reg:>6.3f} {th_sig:>6} {delta}')
+            else:
+                w('No near-miss pairs (none failed at regime or kalman stage).')
+        else:
+            w('No data available.')
+        w()
+
+        # === G. Configuration Used ===
+        w(sep)
+        w('  CONFIGURATION')
+        w(sep)
+        config_keys = [
+            'min_correlation', 'max_hurst', 'max_adf_pvalue',
+            'min_half_life', 'max_half_life', 'lookback_period',
+            'entry_zscore', 'exit_zscore', 'stop_zscore',
+            'min_win_prob', 'fractional_kelly',
+        ]
+        for key in config_keys:
+            val = self.config.get(key, 'N/A')
+            w(f'  {key:<25s}: {val}')
+        w()
+        w(f'Kalman regime hard gate: >= 15.0')
+        w(f'Kalman stability gate: > 0.4')
+        w(f'Kalman innovation ratio: <= 3.0 (no lower bound)')
+        w()
+        w(sep)
+        w(f'  END OF REPORT')
+        w(sep)
+
+        # Write file
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            print(f"[SCAN] Report saved to {filepath}")
+        except Exception as e:
+            print(f"[SCAN] Failed to save report: {e}")
 
     # ------------------------------------------------------------------------
     # LAYER 3: SIGNAL GENERATION
@@ -3477,6 +4312,17 @@ class PairsTradingEngine:
         # Calculate expected outcome
         metrics = ou_model.expected_pnl(current_spread, take_profit, stop_loss)
 
+        # Scale Kelly by HMM P(mean-reverting)
+        pair_row = self._pair_index.get(pair)
+        hmm_p_mr = getattr(pair_row, 'hmm_p_mean_reverting', 1.0) if pair_row else 1.0
+        hmm_p_mr = hmm_p_mr if hmm_p_mr else 1.0
+        metrics['kelly_fraction'] *= hmm_p_mr
+
+        # HMM regime label
+        hmm_state_val = getattr(pair_row, 'hmm_current_state', 0) if pair_row else 0
+        _hmm_labels = {0: "Mean-Reverting", 1: "Trending", 2: "Crisis"}
+        hmm_label = _hmm_labels.get(hmm_state_val, "N/A")
+
         # Determine confidence
         if metrics['win_prob'] >= 0.65 and metrics['kelly_fraction'] >= 0.15:
             confidence = 'HIGH'
@@ -3505,6 +4351,8 @@ class PairsTradingEngine:
             avg_holding_days=avg_holding,
             confidence=confidence,
             optimal_z_entry=optimal_z,
+            hmm_p_mean_reverting=hmm_p_mr,
+            hmm_regime_label=hmm_label,
         )
     
     def generate_all_signals(self) -> Dict[str, TradeSignal]:
@@ -3694,10 +4542,6 @@ class PairsTradingEngine:
     # LAYER 6: ANALYSIS & REPORTING
     # ------------------------------------------------------------------------
     
-    def get_window_details(self, pair: str) -> list:
-        """Return per-window test results for a pair."""
-        return self._window_details.get(pair, [])
-
     def get_pair_ou_params(self, pair: str, use_raw_data: bool = True,
                            method: str = 'kalman',
                            window_size: int = None) -> Tuple[OUProcess, pd.Series, float]:
@@ -3742,15 +4586,7 @@ class PairsTradingEngine:
             # Explicit window size override
             if len(pair_data) > window_size:
                 pair_data = pair_data.iloc[-window_size:]
-        else:
-            # Truncate to shortest passing robustness window for consistency
-            # with scanner results (scanner OU params come from shortest window)
-            if pair_row is not None:
-                pw = getattr(pair_row, 'passing_windows', None)
-                if pw and len(pw) > 0:
-                    shortest_window = min(pw)
-                    if len(pair_data) > shortest_window:
-                        pair_data = pair_data.iloc[-shortest_window:]
+        # Use all available data (2y period, no window truncation)
 
         # Check OU params cache (same data length = same result)
         cache_key = (pair, method, use_raw_data, window_size)
@@ -3964,92 +4800,6 @@ class PairsTradingEngine:
         except Exception as e:
             print(f"Margrabe valuation error for {pair}: {e}")
             return {}
-
-    def calculate_quality_scores(self):
-        """
-        Calculate composite quality score for all viable pairs.
-
-        Weighted composite:
-            - IR proxy (spread return / spread vol): 0.30
-            - Win probability: 0.25
-            - Hurst exponent: 0.15  (lower = better)
-            - Kalman stability: 0.15
-            - Half-life score: 0.15  (closer to ideal range = better)
-
-        Adds 'quality_score' column to self.viable_pairs.
-        """
-        if self.viable_pairs is None or len(self.viable_pairs) == 0:
-            return
-
-        df = self.viable_pairs
-
-        # Compute raw metrics
-        n = len(df)
-        scores = np.zeros(n)
-
-        # Helper: rank-normalize to [0, 1] (higher = better)
-        def rank_norm(series, higher_is_better=True):
-            s = pd.Series(series)
-            ranks = s.rank(method='average')
-            normalized = (ranks - 1) / max(n - 1, 1)
-            if not higher_is_better:
-                normalized = 1 - normalized
-            return normalized.values
-
-        # 1. IR proxy: theta * eq_std / sigma (mean-reversion "Sharpe")
-        ir_proxy = np.zeros(n)
-        for i, row in enumerate(df.itertuples()):
-            theta = getattr(row, 'theta', 0)
-            sigma = getattr(row, 'sigma', 1)
-            if sigma > 0 and theta > 0:
-                ir_proxy[i] = theta / sigma
-        ir_scores = rank_norm(ir_proxy, higher_is_better=True)
-
-        # 2. Win probability (computed on the fly)
-        win_probs = np.zeros(n)
-        for i, row in enumerate(df.itertuples()):
-            ou = self.ou_models.get(row.pair)
-            if ou:
-                try:
-                    entry_z = self.config['entry_zscore']
-                    exit_z = self.config['exit_zscore']
-                    stop_z = self.config['stop_zscore']
-                    S0 = ou.spread_from_z(entry_z)
-                    tp = ou.spread_from_z(exit_z)
-                    sl = ou.spread_from_z(stop_z)
-                    result = ou.win_probability(S0, tp, sl, n_sims=1000, max_time_years=0.25)
-                    win_probs[i] = result['win_prob']
-                except Exception:
-                    win_probs[i] = 0.5
-            else:
-                win_probs[i] = 0.5
-        wp_scores = rank_norm(win_probs, higher_is_better=True)
-
-        # 3. Hurst exponent (lower = better mean reversion)
-        hurst_vals = df['hurst_exponent'].values if 'hurst_exponent' in df.columns else np.full(n, 0.5)
-        hurst_scores = rank_norm(hurst_vals, higher_is_better=False)
-
-        # 4. Kalman stability
-        kalman_stab = df['kalman_stability'].values if 'kalman_stability' in df.columns else np.zeros(n)
-        stab_scores = rank_norm(kalman_stab, higher_is_better=True)
-
-        # 5. Half-life score (closer to ideal range 5-30 = better)
-        hl_vals = df['half_life_days'].values if 'half_life_days' in df.columns else np.full(n, 30)
-        hl_score_raw = np.zeros(n)
-        for i, hl in enumerate(hl_vals):
-            if 5 <= hl <= 30:
-                hl_score_raw[i] = 1.0
-            elif hl < 5:
-                hl_score_raw[i] = max(0, hl / 5)
-            else:
-                hl_score_raw[i] = max(0, 1 - (hl - 30) / 30)
-        hl_scores = rank_norm(hl_score_raw, higher_is_better=True)
-
-        # Weighted composite
-        quality = (0.30 * ir_scores + 0.25 * wp_scores + 0.15 * hurst_scores +
-                   0.15 * stab_scores + 0.15 * hl_scores)
-
-        self.viable_pairs['quality_score'] = quality
 
     def calculate_spread_correlations(self) -> Dict:
         """
