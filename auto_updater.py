@@ -197,7 +197,6 @@ class UpdateCheckerWorker(QObject):
                     self.update_available.emit(remote_version, download_url, release_notes)
             else:
                 self.no_update.emit()
-                self.no_update.emit()
             
         except requests.exceptions.Timeout:
             self.error.emit("Update check timed out")
@@ -362,11 +361,12 @@ class AutoUpdater(QObject):
         self._check_thread = None
         self._check_worker = None
         self._checking = False
-        
+        self._notified_version = None  # Spåra vilken version vi redan visat dialog för
+
         # Timer för periodiska kontroller
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_for_updates)
-        
+
         # Anslut signal
         self.update_available.connect(self._show_update_dialog)
     
@@ -438,9 +438,14 @@ class AutoUpdater(QObject):
         print(f"[AutoUpdater] Error: {error}")
     
     def _show_update_dialog(self, version: str, url: str, notes: str):
-        """Show the update dialog."""
+        """Show the update dialog (only once per version per session)."""
+        if self._notified_version == version:
+            return  # Redan visat dialog för denna version
+        self._notified_version = version
         dialog = UpdateDialog(version, url, notes, self.parent_window)
         dialog.exec_()
+        # Om användaren klickar "Later", tillåt ny notis vid nästa session men inte denna
+        # Om "Skip", sparas till disk via save_skipped_version (permanent)
 
 
 # ============================================================================

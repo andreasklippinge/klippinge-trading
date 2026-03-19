@@ -29,7 +29,8 @@ from PyQt5.QtWidgets import (
     QHeaderView, QAbstractItemView, QSpinBox, QDoubleSpinBox,
     QProgressBar, QStatusBar, QMenuBar, QMenu,
     QFrame, QScrollArea, QGridLayout, QSizePolicy, QMessageBox,
-    QFileDialog, QCheckBox, QAction, QStackedWidget, QCompleter
+    QFileDialog, QCheckBox, QAction, QStackedWidget, QCompleter,
+    QTreeWidget, QTreeWidgetItem
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal as Signal, QThread, QObject, pyqtSlot as Slot, QSize, QUrl, QPointF, QRectF
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QBrush, QPen, QPolygonF, QDesktopServices, QCursor
@@ -69,6 +70,37 @@ try:
 except ImportError:
     MARKOV_AVAILABLE = False
     print("Warning: markov_chain.py not found.")
+
+# EPS Mean Reversion strategy
+try:
+    from eps_mean_reversion import fetch_eps_and_price, screen_tickers as eps_screen_tickers, analyze_pe_mean_reversion, analyze_spread_mean_reversion
+    EPS_MR_AVAILABLE = True
+except ImportError:
+    EPS_MR_AVAILABLE = False
+
+# TTM Squeeze strategy
+try:
+    from squeeze import SqueezeAnalyzer, SqueezeResult, TickerSqueezeResult
+    SQUEEZE_AVAILABLE = True
+except ImportError:
+    SQUEEZE_AVAILABLE = False
+    print("Warning: squeeze.py not found.")
+    print("Warning: eps_mean_reversion.py not found.")
+
+# Avanza Options
+try:
+    from avanza_options import build_ticker_mapping, get_straddle_summary
+    OPTIONS_AVAILABLE = True
+except ImportError:
+    OPTIONS_AVAILABLE = False
+
+# Volatility Analytics
+try:
+    from vol_analytics import analyze_ticker as vol_analyze_ticker
+    VOL_ANALYTICS_AVAILABLE = True
+except ImportError:
+    VOL_ANALYTICS_AVAILABLE = False
+    print("Warning: avanza_options.py not found.")
 
 # Import trading engine
 from pairs_engine import (PairsTradingEngine, OUProcess, load_tickers_from_csv,
@@ -1541,6 +1573,109 @@ def _scrape_ms_table_page(url: str, params: dict, session) -> tuple:
     return headers, rows, total_count
 
 
+# Bloomberg futures month codes
+_FUTURES_MONTH_CODES = 'FGHJKMNQUVXZ'  # Jan-Dec
+_FUTURES_MONTH_SET = set(_FUTURES_MONTH_CODES)
+_commodity_roll_cache = {}  # {stale_asset: rolled_asset}
+
+
+_MONTH_NAME_TO_CODE = {
+    'jan': 'F', 'feb': 'G', 'mar': 'H', 'apr': 'J', 'may': 'K', 'jun': 'M',
+    'jul': 'N', 'aug': 'Q', 'sep': 'U', 'oct': 'V', 'nov': 'X', 'dec': 'Z',
+}
+
+
+def _roll_commodity_asset(ms_asset: str, ms_name: str = None, session=None) -> str:
+    """Auto-roll stale commodity contract codes (e.g. GCJ6 → GCM6).
+
+    Strategy:
+    1. If ms_name contains a month (e.g. "Gold Jun26"), derive the correct code directly.
+    2. Fallback: probe current month + next 12 months sequentially.
+    """
+    if not ms_asset or not ms_asset.endswith('_Comdty') or not SCRAPING_AVAILABLE:
+        return ms_asset
+
+    # Check cache first
+    cache_key = (ms_asset, ms_name or '')
+    if cache_key in _commodity_roll_cache:
+        cached = _commodity_roll_cache[cache_key]
+        print(f"[ROLL] Using cached: {ms_asset} → {cached}")
+        return cached
+
+    # Parse asset code: base + month_letter + year_digits + _Comdty
+    m = re.match(r'^(.+?)([FGHJKMNQUVXZ])(\d{1,2})_Comdty$', ms_asset)
+    if not m:
+        return ms_asset
+
+    base = m.group(1)       # e.g. "GC", "CL", "C_"
+    year_str = m.group(3)   # e.g. "6" or "26"
+    uses_2digit_year = len(year_str) == 2
+
+    # ── Strategy 1: Derive from ms_name (no HTTP needed) ──
+    if ms_name:
+        name_match = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{2})\b',
+                               ms_name, re.IGNORECASE)
+        if name_match:
+            month_code = _MONTH_NAME_TO_CODE[name_match.group(1).lower()]
+            year_2d = name_match.group(2)  # e.g. "26"
+            if uses_2digit_year:
+                year_code = year_2d
+            else:
+                year_code = year_2d[-1]  # "26" → "6"
+            corrected = f"{base}{month_code}{year_code}_Comdty"
+            if corrected != ms_asset:
+                print(f"[ROLL] {ms_asset} → {corrected} (derived from name '{ms_name}')")
+                _commodity_roll_cache[cache_key] = corrected
+                return corrected
+
+    # ── Strategy 2: Sequential probe from current month forward ──
+    now = datetime.now()
+    current_month = now.month
+    current_year = now.year
+
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    for offset in range(18):
+        trial_month = ((current_month - 1 + offset) % 12) + 1
+        trial_year = current_year + (current_month - 1 + offset) // 12
+        month_code = _FUTURES_MONTH_CODES[trial_month - 1]
+
+        if uses_2digit_year:
+            year_code = str(trial_year % 100)
+        else:
+            year_code = str(trial_year % 10)
+
+        trial_asset = f"{base}{month_code}{year_code}_Comdty"
+        if trial_asset == ms_asset:
+            continue
+
+        try:
+            params = {
+                "f_pc": "LeverageProducts",
+                "f_pt": "MiniFuture",
+                "f_asset": trial_asset,
+                "p_s": 1,
+                "p_n": 1
+            }
+            _, rows, total = _scrape_ms_table_page(
+                "https://etp.morganstanley.com/se/sv/produkter", params, session)
+            count = total if total else len(rows) if rows else 0
+            # Only accept if it has substantial products (>20), otherwise it's likely
+            # a stale contract or MS returning "popular products" fallback
+            if count > 20:
+                print(f"[ROLL] {ms_asset} → {trial_asset} (probed, found {count} products)")
+                _commodity_roll_cache[cache_key] = trial_asset
+                return trial_asset
+        except Exception:
+            continue
+
+    print(f"[ROLL] No active contract found for {ms_asset}, keeping original")
+    _commodity_roll_cache[cache_key] = ms_asset
+    return ms_asset
+
+
 def _fetch_ms_all_pages(product_type: str, ms_asset: str, session=None,
                          page_size: int = 100) -> pd.DataFrame:
     """Hämta ALLA sidor av en produkttyp från Morgan Stanley.
@@ -1784,20 +1919,24 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     
     if not ms_asset:
         return None
-    
+
+    # Auto-roll stale commodity contracts
+    if ms_asset.endswith('_Comdty'):
+        ms_asset = _roll_commodity_asset(ms_asset, ms_name=ms_name)
+
     # Fetch certificates for this asset
     df_certs = fetch_certificates_for_asset(ms_asset)
-    
+
     if df_certs.empty:
         return None
-    
+
     # VIKTIGT: Verifiera att de hämtade certifikaten faktiskt är för rätt underliggande!
     # Morgan Stanley kan returnera "populära produkter" om tillgången inte finns.
     if 'Underliggande tillgång' in df_certs.columns:
         # Filtrera på underliggande som matchar ms_name (case-insensitive)
-        mask = df_certs['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
+        mask = _match_underlying(df_certs['Underliggande tillgång'], ms_name)
         df_certs = df_certs[mask]
-        
+
         if df_certs.empty:
             print(f"[Certificate] No certificates found matching underlying '{ms_name}' for {ticker}")
             return None
@@ -1883,6 +2022,39 @@ def find_best_certificate(ticker: str, direction: str, ticker_to_ms: dict,
     }
 
 
+def _match_underlying(df_col: pd.Series, ms_name: str) -> pd.Series:
+    """Matcha underliggande kolumn mot MS-namn, hanterar kontraktsmanad och sprakvarianter."""
+    # Rensa kontraktsmanad: "Gold Jun26" -> "Gold"
+    clean_name = re.sub(r'\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\d{2}$',
+                        '', ms_name, flags=re.IGNORECASE).strip()
+    search_terms = [clean_name.lower()]
+    print(f"[MATCH] ms_name={ms_name!r} → clean={clean_name!r}, terms will include aliases")
+    # Svenska/engelska commodity-alias
+    _ALIASES = {
+        'gold': ['guld'], 'guld': ['gold'],
+        'silver': ['silver'], 'copper': ['koppar'], 'koppar': ['copper'],
+        'brent crude oil': ['brent', 'brentolja'],
+        'wti crude oil': ['wti', 'olja', 'råolja'],
+        'natural gas': ['naturgas', 'natgas'],
+        'platinum': ['platina'], 'palladium': ['palladium'],
+        'wheat': ['vete'], 'corn': ['majs'],
+        'sugar': ['socker'], 'coffee': ['kaffe'], 'cocoa': ['kakao'],
+    }
+    for eng, aliases in _ALIASES.items():
+        if eng in clean_name.lower():
+            search_terms.extend(aliases)
+        for a in aliases:
+            if a in clean_name.lower():
+                search_terms.append(eng)
+    print(f"[MATCH] Final search_terms={search_terms}")
+    col_lower = df_col.str.lower()
+    mask = pd.Series(False, index=df_col.index)
+    for term in search_terms:
+        mask = mask | col_lower.str.contains(term, na=False, regex=False)
+    print(f"[MATCH] Matched {mask.sum()} of {len(mask)} rows")
+    return mask
+
+
 def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: dict,
                                       ticker_to_ms_asset: dict = None) -> list:
     """
@@ -1895,12 +2067,14 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
     fallback price lookups.
     """
     instruments = []
+    _DBG = f"[DERIV] {ticker} {direction}"
 
     # Slå upp MS-namn och asset-kod
     ms_name = ticker_to_ms.get(ticker)
     if not ms_name:
         base_ticker = ticker.split('.')[0]
         ms_name = ticker_to_ms.get(base_ticker)
+    print(f"{_DBG} ms_name={ms_name!r}")
 
     ms_asset = None
     if ticker_to_ms_asset:
@@ -1908,14 +2082,22 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
         if not ms_asset:
             base_ticker = ticker.split('.')[0]
             ms_asset = ticker_to_ms_asset.get(base_ticker)
+    print(f"{_DBG} ms_asset={ms_asset!r} (before roll)")
 
     if not ms_asset:
+        print(f"{_DBG} ABORT: no ms_asset found")
         return instruments
 
     spot_price = get_spot_price(ticker)
+    print(f"{_DBG} spot_price={spot_price}")
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    # ── Auto-roll stale commodity contracts ──
+    if ms_asset.endswith('_Comdty'):
+        ms_asset = _roll_commodity_asset(ms_asset, ms_name=ms_name, session=session)
+        print(f"{_DBG} ms_asset={ms_asset!r} (after roll)")
 
     # ── Fetch mini futures AND certificates in parallel ──
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1923,21 +2105,63 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
         fut_cert = executor.submit(fetch_certificates_for_asset, ms_asset, session)
         df_mf = fut_mf.result()
         df_cert = fut_cert.result()
+    print(f"{_DBG} Fetched: {len(df_mf)} mini futures, {len(df_cert)} certificates")
+
+    # ── Detect "popular products" fallback (invalid asset code) ──
+    # MS returns ALL products (~1000) when the asset code is unrecognized.
+    # If first row doesn't match our underlying, try alternative exchange suffixes.
+    if ms_asset.endswith('_Equity') and len(df_mf) >= 500 and ms_name:
+        underlying_col = next((c for c in df_mf.columns if 'underliggande' in c.lower()), None)
+        if underlying_col:
+            first_underlying = str(df_mf.iloc[0][underlying_col]).lower()
+            clean_name = re.sub(r'\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\d{2}$',
+                                '', ms_name, flags=re.IGNORECASE).strip().lower()
+            if clean_name not in first_underlying and first_underlying not in clean_name:
+                # Asset code is invalid — try alternative exchange suffixes
+                base_code = ms_asset.rsplit('_', 2)[0]  # e.g. "EQNR"
+                _ALT_EXCHANGES = ['NO_Equity', 'SS_Equity', 'DC_Equity', 'US_Equity',
+                                  'LN_Equity', 'FP_Equity', 'GY_Equity', 'FH_Equity', 'JT_Equity']
+                current_suffix = '_'.join(ms_asset.split('_')[-2:])
+                print(f"{_DBG} Detected 'popular products' fallback for {ms_asset}, trying alternatives...")
+                for alt in _ALT_EXCHANGES:
+                    if alt == current_suffix:
+                        continue
+                    trial = f"{base_code}_{alt}"
+                    df_trial = fetch_minifutures_for_asset(trial, session)
+                    if not df_trial.empty and len(df_trial) < 500:
+                        # Verify first row matches our underlying
+                        trial_first = str(df_trial.iloc[0].get(underlying_col, '')).lower()
+                        if clean_name in trial_first or trial_first in clean_name:
+                            print(f"{_DBG} Found correct asset: {trial} ({len(df_trial)} products)")
+                            ms_asset = trial
+                            df_mf = df_trial
+                            df_cert = fetch_certificates_for_asset(trial, session)
+                            break
+
+    if not df_mf.empty:
+        print(f"{_DBG} MF columns: {list(df_mf.columns)}")
+        print(f"{_DBG} MF first row: {dict(df_mf.iloc[0])}")
 
     # ── Process Mini Futures ──
     # Track ISINs needing fallback price lookup
     _mf_need_price = []  # list of (index_in_instruments, isin)
 
     if not df_mf.empty and ms_name:
-        # Verifiera underliggande
+        # Verifiera underliggande med fuzzy matching (hanterar commodity-namn)
         underlying_col = None
         for col in df_mf.columns:
             if 'underliggande' in col.lower():
                 underlying_col = col
                 break
         if underlying_col:
-            mask = df_mf[underlying_col].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
+            unique_underlyings = df_mf[underlying_col].unique().tolist()
+            print(f"{_DBG} Unique underlyings in data: {unique_underlyings}")
+            mask = _match_underlying(df_mf[underlying_col], ms_name)
+            n_before = len(df_mf)
             df_mf = df_mf[mask]
+            print(f"{_DBG} Underlying filter: {n_before} → {len(df_mf)} (ms_name={ms_name!r})")
+        else:
+            print(f"{_DBG} WARNING: No 'underliggande' column found!")
 
         # Filtrera riktning
         riktning_col = None
@@ -1946,7 +2170,13 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
                 riktning_col = col
                 break
         if riktning_col and not df_mf.empty:
+            unique_directions = df_mf[riktning_col].unique().tolist()
+            print(f"{_DBG} Unique directions: {unique_directions}, filtering for '{direction}'")
+            n_before = len(df_mf)
             df_mf = df_mf[df_mf[riktning_col].str.contains(direction, case=False, na=False)]
+            print(f"{_DBG} Direction filter: {n_before} → {len(df_mf)}")
+        elif not riktning_col:
+            print(f"{_DBG} WARNING: No 'riktning' column found!")
 
         # Pre-find column names once (not per row)
         isin_col = None
@@ -1960,18 +2190,24 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
                 name_col = col
             if ('finansieringsnivånum' in cl or col == 'FinansieringsnivåNum') and fin_col is None:
                 fin_col = col
+        print(f"{_DBG} Columns: isin={isin_col}, name={name_col}, fin={fin_col}")
+        print(f"{_DBG} spot={spot_price}, rows_left={len(df_mf)}, has_fin_col={fin_col is not None}")
 
         # Beräkna hävstång för varje mini future
         if not df_mf.empty and spot_price is not None and fin_col:
+            _dbg_skipped = {'no_fin': 0, 'bad_dir': 0, 'low_lev': 0}
             for _, row in df_mf.iterrows():
                 fin_level = row.get(fin_col)
                 if fin_level is None or pd.isna(fin_level):
+                    _dbg_skipped['no_fin'] += 1
                     continue
 
                 # Filtrera ogiltiga finansieringsnivåer
                 if direction.lower() == 'long' and fin_level >= spot_price:
+                    _dbg_skipped['bad_dir'] += 1
                     continue
                 if direction.lower() == 'short' and fin_level <= spot_price:
+                    _dbg_skipped['bad_dir'] += 1
                     continue
 
                 # Beräkna teoretisk hävstång
@@ -1981,6 +2217,7 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
                     leverage = spot_price / (fin_level - spot_price)
 
                 if leverage <= 1:
+                    _dbg_skipped['low_lev'] += 1
                     continue
 
                 isin_url = row.get(isin_col, '') if isin_col else ''
@@ -2013,13 +2250,18 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
                 if mf_instrument_price is None and isin and isin != 'N/A':
                     _mf_need_price.append((len(instruments) - 1, isin))
 
+            mf_count = sum(1 for i in instruments if i.get('product_type') == 'Mini Future')
+            print(f"{_DBG} MF leverage loop: {mf_count} valid, skipped={_dbg_skipped}")
+        else:
+            print(f"{_DBG} MF leverage loop SKIPPED: empty={df_mf.empty}, spot={spot_price}, fin_col={fin_col}")
+
     # ── Process Certifikat ──
     _cert_need_price = []  # list of (index_in_instruments, isin)
 
     if not df_cert.empty and ms_name:
-        # Verifiera underliggande
+        # Verifiera underliggande med fuzzy matching
         if 'Underliggande tillgång' in df_cert.columns:
-            mask = df_cert['Underliggande tillgång'].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
+            mask = _match_underlying(df_cert['Underliggande tillgång'], ms_name)
             df_cert = df_cert[mask]
 
         # Filtrera riktning
@@ -2118,6 +2360,10 @@ def fetch_all_instruments_for_ticker(ticker: str, direction: str, ticker_to_ms: 
 
     # Sortera efter hävstång (lägst först)
     instruments.sort(key=lambda x: x['leverage'])
+
+    n_mf = sum(1 for i in instruments if i.get('product_type') == 'Mini Future')
+    n_cert = sum(1 for i in instruments if i.get('product_type') == 'Certificate')
+    print(f"{_DBG} FINAL: {len(instruments)} instruments ({n_mf} mini, {n_cert} cert)")
 
     return instruments
 
@@ -2282,29 +2528,31 @@ def find_best_minifuture(ticker: str, direction: str, ticker_to_ms: dict,
         return None
     
     
+    # Auto-roll stale commodity contracts
+    if ms_asset and ms_asset.endswith('_Comdty'):
+        ms_asset = _roll_commodity_asset(ms_asset, ms_name=ms_name)
+
     # OPTIMIZATION: Try direct fetch via MS_Asset first (10x faster!)
     df_filtered = None
     if ms_asset:
         # Fetch directly for this specific underlying - only 1 request!
         df_asset = fetch_minifutures_for_asset(ms_asset)
-        
+
         if not df_asset.empty:
             # VIKTIGT: Verifiera att hämtade minifutures är för rätt underliggande!
-            # Morgan Stanley kan returnera "populära produkter" om tillgången inte finns.
             underlying_col = None
             for col in df_asset.columns:
                 if 'underliggande' in col.lower():
                     underlying_col = col
                     break
-            
+
             if underlying_col:
-                # Filtrera på underliggande som matchar ms_name
-                underlying_mask = df_asset[underlying_col].str.lower().str.contains(ms_name.lower(), na=False, regex=False)
-                df_asset = df_asset[underlying_mask]
-                
+                mask = _match_underlying(df_asset[underlying_col], ms_name)
+                df_asset = df_asset[mask]
+
                 if df_asset.empty:
                     print(f"[MiniFuture] No products found matching underlying '{ms_name}' for {ticker}")
-            
+
             if not df_asset.empty:
                 # Find Riktning column with flexible matching
                 riktning_col = None
@@ -2837,6 +3085,50 @@ class AnalysisWorker(QObject):
 
 
 
+class PriceDataWorker(QObject):
+    """Worker som bara hämtar prisdata (utan pairs screening) för Master Scanner."""
+    finished = Signal()
+    progress = Signal(int, str)
+    error = Signal(str)
+    result = Signal(object)  # Emittar PairsTradingEngine med price_data
+
+    def __init__(self, tickers: List[str], lookback: str = '2y'):
+        super().__init__()
+        self.tickers = tickers
+        self.lookback = lookback
+
+    @Slot()
+    def run(self):
+        try:
+            print(f"[SCANNER] PriceDataWorker: Fetching {len(self.tickers)} tickers, period={self.lookback}")
+            self.progress.emit(5, f"Initializing engine...")
+            engine = PairsTradingEngine()
+
+            def fetch_progress(batch_num, total_batches, msg):
+                pct = 10 + int(batch_num / max(1, total_batches) * 80)
+                self.progress.emit(pct, msg)
+                print(f"[SCANNER] Fetch progress: {msg}")
+
+            self.progress.emit(10, f"Downloading {len(self.tickers)} tickers...")
+            engine.fetch_data(self.tickers, self.lookback, progress_callback=fetch_progress)
+
+            if engine.price_data is None or len(engine.price_data.columns) == 0:
+                self.error.emit("No price data loaded")
+                return
+
+            loaded = len(engine.price_data.columns)
+            print(f"[SCANNER] PriceDataWorker: Loaded {loaded} tickers successfully")
+            self.progress.emit(100, f"Loaded {loaded} tickers")
+            self.result.emit(engine)
+        except Exception as e:
+            print(f"[SCANNER] PriceDataWorker ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
 class DiscordWorker(QObject):
     """Worker thread for Discord notifications (async HTTP to prevent GUI freeze)."""
     finished = Signal()
@@ -2926,6 +3218,224 @@ class PriceFetchWorker(QObject):
             self.finished.emit()
 
 
+class OptionPriceFetchWorker(QObject):
+    """Worker: fetch current bid prices for Avanza options (for straddle P/L tracking)."""
+    finished = Signal()
+    result = Signal(dict)   # {orderbook_id: {'buy': float, 'sell': float, 'last': float}}
+    error = Signal(str)
+    status_message = Signal(str)
+
+    def __init__(self, orderbook_ids: list):
+        super().__init__()
+        self.orderbook_ids = orderbook_ids
+
+    @Slot()
+    def run(self):
+        try:
+            import requests
+            self.status_message.emit(f"Fetching {len(self.orderbook_ids)} option prices...")
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+            })
+            results = {}
+            for ob_id in self.orderbook_ids:
+                try:
+                    r = session.get(
+                        f"https://www.avanza.se/_api/market-guide/option/{ob_id}",
+                        timeout=10)
+                    if r.status_code == 200:
+                        q = r.json().get('quote', {})
+                        results[ob_id] = {
+                            'buy': q.get('buy'),
+                            'sell': q.get('sell'),
+                            'last': q.get('last'),
+                        }
+                except Exception as e:
+                    print(f"[OPT_PRICE] Error fetching {ob_id}: {e}")
+            self.result.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class VolSurfaceWorker(QObject):
+    """Worker: fetch IV from Avanza for strikes near ATM per expiry.
+    Fokuserad: hamtar bara optioner som ar relevanta (nara ATM, ±5 strikes).
+    Ateranvander cachade IDs fran all_straddles for att undvika extra matris-anrop.
+    """
+    finished = Signal()
+    result = Signal(object)   # dict: {surface_df, spot, ticker, garch_ts}
+    error = Signal(str)
+
+    def __init__(self, avanza_id: str, ticker: str, spot: float,
+                 expiries: list, garch_ts: dict = None, r: float = 0.02,
+                 cached_straddles: object = None):
+        super().__init__()
+        self.avanza_id = avanza_id
+        self.ticker = ticker
+        self.spot = spot
+        self.expiries = expiries
+        self.garch_ts = garch_ts or {}
+        self.r = r
+        self.cached_straddles = cached_straddles  # DataFrame fran options_data
+
+    @Slot()
+    def run(self):
+        try:
+            import requests
+            import time as _time
+            from datetime import date, datetime as dt
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from requests.adapters import HTTPAdapter
+
+            HEADERS = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            }
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+            session.mount('https://', adapter)
+            today = date.today()
+            t0 = _time.time()
+
+            # ── Steg 1: Bestam vilka strikes att hamta IV for ───────────
+            # Anvand cachad all_straddles — filtrera till ±5 strikes fran ATM per expiry
+            df = self.cached_straddles
+            if df is None or not hasattr(df, 'empty') or df.empty:
+                self.error.emit("No cached straddle data")
+                return
+
+            iv_jobs = []  # (strike, dte, opt_id, is_call)
+            n_strikes_per_expiry = 5  # ±5 strikes fran ATM = max 11 per expiry
+
+            for expiry, group in df.groupby('Expiry'):
+                expiry_str = str(expiry)[:10]
+                try:
+                    dte = (dt.strptime(expiry_str, '%Y-%m-%d').date() - today).days
+                except (ValueError, TypeError):
+                    continue
+                if dte < 1:
+                    continue
+
+                # Sortera efter naerhet till spot, ta ±N narmaste
+                group = group.copy()
+                group['_dist'] = (group['Strike'] - self.spot).abs()
+                group = group.sort_values('_dist')
+                nearby = group.head(n_strikes_per_expiry * 2 + 1)  # Max 11
+
+                for _, row in nearby.iterrows():
+                    strike = row.get('Strike', 0)
+                    if not strike or strike <= 0:
+                        continue
+                    c_id = str(row.get('C_Id', ''))
+                    p_id = str(row.get('P_Id', ''))
+                    if c_id:
+                        iv_jobs.append((strike, dte, c_id, True))
+                    if p_id:
+                        iv_jobs.append((strike, dte, p_id, False))
+
+            n_expiries = df['Expiry'].nunique()
+            print(f"[VOLSURF] {self.ticker}: {len(iv_jobs)} IV jobs "
+                  f"({n_expiries} expiries x ±{n_strikes_per_expiry} strikes near ATM)")
+
+            if not iv_jobs:
+                self.error.emit("No options found for IV")
+                return
+
+            # ── Steg 2: Hamta IV parallellt fran Avanza ─────────────────
+            iv_results = {}  # (strike, dte, is_call) -> iv_value
+
+            def _fetch_iv(job):
+                strike, dte, opt_id, is_call = job
+                try:
+                    r2 = session.get(
+                        f"https://www.avanza.se/_api/market-guide/option/{opt_id}/details",
+                        timeout=10)
+                    if r2.status_code == 200:
+                        ga = r2.json().get('optionAnalytics', {})
+                        iv_val = ga.get('implicitMidVolatility')
+                        if iv_val is None:
+                            iv_b = ga.get('implicitBuyVolatility')
+                            iv_a = ga.get('implicitSellVolatility')
+                            if iv_b is not None and iv_a is not None:
+                                iv_val = (iv_b + iv_a) / 2
+                            elif iv_a is not None:
+                                iv_val = iv_a
+                            elif iv_b is not None:
+                                iv_val = iv_b
+                        if iv_val is not None and float(iv_val) > 0.5:
+                            return (strike, dte, is_call), float(iv_val)
+                except Exception:
+                    pass
+                return (strike, dte, is_call), None
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futs = [pool.submit(_fetch_iv, j) for j in iv_jobs]
+                for fut in as_completed(futs):
+                    key, val = fut.result()
+                    if val is not None:
+                        iv_results[key] = val
+
+            # ── Steg 3: Bygg surface DataFrame ─────────────────────────
+            points = {}  # (strike, dte) -> {'c_iv': float, 'p_iv': float}
+            for (strike, dte, is_call), iv in iv_results.items():
+                key = (strike, dte)
+                if key not in points:
+                    points[key] = {'c_iv': None, 'p_iv': None}
+                if is_call:
+                    points[key]['c_iv'] = iv
+                else:
+                    points[key]['p_iv'] = iv
+
+            rows = []
+            for (strike, dte), ivs in points.items():
+                c_iv = ivs['c_iv']
+                p_iv = ivs['p_iv']
+                if c_iv is not None and p_iv is not None:
+                    mid_iv = (c_iv + p_iv) / 2
+                elif c_iv is not None:
+                    mid_iv = c_iv
+                elif p_iv is not None:
+                    mid_iv = p_iv
+                else:
+                    continue
+                rows.append({
+                    'Strike': strike, 'DTE': dte,
+                    'Moneyness': round(strike / self.spot, 3),
+                    'C_IV': c_iv, 'P_IV': p_iv, 'MidIV': mid_iv,
+                })
+
+            if not rows:
+                self.error.emit("No valid IV data from Avanza")
+                return
+
+            surface_df = pd.DataFrame(rows).sort_values(['DTE', 'Strike']).reset_index(drop=True)
+            elapsed = _time.time() - t0
+            print(f"[VOLSURF] {self.ticker}: {len(surface_df)} points "
+                  f"({surface_df['DTE'].nunique()} expiries x "
+                  f"~{len(surface_df)//max(1,surface_df['DTE'].nunique())} strikes) "
+                  f"in {elapsed:.1f}s ({len(iv_results)}/{len(iv_jobs)} IV ok)")
+
+            self.result.emit({
+                'surface_df': surface_df,
+                'spot': self.spot,
+                'ticker': self.ticker,
+                'garch_ts': self.garch_ts,
+            })
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
 class MarketWatchWorker(QObject):
     """Worker thread for fetching market data via yf.download().
 
@@ -2990,11 +3500,18 @@ class MarketWatchWorker(QObject):
                             daily_close.columns = [self.tickers[0]]
                     else:
                         daily_close = daily
+                    today = pd.Timestamp.now().normalize()
                     for tk in self.tickers:
                         if tk in daily_close.columns:
                             dc = daily_close[tk].dropna()
                             if len(dc) >= 2:
-                                prev_close_map[tk] = float(dc.iloc[-2])
+                                # Om senaste datumet i daglig data ÄR idag → prev_close = näst sista
+                                # Om senaste datumet < idag → prev_close = sista (den senaste stängningen)
+                                last_date = pd.Timestamp(dc.index[-1]).normalize()
+                                if last_date >= today:
+                                    prev_close_map[tk] = float(dc.iloc[-2])
+                                else:
+                                    prev_close_map[tk] = float(dc.iloc[-1])
             except Exception as e:
                 print(f"[MarketWatch] Daily download for prev close failed: {e}")
 
@@ -3538,6 +4055,354 @@ class MarkovChainWorker(QObject):
             analyzer = MarkovChainAnalyzer()
             res = analyzer.analyze(self.ticker, progress_callback=self.progress.emit)
             self.result.emit(res)
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class MarkovBatchWorker(QObject):
+    """Worker som kör Markov-analys på flera tickers sekventiellt."""
+    finished = Signal()
+    result = Signal(object)   # dict: {ticker: MarkovResult}
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, tickers: list):
+        super().__init__()
+        self.tickers = tickers
+
+    @Slot()
+    def run(self):
+        try:
+            results = {}
+            total = len(self.tickers)
+            analyzer = MarkovChainAnalyzer()
+            for i, ticker in enumerate(self.tickers):
+                pct = int((i / total) * 100)
+                self.progress.emit(pct, f"Markov: {ticker} ({i+1}/{total})")
+                print(f"[SCANNER] Markov batch: Analyzing {ticker} ({i+1}/{total})...")
+                try:
+                    res = analyzer.analyze(ticker)
+                    results[ticker] = res
+                    print(f"[SCANNER] Markov batch: {ticker} OK — state={res.current_state}, "
+                          f"E[r]={res.expected_return:+.2%}")
+                except Exception as e:
+                    print(f"[SCANNER] Markov batch: {ticker} FAILED — {e}")
+            self.progress.emit(100, f"Markov: {len(results)}/{total} complete")
+            self.result.emit(results)
+        except Exception as e:
+            print(f"[SCANNER] Markov batch ERROR: {e}")
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class EPSMeanReversionWorker(QObject):
+    """Worker thread for EPS mean reversion analysis (fetches own EPS data)."""
+    finished = Signal()
+    result = Signal(object)   # (data_dict, screening_df)
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, tickers: list, delay: int = 0):
+        super().__init__()
+        self.tickers = tickers
+        self._delay = delay  # sekunder att vänta innan start (undviker yfinance concurrency)
+
+    @Slot()
+    def run(self):
+        import socket
+        import time as _time
+        old_timeout = socket.getdefaulttimeout()
+        try:
+            # Sätt socket timeout för att undvika att yfinance hänger sig
+            socket.setdefaulttimeout(30)
+
+            print(f"[EPS-WORKER] Starting EPS analysis for {len(self.tickers)} tickers...")
+            print(f"[EPS-WORKER] Socket timeout set to 30s")
+            self.progress.emit(10, f"Fetching EPS data for {len(self.tickers)} tickers...")
+
+            t0 = _time.time()
+            data = fetch_eps_and_price(self.tickers, period='max')
+            t1 = _time.time()
+            print(f"[EPS-WORKER] fetch_eps_and_price completed in {t1-t0:.1f}s — {len(data)} tickers OK")
+
+            if not data:
+                self.error.emit("No EPS data returned — yfinance may be unavailable")
+                return
+
+            self.progress.emit(60, f"Screening {len(data)} tickers...")
+            df = eps_screen_tickers(data)
+            self.progress.emit(90, "Computing P/E analytics...")
+
+            # Add P/E analysis for each ticker
+            pe_analyses = {}
+            for ticker, d in data.items():
+                pe_result = analyze_pe_mean_reversion(d['pe_ratio'])
+                if pe_result:
+                    pe_analyses[ticker] = pe_result
+
+            self.progress.emit(100, "EPS analysis complete")
+            print(f"[EPS-WORKER] Done — {len(data)} tickers, {len(pe_analyses)} P/E analyses, total {_time.time()-t0:.1f}s")
+            self.result.emit((data, df, pe_analyses))
+        except Exception as e:
+            print(f"[EPS-WORKER] EXCEPTION: {e}")
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            socket.setdefaulttimeout(old_timeout)
+            self.finished.emit()
+
+
+class SqueezeWorker(QObject):
+    """Worker thread for TTM Squeeze analysis — downloads OHLCV for OMXS Large Cap."""
+    finished = Signal()
+    result = Signal(object)
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, tickers: list):
+        super().__init__()
+        self.tickers = tickers
+
+    @Slot()
+    def run(self):
+        try:
+            import yfinance as yf
+            import time as _time
+            import socket
+            socket.setdefaulttimeout(30)
+
+            self.progress.emit(5, f"Downloading OHLCV for {len(self.tickers)} tickers...")
+
+            # Batch-download i grupper om 50 (samma mönster som pairs_engine)
+            batch_size = 50
+            all_close, all_high, all_low, all_volume = {}, {}, {}, {}
+            total_batches = (len(self.tickers) + batch_size - 1) // batch_size
+
+            for batch_num, i in enumerate(range(0, len(self.tickers), batch_size), 1):
+                batch = self.tickers[i:i + batch_size]
+                pct = int(5 + 50 * batch_num / max(total_batches, 1))
+                self.progress.emit(pct, f"Downloading batch {batch_num}/{total_batches}...")
+                try:
+                    data = yf.download(
+                        batch, period='2y', interval='1d',
+                        auto_adjust=True, progress=False,
+                        threads=False, ignore_tz=True,
+                        timeout=30,
+                    )
+                    if data is None or data.empty:
+                        print(f"[SQUEEZE] Batch {batch_num}: empty response")
+                        continue
+
+                    # Extrahera OHLCV per ticker
+                    for field, target in [('Close', all_close), ('High', all_high),
+                                          ('Low', all_low), ('Volume', all_volume)]:
+                        try:
+                            if isinstance(data.columns, pd.MultiIndex):
+                                if field in data.columns.get_level_values(0):
+                                    sub = data[field]
+                                else:
+                                    continue
+                            elif field in data.columns:
+                                sub = data[field]
+                            else:
+                                continue
+
+                            if isinstance(sub, pd.Series):
+                                # Enstaka ticker → Series
+                                ticker_sym = batch[0]
+                                if sub.notna().sum() > 50:
+                                    target[ticker_sym] = sub
+                            else:
+                                for col in sub.columns:
+                                    s = sub[col].dropna()
+                                    if len(s) > 50:
+                                        target[col] = s
+                        except Exception as e:
+                            print(f"[SQUEEZE] Field {field} extraction error: {e}")
+
+                    n_ok = len(all_close)
+                    print(f"[SQUEEZE] Batch {batch_num}/{total_batches}: "
+                          f"{n_ok} tickers total so far")
+
+                except Exception as e:
+                    print(f"[SQUEEZE] Batch {batch_num} download error: {e}")
+                    import traceback as _tb
+                    _tb.print_exc()
+
+                if batch_num < total_batches:
+                    _time.sleep(1)  # Undvik rate limiting
+
+            print(f"[SQUEEZE] Download complete: {len(all_close)} close, "
+                  f"{len(all_high)} high, {len(all_low)} low, {len(all_volume)} volume")
+
+            if not all_close:
+                self.error.emit(f"No data downloaded for {len(self.tickers)} tickers")
+                return
+
+            price_data = pd.DataFrame(all_close)
+            high_data = pd.DataFrame(all_high) if all_high else None
+            low_data = pd.DataFrame(all_low) if all_low else None
+            volume_data = pd.DataFrame(all_volume) if all_volume else None
+
+            self.progress.emit(60, f"Analyzing {len(price_data.columns)} tickers...")
+
+            analyzer = SqueezeAnalyzer()
+            res = analyzer.scan(
+                price_data,
+                high_data=high_data,
+                low_data=low_data,
+                volume_data=volume_data,
+                progress_callback=self.progress.emit,
+            )
+            self.result.emit(res)
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class OptionsWorker(QObject):
+    """Worker thread: hamtar options/straddle-data fran Avanza for squeeze-tickers.
+    Parallelliserad: alla tickers hamtas samtidigt med ThreadPoolExecutor.
+    """
+    finished = Signal()
+    result = Signal(object)   # dict: {yf_ticker: straddle_summary_dict, ...}
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, yf_tickers: list, last_prices: dict = None):
+        super().__init__()
+        self.yf_tickers = yf_tickers
+        self.last_prices = last_prices or {}  # yf_ticker -> float (spot)
+
+    @Slot()
+    def run(self):
+        try:
+            if not OPTIONS_AVAILABLE:
+                self.error.emit("nasdaq_options.py not available")
+                return
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from requests.adapters import HTTPAdapter
+            import time as _time
+
+            session = requests.Session()
+            # Utoka connection pool for parallella anrop
+            adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+            session.mount('https://', adapter)
+
+            # Steg 1: Mappa tickers till orderBookIDs
+            self.progress.emit(10, f"Mapping {len(self.yf_tickers)} tickers...")
+            mapping = build_ticker_mapping(self.yf_tickers, session)
+            self.progress.emit(30, f"Mapped {len(mapping)}/{len(self.yf_tickers)} tickers")
+
+            # Steg 2: Hamta straddle-data for alla tickers parallellt
+            results = {}
+            n_mapped = len(mapping)
+            completed = [0]  # mutable for closure
+            t0 = _time.time()
+
+            def _fetch_ticker(yf_ticker, orderbook_id):
+                try:
+                    spot = self.last_prices.get(yf_ticker)
+                    return yf_ticker, get_straddle_summary(
+                        orderbook_id, spot=spot, session=session, max_workers=6)
+                except Exception as e:
+                    print(f"[OPTIONS] Error for {yf_ticker}: {e}")
+                    return yf_ticker, {'error': str(e)}
+
+            # Max 3 tickers parallellt (varje ticker gor ~8 parallella anrop internt)
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {
+                    pool.submit(_fetch_ticker, yf, obid): yf
+                    for yf, obid in mapping.items()
+                }
+                for fut in as_completed(futures):
+                    yf_ticker, summary = fut.result()
+                    results[yf_ticker] = summary
+                    completed[0] += 1
+                    pct = 30 + int(60 * completed[0] / max(n_mapped, 1))
+                    self.progress.emit(pct, f"Options {completed[0]}/{n_mapped}: {yf_ticker}")
+
+            elapsed = _time.time() - t0
+            print(f"[OPTIONS] All {n_mapped} tickers fetched in {elapsed:.1f}s")
+            self.progress.emit(95, f"Options data for {len(results)} tickers")
+            self.result.emit(results)
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class VolAnalyticsWorker(QObject):
+    """Worker: Hamtar 5y OHLC och kor volatilitetsanalys (post-squeeze, YZ, GARCH)."""
+    finished = Signal()
+    result = Signal(object)   # dict: {yf_ticker: vol_analytics_dict}
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, yf_tickers: list, forward_windows: list = None):
+        super().__init__()
+        self.yf_tickers = yf_tickers
+        self.forward_windows = forward_windows or [30, 60, 90, 120, 180]
+
+    @Slot()
+    def run(self):
+        try:
+            import yfinance as yf
+
+            self.progress.emit(10, "Downloading 5y OHLC data...")
+            # Batch-download alla tickers
+            tickers_str = " ".join(self.yf_tickers)
+            df = yf.download(tickers_str, period='5y', progress=False, threads=True)
+
+            if df.empty:
+                self.error.emit("No OHLC data downloaded")
+                return
+
+            results = {}
+            n = len(self.yf_tickers)
+            for idx, ticker in enumerate(self.yf_tickers):
+                pct = 10 + int(80 * (idx + 1) / max(n, 1))
+                self.progress.emit(pct, f"Vol analytics {idx+1}/{n}: {ticker}...")
+                try:
+                    # Hantera bade single-ticker och multi-ticker format
+                    if len(self.yf_tickers) == 1:
+                        if isinstance(df.columns, pd.MultiIndex):
+                            t_open = df['Open'].iloc[:, 0]
+                            t_high = df['High'].iloc[:, 0]
+                            t_low = df['Low'].iloc[:, 0]
+                            t_close = df['Close'].iloc[:, 0]
+                        else:
+                            t_open = df['Open']
+                            t_high = df['High']
+                            t_low = df['Low']
+                            t_close = df['Close']
+                    else:
+                        t_open = df['Open'][ticker].dropna()
+                        t_high = df['High'][ticker].dropna()
+                        t_low = df['Low'][ticker].dropna()
+                        t_close = df['Close'][ticker].dropna()
+
+                    if len(t_close) < 200:
+                        continue
+
+                    result = vol_analyze_ticker(
+                        t_open, t_high, t_low, t_close,
+                        forward_windows=self.forward_windows)
+                    results[ticker] = result
+                except Exception as e:
+                    print(f"[VOL] Error for {ticker}: {e}")
+
+            self.progress.emit(95, f"Vol analytics for {len(results)} tickers")
+            self.result.emit(results)
         except Exception as e:
             traceback.print_exc()
             self.error.emit(str(e))
@@ -4271,14 +5136,15 @@ class VolatilitySparkline(QWidget):
         self.color = QColor(COLORS['accent'])
         self.median_value = None
         self._base_height = 35
-        self.setFixedHeight(35)
+        self.setMinimumHeight(35)
         self.setMinimumWidth(80)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background: transparent; border: none;")
     
     def scale_to(self, scale: float):
         """Scale the sparkline height based on window size."""
         height = max(25, int(self._base_height * scale))
-        self.setFixedHeight(height)
+        self.setMinimumHeight(height)
     
     def set_data(self, values: list, color: str = None, median: float = None):
         """Set data for sparkline."""
@@ -4367,6 +5233,7 @@ class VolatilityCard(QFrame):
         self._history_data = []  # Store historical data for sparkline
         
         self.setMinimumHeight(165)  # Increased to accommodate sparkline
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.setStyleSheet(f"""
             QFrame {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -4417,17 +5284,15 @@ class VolatilityCard(QFrame):
         self.mode_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; background: transparent; border: none;")
         layout.addWidget(self.mode_label)
         
-        # Row 4: Sparkline chart (NEW!)
+        # Row 4: Sparkline chart — gets stretch so it fills available space
         self.sparkline = VolatilitySparkline()
-        layout.addWidget(self.sparkline)
-        
+        layout.addWidget(self.sparkline, 1)
+
         # Row 5: Description
         self.desc_label = QLabel(description)
         self.desc_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-style: italic; background: transparent; border: none;")
         self.desc_label.setWordWrap(True)
         layout.addWidget(self.desc_label)
-        
-        layout.addStretch()
     
     def update_data(self, value: float, change_pct: float, percentile: float, 
                     median: float, mode: float, description: str,
@@ -6881,6 +7746,25 @@ class PairsTradingTerminal(QMainWindow):
         self._markov_worker = None
         self._markov_running = False
         self._markov_result = None
+        self._markov_batch_results = {}  # {ticker: MarkovResult} från Master Scanner
+        self._markov_batch_running = False
+        self._markov_batch_thread: Optional[QThread] = None
+        self._markov_batch_worker = None
+
+        # Strategy analysis states
+        self._eps_mr_running = False
+        self._eps_mr_result = None
+        self._eps_mr_thread: Optional[QThread] = None
+        self._eps_mr_worker = None
+
+        self._squeeze_running = False
+        self._squeeze_result = None
+        self._options_running = False
+        self._options_data = {}  # yf_ticker -> straddle summary dict
+        self._vol_analytics_data = {}  # yf_ticker -> vol analytics dict
+        self._vol_analytics_running = False
+        self._squeeze_thread: Optional[QThread] = None
+        self._squeeze_worker = None
 
         # OPTIMERING: Metrics initieras som None (skapas i lazy-loaded tabs)
         self.tickers_metric: Optional[QFrame] = None
@@ -7519,7 +8403,7 @@ class PairsTradingTerminal(QMainWindow):
             max_retries = 3
             for attempt in range(max_retries):
                 if not self._tabs_loaded.get(1, False):
-                    self._on_tab_changed(1)
+                    self._load_page_if_needed(1)
                     # Processa events flera gånger för att säkerställa widget-skapande
                     for _ in range(5):
                         QApplication.processEvents()
@@ -7577,8 +8461,24 @@ class PairsTradingTerminal(QMainWindow):
                 description=f"Error: {str(e)}\n\nDetails logged to console.",
                 color=0xff0000
             )
-    
-    def send_discord_notification(self, title: str, description: str, color: int = 0xff6b00, 
+
+    def _run_master_scanner_after_scheduled(self):
+        """Kör Master Scanner (alla 4 strategier) automatiskt efter schemalagd pairs-scan."""
+        print(f"\n[SCHEDULE] Triggering Master Scanner after scheduled pairs scan...")
+        try:
+            # Ladda Master Scanner-tabben om den inte är laddad
+            if not self._tabs_loaded.get(11, False):
+                self._load_page_if_needed(11)
+                QApplication.processEvents()
+
+            # Kör alla strategier (engine + prisdata finns redan från pairs-scan)
+            self._refresh_master_scanner()
+        except Exception as e:
+            print(f"[SCHEDULE] Master Scanner error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def send_discord_notification(self, title: str, description: str, color: int = 0xff6b00,
                                    fields: list = None, footer: str = None):
         """Send notification to Discord webhook ASYNCHRONOUSLY (prevents GUI freeze)."""
         if not SCRAPING_AVAILABLE:
@@ -7765,26 +8665,27 @@ class PairsTradingTerminal(QMainWindow):
                         print(f"[Discord] Could not get live z-score for {pair}: {e}")
                 
                 # Calculate P&L for Y leg (long leg)
+                parity = pos.get('parity', 1)
                 entry_y = pos.get('mf_entry_price_y', 0.0)
                 current_y = pos.get('mf_current_price_y', entry_y)
                 qty_y = pos.get('mf_qty_y', 0)
-                
+
                 pnl_y = 0.0
                 invested_y = 0.0
                 if entry_y > 0 and qty_y > 0:
-                    pnl_y = (current_y - entry_y) * qty_y
-                    invested_y = entry_y * qty_y
-                
+                    pnl_y = (current_y - entry_y) * qty_y * parity
+                    invested_y = entry_y * qty_y * parity
+
                 # Calculate P&L for X leg (short/hedge leg)
                 entry_x = pos.get('mf_entry_price_x', 0.0)
                 current_x = pos.get('mf_current_price_x', entry_x)
                 qty_x = pos.get('mf_qty_x', 0)
-                
+
                 pnl_x = 0.0
                 invested_x = 0.0
                 if entry_x > 0 and qty_x > 0:
-                    pnl_x = (current_x - entry_x) * qty_x
-                    invested_x = entry_x * qty_x
+                    pnl_x = (current_x - entry_x) * qty_x * parity
+                    invested_x = entry_x * qty_x * parity
                 
                 # Total for this position
                 pos_pnl = pnl_y + pnl_x
@@ -8013,17 +8914,18 @@ class PairsTradingTerminal(QMainWindow):
                 direction = pos.get('direction', 'LONG')
 
                 # Beräkna P&L per position
+                parity = pos.get('parity', 1)
                 entry_y = pos.get('mf_entry_price_y', 0.0)
                 current_y = pos.get('mf_current_price_y', entry_y)
                 qty_y = pos.get('mf_qty_y', 0)
-                pnl_y = (current_y - entry_y) * qty_y if entry_y > 0 and qty_y > 0 else 0
-                inv_y = entry_y * qty_y if entry_y > 0 and qty_y > 0 else 0
+                pnl_y = (current_y - entry_y) * qty_y * parity if entry_y > 0 and qty_y > 0 else 0
+                inv_y = entry_y * qty_y * parity if entry_y > 0 and qty_y > 0 else 0
 
                 entry_x = pos.get('mf_entry_price_x', 0.0)
                 current_x = pos.get('mf_current_price_x', entry_x)
                 qty_x = pos.get('mf_qty_x', 0)
-                pnl_x = (current_x - entry_x) * qty_x if entry_x > 0 and qty_x > 0 else 0
-                inv_x = entry_x * qty_x if entry_x > 0 and qty_x > 0 else 0
+                pnl_x = (current_x - entry_x) * qty_x * parity if entry_x > 0 and qty_x > 0 else 0
+                inv_x = entry_x * qty_x * parity if entry_x > 0 and qty_x > 0 else 0
 
                 pos_pnl = pnl_y + pnl_x
                 pos_inv = inv_y + inv_x
@@ -8338,47 +9240,164 @@ class PairsTradingTerminal(QMainWindow):
         content_layout.setContentsMargins(20, 15, 20, 15)
         content_layout.setSpacing(15)  # Ökat från 10 för mer luft
         
-        # Main tab widget
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        
+        # ── Sidebar navigation + stacked content ──
         # OPTIMERING: Lazy loading med container-widgets
-        # Spara vilka tabbar som är laddade
         self._tabs_loaded = {
-            0: True,   # Market Overview - laddas direkt (starttab)
+            0: True,   # Market Overview - laddas direkt
             1: False,  # Arbitrage Scanner
             2: False,  # OU Analytics
-            3: False,  # Pair Signals (tung - MS scraping)
+            3: False,  # Pair Signals
             4: False,  # Portfolio
             5: False,  # Markov Chains
+            10: False, # EPS Mean Reversion
         }
-        
-        # Spara container-widgets för lazy loading
         self._tab_containers = {}
-        
-        # Tab 0: Market Overview - laddas direkt (starttab)
-        self.tabs.addTab(self.create_market_overview_tab(), "|◎| MARKET OVERVIEW")
-        
-        # Tab 1-4: Containers med placeholders som fylls on-demand
-        self._tab_containers[1] = self._create_lazy_container("ARBITRAGE SCANNER")
-        self.tabs.addTab(self._tab_containers[1], "|◊| ARBITRAGE SCANNER")
-        
-        self._tab_containers[2] = self._create_lazy_container("OU ANALYTICS")
-        self.tabs.addTab(self._tab_containers[2], "|∂x| OU ANALYTICS")
-        
-        self._tab_containers[3] = self._create_lazy_container("PAIR SIGNALS")
-        self.tabs.addTab(self._tab_containers[3], "|⧗| PAIR SIGNALS")
-        
+
+        # Sidebar tree
+        self.nav_tree = QTreeWidget()
+        self.nav_tree.setHeaderHidden(True)
+        self.nav_tree.setIndentation(16)
+        self.nav_tree.setAnimated(True)
+        self.nav_tree.setExpandsOnDoubleClick(False)
+        self.nav_tree.setRootIsDecorated(False)
+        self.nav_tree.setFixedWidth(220)
+        self.nav_tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background-color: {COLORS['bg_darkest']};
+                border: none;
+                border-right: 1px solid {COLORS['border_subtle']};
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 11px;
+                outline: none;
+            }}
+            QTreeWidget::item {{
+                color: {COLORS['text_muted']};
+                padding: 7px 12px;
+                border: none;
+            }}
+            QTreeWidget::item:selected {{
+                background-color: rgba(212, 165, 116, 0.12);
+                color: {COLORS['accent']};
+                border-left: 2px solid {COLORS['accent']};
+            }}
+            QTreeWidget::item:hover:!selected {{
+                background-color: {COLORS['bg_hover']};
+                color: {COLORS['text_secondary']};
+            }}
+            QTreeWidget::branch {{
+                background: transparent;
+            }}
+            QTreeWidget::branch:has-children:closed {{
+                image: none;
+            }}
+            QTreeWidget::branch:has-children:open {{
+                image: none;
+            }}
+        """)
+
+        # Stacked content area
+        self.content_stack = QStackedWidget()
+
+        # ── Bygg navigation-träd och stacked pages ──
+        # Mapping: tree item → stacked index
+        self._nav_index_map = {}
+
+        # Topnivå-items (standalone)
+        market_item = QTreeWidgetItem(self.nav_tree, ["  ◎  MARKET OVERVIEW"])
+        market_item.setFlags(market_item.flags() & ~Qt.ItemIsSelectable | Qt.ItemIsSelectable)
+        font_top = QFont("JetBrains Mono", 10, QFont.Bold)
+        market_item.setFont(0, font_top)
+        self._nav_index_map[id(market_item)] = 0
+        self.content_stack.addWidget(self.create_market_overview_tab())  # index 0
+
+        # Master Scanner — standalone
+        scanner_item = QTreeWidgetItem(self.nav_tree, ["  ⚡  MASTER SCANNER"])
+        scanner_item.setFont(0, font_top)
+        self._nav_index_map[id(scanner_item)] = 11
+        self._tab_containers[11] = self._create_lazy_container("MASTER SCANNER")
+        self.content_stack.addWidget(self._tab_containers[11])
+        self._tabs_loaded[11] = False
+
+        # ── Kategori: PAIRS TRADING ──
+        cat_pairs = QTreeWidgetItem(self.nav_tree, ["  ◊  PAIRS TRADING"])
+        cat_pairs.setFont(0, font_top)
+        cat_pairs.setFlags(cat_pairs.flags() & ~Qt.ItemIsSelectable)
+        cat_pairs.setForeground(0, QColor(COLORS['text_muted']))
+        cat_pairs.setExpanded(True)
+
+        pairs_children = [
+            (1, "Arbitrage Scanner"),
+            (2, "OU Analytics"),
+            (3, "Pair Signals"),
+        ]
+        for idx, name in pairs_children:
+            child = QTreeWidgetItem(cat_pairs, [f"    {name}"])
+            self._nav_index_map[id(child)] = idx
+            self._tab_containers[idx] = self._create_lazy_container(name.upper())
+            self.content_stack.addWidget(self._tab_containers[idx])  # index = idx
+
+        # ── Kategori: KVANTMODELLER ──
+        cat_quant = QTreeWidgetItem(self.nav_tree, ["  ∂  QUANT MODELS"])
+        cat_quant.setFont(0, font_top)
+        cat_quant.setFlags(cat_quant.flags() & ~Qt.ItemIsSelectable)
+        cat_quant.setForeground(0, QColor(COLORS['text_muted']))
+        cat_quant.setExpanded(True)
+
+        quant_children = [
+            (5, "Markov Chains"),
+            (10, "EPS Reversion"),
+            (12, "TTM Squeeze"),
+        ]
+        for entry in quant_children:
+            idx, name = entry[0], entry[1]
+            hidden = entry[2] if len(entry) > 2 else False
+            if not hidden:
+                child = QTreeWidgetItem(cat_quant, [f"    {name}"])
+                self._nav_index_map[id(child)] = idx
+            self._tab_containers[idx] = self._create_lazy_container(name.upper())
+            self.content_stack.addWidget(self._tab_containers[idx])
+
+        # ── Kategori: PORTFÖLJ ──
+        cat_port = QTreeWidgetItem(self.nav_tree, ["  ≡  PORTFOLIO"])
+        cat_port.setFont(0, font_top)
+        cat_port.setFlags(cat_port.flags() & ~Qt.ItemIsSelectable)
+        cat_port.setForeground(0, QColor(COLORS['text_muted']))
+        cat_port.setExpanded(True)
+
+        port_child = QTreeWidgetItem(cat_port, ["    Positions & History"])
+        self._nav_index_map[id(port_child)] = 4
         self._tab_containers[4] = self._create_lazy_container("PORTFOLIO")
-        self.tabs.addTab(self._tab_containers[4], "|≡| PORTFOLIO")
+        self.content_stack.addWidget(self._tab_containers[4])
 
-        self._tab_containers[5] = self._create_lazy_container("MARKOV CHAINS")
-        self.tabs.addTab(self._tab_containers[5], "|⛓| MARKOV CHAINS")
+        # Stacked widget index → page index mapping
+        # Actual widget addition order: 0=Market, 11=Scanner, 1=Arb, 2=OU, 3=Signals,
+        # 5=Markov, 10=EPS, 12=Squeeze, 4=Portfolio
+        self._logical_to_stack = {}
+        add_order = [0, 11, 1, 2, 3, 5, 10, 12, 4]
+        for stack_idx, logical_idx in enumerate(add_order):
+            self._logical_to_stack[logical_idx] = stack_idx
 
-        # Koppla signal för lazy loading
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        
-        content_layout.addWidget(self.tabs)
+        # Connect sidebar click → page switch
+        self.nav_tree.currentItemChanged.connect(self._on_nav_item_changed)
+
+        # Select Market Overview by default
+        self.nav_tree.setCurrentItem(market_item)
+
+        # Layout: sidebar | content
+        nav_splitter = QSplitter(Qt.Horizontal)
+        nav_splitter.setHandleWidth(1)
+        nav_splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background-color: {COLORS['border_subtle']};
+            }}
+        """)
+        nav_splitter.addWidget(self.nav_tree)
+        nav_splitter.addWidget(self.content_stack)
+        nav_splitter.setStretchFactor(0, 0)
+        nav_splitter.setStretchFactor(1, 1)
+        nav_splitter.setSizes([220, 1200])
+
+        content_layout.addWidget(nav_splitter)
         main_layout.addWidget(content_widget)
         
         # Status bar
@@ -8443,60 +9462,86 @@ class PairsTradingTerminal(QMainWindow):
     def _toggle_robustness_section(self):
         pass  # Robustness section removed (single 2y period)
 
-    def _on_tab_changed(self, index: int):
-        """Handle tab change - load tab content on demand.
-        
-        OPTIMERING: Lazy loading - laddar tabbinnehåll i befintlig container.
-        """
+    def _on_nav_item_changed(self, current, previous):
+        """Handle sidebar navigation item click → switch stacked page + lazy load."""
+        if current is None:
+            return
+        item_id = id(current)
+        if item_id not in self._nav_index_map:
+            return  # Kategori-header, inte klickbar
+        logical_index = self._nav_index_map[item_id]
+        self.navigate_to_page(logical_index)
+
+    def navigate_to_page(self, logical_index: int):
+        """Navigate to a page by logical index. Handles lazy loading + sidebar sync."""
+        stack_idx = self._logical_to_stack.get(logical_index, 0)
+        self.content_stack.setCurrentIndex(stack_idx)
+        self._load_page_if_needed(logical_index)
+        # Synka sidebar-markering
+        for item_id, idx in self._nav_index_map.items():
+            if idx == logical_index:
+                # Hitta QTreeWidgetItem via id
+                iterator = self._iterate_tree_items()
+                for tree_item in iterator:
+                    if id(tree_item) == item_id:
+                        self.nav_tree.blockSignals(True)
+                        self.nav_tree.setCurrentItem(tree_item)
+                        self.nav_tree.blockSignals(False)
+                        return
+
+    def _iterate_tree_items(self):
+        """Iterera alla items i nav-trädet."""
+        def _recurse(item):
+            yield item
+            for i in range(item.childCount()):
+                yield from _recurse(item.child(i))
+        for i in range(self.nav_tree.topLevelItemCount()):
+            yield from _recurse(self.nav_tree.topLevelItem(i))
+
+    def _load_page_if_needed(self, index: int):
+        """Lazy-load page content on first visit."""
         if self._tabs_loaded.get(index, False):
-            return  # Redan laddad
-        
+            return
+
         if index not in self._tab_containers:
-            return  # Inte en lazy-loaded tab
-        
-        self.statusBar().showMessage(f"Loading tab...")
-        QApplication.processEvents()  # Visa statusmeddelande direkt
-        
-        # Skapa rätt innehåll baserat på index
+            return
+
+        self.statusBar().showMessage(f"Loading...")
+        QApplication.processEvents()
+
         tab_creators = {
             1: self.create_arbitrage_scanner_tab,
             2: self.create_ou_analytics_tab,
             3: self.create_signals_tab,
             4: self.create_portfolio_tab,
             5: self.create_markov_chains_tab,
+            10: self.create_eps_reversion_tab,
+            11: self.create_master_scanner_tab,
+            12: self.create_squeeze_tab,
         }
-        
+
         if index in tab_creators:
             container = self._tab_containers[index]
             layout = container.layout()
-            
-            # Ta bort placeholder
+
             placeholder = container.findChild(QLabel, "placeholder")
             if placeholder:
                 placeholder.deleteLater()
-            
-            # Skapa det riktiga innehållet
+
             content = tab_creators[index]()
-            
-            # Flytta innehållet till containern
-            # (content är en QWidget, vi tar dess layout och barn)
             content_layout = content.layout()
             if content_layout:
-                # Flytta alla widgets från content till container
                 while content_layout.count():
                     item = content_layout.takeAt(0)
                     if item.widget():
                         layout.addWidget(item.widget())
                     elif item.layout():
                         layout.addLayout(item.layout())
-            
-            # Markera som laddad
+
             self._tabs_loaded[index] = True
-            
-            # Ladda data för tabben om engine finns
+
             if self.engine is not None:
-                if index == 1:  # Arbitrage Scanner
-                    # Update scan summary metrics (may have been cached before tab existed)
+                if index == 1:
                     n_tickers = len(self.engine.price_data.columns) if self.engine.price_data is not None else 0
                     n_pairs = len(self.engine.pairs_stats) if self.engine.pairs_stats is not None else 0
                     n_viable = len(self.engine.viable_pairs) if self.engine.viable_pairs is not None else 0
@@ -8506,17 +9551,908 @@ class PairsTradingTerminal(QMainWindow):
                     self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
                     self.update_viable_table()
                     self.update_all_pairs_table()
-                elif index == 2:  # OU Analytics
+                elif index == 2:
                     self.update_ou_pair_list()
-                elif index == 3:  # Pair Signals
+                elif index == 3:
                     self.update_signals_list()
-            
-            # Portfolio behöver alltid uppdateras
-            if index == 4:  # Portfolio
+
+            if index == 4:
                 self.update_portfolio_display()
-            
-            self.statusBar().showMessage("Tab loaded")
+
+            if index == 10 and self._eps_mr_result is not None:
+                self._on_eps_mr_result(self._eps_mr_result)
+
+            self.statusBar().showMessage("Ready")
     
+    # ========================================================================
+    # MASTER SCANNER
+    # ========================================================================
+
+    def create_master_scanner_tab(self) -> QWidget:
+        """Aggregerad signalöversikt — samlar signaler från alla strategier."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(12)
+
+        # Header row
+        header_row = QHBoxLayout()
+        title = QLabel("MASTER SCANNER")
+        title.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            font-family: 'JetBrains Mono', monospace;
+        """)
+        header_row.addWidget(title)
+        header_row.addStretch()
+
+        # Refresh-knapp
+        self.scanner_refresh_btn = QPushButton("⟳  SCAN ALL")
+        self.scanner_refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none;
+                border-radius: 4px;
+                padding: 8px 20px;
+                font-size: 11px;
+                font-weight: 700;
+                font-family: 'JetBrains Mono', monospace;
+                letter-spacing: 1px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['accent_bright']};
+            }}
+        """)
+        self.scanner_refresh_btn.clicked.connect(self._refresh_master_scanner)
+        header_row.addWidget(self.scanner_refresh_btn)
+        main_layout.addLayout(header_row)
+
+        # Summary cards row
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+        self._scanner_total_card = self._create_scanner_summary_card("TOTAL SIGNALS", "0")
+        self._scanner_buy_card = self._create_scanner_summary_card("BUY / LONG", "0", COLORS['positive'])
+        self._scanner_sell_card = self._create_scanner_summary_card("SELL / SHORT", "0", COLORS['negative'])
+        self._scanner_neutral_card = self._create_scanner_summary_card("NEUTRAL", "0", COLORS['text_muted'])
+        cards_row.addWidget(self._scanner_total_card)
+        cards_row.addWidget(self._scanner_buy_card)
+        cards_row.addWidget(self._scanner_sell_card)
+        cards_row.addWidget(self._scanner_neutral_card)
+        main_layout.addLayout(cards_row)
+
+        # Filter row
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+
+        filter_label = QLabel("FILTER:")
+        filter_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; font-weight: 600;")
+        filter_row.addWidget(filter_label)
+
+        self._scanner_strategy_filter = QComboBox()
+        self._scanner_strategy_filter.addItems([
+            "All Strategies", "Pairs", "EPS Reversion", "Markov", "TTM Squeeze"
+        ])
+        self._scanner_strategy_filter.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-family: 'JetBrains Mono', monospace;
+                min-width: 130px;
+            }}
+        """)
+        self._scanner_strategy_filter.currentTextChanged.connect(self._apply_scanner_filter)
+        filter_row.addWidget(self._scanner_strategy_filter)
+
+        self._scanner_direction_filter = QComboBox()
+        self._scanner_direction_filter.addItems(["All Directions", "LONG", "SHORT", "NEUTRAL"])
+        self._scanner_direction_filter.setStyleSheet(self._scanner_strategy_filter.styleSheet())
+        self._scanner_direction_filter.currentTextChanged.connect(self._apply_scanner_filter)
+        filter_row.addWidget(self._scanner_direction_filter)
+
+        self._scanner_min_score = QDoubleSpinBox()
+        self._scanner_min_score.setRange(0.0, 1.0)
+        self._scanner_min_score.setSingleStep(0.1)
+        self._scanner_min_score.setValue(0.0)
+        self._scanner_min_score.setPrefix("Min Score: ")
+        self._scanner_min_score.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-family: 'JetBrains Mono', monospace;
+                min-width: 120px;
+            }}
+        """)
+        self._scanner_min_score.valueChanged.connect(self._apply_scanner_filter)
+        filter_row.addWidget(self._scanner_min_score)
+        filter_row.addStretch()
+        main_layout.addLayout(filter_row)
+
+        # Signal table
+        self.scanner_table = QTableWidget()
+        self.scanner_table.setColumnCount(7)
+        self.scanner_table.setHorizontalHeaderLabels([
+            "Ticker/Pair", "Strategy", "Signal", "Score",
+            "Direction", "Details", "Time"
+        ])
+        self.scanner_table.horizontalHeader().setStyleSheet(f"""
+            QHeaderView::section {{
+                background-color: {COLORS['bg_darkest']};
+                color: {COLORS['accent']};
+                border: none;
+                border-bottom: 1px solid {COLORS['border_subtle']};
+                padding: 8px 6px;
+                font-size: 10px;
+                font-weight: 700;
+                font-family: 'JetBrains Mono', monospace;
+                letter-spacing: 1px;
+                text-transform: uppercase;
+            }}
+        """)
+        self.scanner_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['bg_dark']};
+                gridline-color: {COLORS['border_subtle']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 11px;
+                color: {COLORS['text_primary']};
+            }}
+            QTableWidget::item {{
+                padding: 6px 8px;
+                border-bottom: 1px solid {COLORS['bg_elevated']};
+            }}
+            QTableWidget::item:selected {{
+                background-color: rgba(212, 165, 116, 0.15);
+            }}
+            QTableWidget::item:hover {{
+                background-color: {COLORS['bg_hover']};
+            }}
+        """)
+        self.scanner_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.scanner_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.scanner_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.scanner_table.verticalHeader().setVisible(False)
+        self.scanner_table.horizontalHeader().setStretchLastSection(True)
+        self.scanner_table.setSortingEnabled(True)
+
+        # Kolumn-bredder
+        header = self.scanner_table.horizontalHeader()
+        header.resizeSection(0, 130)   # Ticker/Pair
+        header.resizeSection(1, 120)   # Strategy
+        header.resizeSection(2, 140)   # Signal
+        header.resizeSection(3, 70)    # Score
+        header.resizeSection(4, 90)    # Direction
+        header.resizeSection(5, 250)   # Details
+        # Time stretches
+
+        # Dubbelklick → navigera till strategi
+        self.scanner_table.doubleClicked.connect(self._on_scanner_row_activated)
+
+        main_layout.addWidget(self.scanner_table, 1)
+
+        # Status label
+        self.scanner_status = QLabel("Click SCAN ALL to collect signals from all strategies")
+        self.scanner_status.setStyleSheet(f"""
+            color: {COLORS['text_muted']};
+            font-size: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            padding: 4px;
+        """)
+        main_layout.addWidget(self.scanner_status)
+
+        # Intern signal-cache
+        self._scanner_signals = []
+
+        # Ladda cachade resultat från disk
+        QTimer.singleShot(100, self._load_scanner_cache)
+
+        return tab
+
+    def _create_scanner_summary_card(self, label: str, value: str, color: str = None) -> QFrame:
+        """Liten summary-card för Master Scanner."""
+        card = QFrame()
+        color = color or COLORS['accent']
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 6px;
+                padding: 10px 16px;
+            }}
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        lbl = QLabel(label)
+        lbl.setStyleSheet(f"""
+            color: {COLORS['text_muted']};
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            font-family: 'JetBrains Mono', monospace;
+        """)
+        layout.addWidget(lbl)
+
+        val = QLabel(value)
+        val.setObjectName("value")
+        val.setStyleSheet(f"""
+            color: {color};
+            font-size: 22px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        """)
+        layout.addWidget(val)
+
+        return card
+
+    def _refresh_master_scanner(self):
+        """Kör alla tillgängliga strategier, samla signaler när klara.
+
+        Om prisdata saknas → ladda ner automatiskt från CSV-tickerlistan.
+        """
+        print(f"\n{'='*70}")
+        print(f"[SCANNER] === MASTER SCANNER: SCAN ALL started ===")
+        print(f"[SCANNER] Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*70}")
+
+        self.scanner_refresh_btn.setEnabled(False)
+        self.scanner_status.setText("Initializing scan...")
+        QApplication.processEvents()
+
+        has_data = self.engine is not None and self.engine.price_data is not None
+        print(f"[SCANNER] Engine exists: {self.engine is not None}")
+        if has_data:
+            print(f"[SCANNER] Price data: {len(self.engine.price_data.columns)} tickers loaded")
+        else:
+            print(f"[SCANNER] Price data: NONE — will auto-download")
+
+        if has_data:
+            # Prisdata finns redan → kör strategier direkt
+            self._launch_all_strategies()
+        else:
+            # Prisdata saknas → ladda ner först
+            self._download_price_data_for_scanner()
+
+    def _download_price_data_for_scanner(self):
+        """Ladda ner prisdata från CSV-tickerlistan innan strategier körs."""
+        print(f"[SCANNER] Loading ticker list from: {SCHEDULED_CSV_PATH}")
+
+        if not os.path.exists(SCHEDULED_CSV_PATH):
+            msg = f"Ticker CSV not found: {SCHEDULED_CSV_PATH}"
+            print(f"[SCANNER] ERROR: {msg}")
+            self.scanner_status.setText(msg)
+            self.scanner_refresh_btn.setEnabled(True)
+            return
+
+        tickers = load_tickers_from_csv(SCHEDULED_CSV_PATH)
+        if not tickers:
+            msg = "No tickers found in CSV"
+            print(f"[SCANNER] ERROR: {msg}")
+            self.scanner_status.setText(msg)
+            self.scanner_refresh_btn.setEnabled(True)
+            return
+
+        print(f"[SCANNER] Loaded {len(tickers)} tickers from CSV")
+        self.scanner_status.setText(f"Downloading price data for {len(tickers)} tickers...")
+
+        # Kör nedladdning i bakgrundstråd
+        self._scanner_fetch_thread = QThread()
+        self._scanner_fetch_worker = PriceDataWorker(tickers, '2y')
+        self._scanner_fetch_worker.moveToThread(self._scanner_fetch_thread)
+
+        self._scanner_fetch_thread.started.connect(self._scanner_fetch_worker.run)
+        self._scanner_fetch_worker.progress.connect(self._on_scanner_fetch_progress)
+        self._scanner_fetch_worker.result.connect(self._on_scanner_fetch_result)
+        self._scanner_fetch_worker.error.connect(self._on_scanner_fetch_error)
+        self._scanner_fetch_worker.finished.connect(self._scanner_fetch_thread.quit)
+
+        self._scanner_fetch_thread.start()
+
+    def _on_scanner_fetch_progress(self, pct, msg):
+        self.scanner_status.setText(f"[{pct}%] {msg}")
+
+    def _on_scanner_fetch_error(self, msg):
+        print(f"[SCANNER] Price data fetch ERROR: {msg}")
+        self.scanner_status.setText(f"Error loading data: {msg}")
+        self.scanner_refresh_btn.setEnabled(True)
+
+    def _on_scanner_fetch_result(self, engine):
+        """Prisdata nedladdad — spara engine och kör strategier."""
+        n_tickers = len(engine.price_data.columns) if engine.price_data is not None else 0
+        print(f"[SCANNER] Price data loaded: {n_tickers} tickers")
+
+        # Spara engine om det inte redan finns en (bevarar existerande pairs-analys)
+        if self.engine is None:
+            self.engine = engine
+            print(f"[SCANNER] New engine created and assigned")
+        elif self.engine.price_data is None:
+            self.engine.price_data = engine.price_data
+            self.engine.raw_price_data = engine.price_data.copy()
+            print(f"[SCANNER] Price data assigned to existing engine")
+
+        # Navigera tillbaka till Master Scanner
+        self.navigate_to_page(11)
+        self._launch_all_strategies()
+
+    def _launch_all_strategies(self):
+        """Starta alla strategi-analyser."""
+        print(f"\n[SCANNER] --- Launching all strategies ---")
+        launched = []
+
+        # Spara nuvarande sida (Master Scanner) för att återställa efter lazy-loading
+        scanner_stack_idx = self.content_stack.currentIndex()
+
+        # Strategier som behöver engine.price_data
+        strategies_needing_data = {
+            12: ('TTM Squeeze', 'run_squeeze_analysis', '_squeeze_running'),
+        }
+        # VRP och EPS startas EFTER Markov (undviker concurrent yfinance-downloads)
+
+        all_strategies = {**strategies_needing_data}
+
+        for idx, (name, method_name, running_attr) in all_strategies.items():
+            # Hoppa över om redan har cachade resultat
+            result_attrs = {10: '_eps_mr_result', 12: '_squeeze_result'}
+            if getattr(self, result_attrs.get(idx, ''), None) is not None:
+                print(f"[SCANNER]   {name}: SKIPPED (cached result exists)")
+                launched.append(f"{name} (cached)")
+                continue
+
+            if getattr(self, running_attr, False):
+                print(f"[SCANNER]   {name}: SKIPPED (already running)")
+                launched.append(f"{name} (running)")
+                continue
+
+            # Lazy-load tabben om den inte är laddad (widgets krävs)
+            if not self._tabs_loaded.get(idx, False):
+                print(f"[SCANNER]   {name}: Lazy-loading tab {idx}...")
+                self._load_page_if_needed(idx)
+                QApplication.processEvents()
+
+            method = getattr(self, method_name, None)
+            if method:
+                try:
+                    print(f"[SCANNER]   {name}: Starting analysis...")
+                    method()
+                    launched.append(name)
+                    print(f"[SCANNER]   {name}: LAUNCHED OK")
+                except Exception as e:
+                    print(f"[SCANNER]   {name}: ERROR — {e}")
+                    import traceback
+                    traceback.print_exc()
+                    launched.append(f"{name} (error)")
+
+        # ── Markov batch: kör på ett urval av tickers ──
+        if not self._markov_batch_running:
+            markov_tickers = self._get_markov_scan_tickers()
+            if markov_tickers and MARKOV_AVAILABLE:
+                print(f"[SCANNER]   Markov: Starting batch analysis on {len(markov_tickers)} tickers...")
+                self._markov_batch_running = True
+                self._markov_batch_thread = QThread()
+                self._markov_batch_worker = MarkovBatchWorker(markov_tickers)
+                self._markov_batch_worker.moveToThread(self._markov_batch_thread)
+                self._markov_batch_thread.started.connect(self._markov_batch_worker.run)
+                self._markov_batch_worker.progress.connect(self._on_scanner_fetch_progress)
+                self._markov_batch_worker.result.connect(self._on_markov_batch_result)
+                self._markov_batch_worker.error.connect(self._on_markov_batch_error)
+                self._markov_batch_worker.finished.connect(self._markov_batch_thread.quit)
+                self._markov_batch_thread.start()
+                launched.append('Markov')
+                markov_will_callback = True
+            else:
+                print(f"[SCANNER]   Markov: SKIPPED ({'already running' if self._markov_batch_running else 'not available'})")
+                markov_will_callback = False
+        else:
+            launched.append('Markov (running)')
+            markov_will_callback = True  # already running, will callback when done
+
+        # ── EPS: startas EFTER Markov (undviker concurrent yfinance-downloads) ──
+        self._yf_queue = []  # (name, method_name, tab_idx)
+
+        # EPS
+        eps_idx = 10
+        if getattr(self, '_eps_mr_result', None) is not None:
+            print(f"[SCANNER]   EPS Reversion: SKIPPED (cached result exists)")
+            launched.append('EPS Reversion (cached)')
+        elif self._eps_mr_running:
+            print(f"[SCANNER]   EPS Reversion: SKIPPED (already running)")
+            launched.append('EPS Reversion (running)')
+        else:
+            if not self._tabs_loaded.get(eps_idx, False):
+                print(f"[SCANNER]   EPS Reversion: Lazy-loading tab {eps_idx}...")
+                self._load_page_if_needed(eps_idx)
+                QApplication.processEvents()
+            self._yf_queue.append(('EPS Reversion', 'run_eps_mr_analysis', eps_idx))
+            launched.append('EPS Reversion (queued)')
+
+        self._eps_pending_scanner_launch = len(self._yf_queue) > 0
+        if self._yf_queue:
+            queued_names = [q[0] for q in self._yf_queue]
+            if markov_will_callback:
+                print(f"[SCANNER]   yfinance queue: {queued_names} — will start after Markov completes")
+            else:
+                print(f"[SCANNER]   yfinance queue: {queued_names} — starting immediately (no Markov)")
+                self._launch_next_yf_strategy()
+
+        # Återställ synlig sida till Master Scanner
+        self.content_stack.setCurrentIndex(scanner_stack_idx)
+
+        print(f"[SCANNER] Launched: {launched}")
+        self.scanner_status.setText(f"Running: {', '.join(launched)}...")
+
+        # Starta poll-timer med timeout (max 5 min)
+        self._scanner_pending = True
+        self._scanner_start_time = time.time()
+        if hasattr(self, '_scanner_check_timer') and self._scanner_check_timer.isActive():
+            self._scanner_check_timer.stop()
+        self._scanner_check_timer = QTimer(self)
+        self._scanner_check_timer.timeout.connect(self._check_scanner_complete)
+        self._scanner_check_timer.start(1500)
+
+    def _get_markov_scan_tickers(self) -> list:
+        """Välj ett urval tickers för Markov batch-scan.
+
+        Använder index + mest likvida aktier från CSV.
+        """
+        # Populära index och storbolag
+        core_tickers = [
+            '^GSPC', '^OMX', '^IXIC', '^DJI',
+            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA',
+            'VOLV-B.ST', 'ERIC-B.ST', 'SEB-A.ST', 'SHB-A.ST', 'ABB.ST',
+            'SAND.ST', 'HM-B.ST', 'ATLAS-A.ST', 'INVE-B.ST',
+        ]
+        # Lägg till tickers som har engine price_data (dvs redan nedladdade)
+        if self.engine is not None and self.engine.price_data is not None:
+            available = list(self.engine.price_data.columns)
+            # Filtrera core_tickers till de som finns i data
+            valid_core = [t for t in core_tickers if t in available]
+            # Begränsa till max 25 tickers totalt för rimlig tid
+            return valid_core[:25]
+        return core_tickers[:15]
+
+    def _on_markov_batch_result(self, results):
+        """Markov batch klar — spara resultat och starta yfinance-kön."""
+        self._markov_batch_results = results
+        self._markov_batch_running = False
+        print(f"[SCANNER] Markov batch complete: {len(results)} tickers analyzed")
+        if getattr(self, '_eps_pending_scanner_launch', False):
+            self._launch_next_yf_strategy()
+
+    def _on_markov_batch_error(self, msg):
+        """Markov batch error."""
+        self._markov_batch_running = False
+        print(f"[SCANNER] Markov batch ERROR: {msg}")
+        if getattr(self, '_eps_pending_scanner_launch', False):
+            self._launch_next_yf_strategy()
+
+    def _launch_next_yf_strategy(self):
+        """Startar nästa strategi i yfinance-kön (sekventiell för att undvika concurrent downloads)."""
+        if not hasattr(self, '_yf_queue') or not self._yf_queue:
+            self._eps_pending_scanner_launch = False
+            print(f"[SCANNER]   yfinance queue: Empty — all launched")
+            return
+
+        name, method_name, tab_idx = self._yf_queue.pop(0)
+        print(f"[SCANNER]   {name}: Starting analysis (from yfinance queue)...")
+        try:
+            method = getattr(self, method_name, None)
+            if method:
+                method()
+                print(f"[SCANNER]   {name}: LAUNCHED OK")
+            else:
+                print(f"[SCANNER]   {name}: Method {method_name} not found!")
+        except Exception as e:
+            print(f"[SCANNER]   {name}: LAUNCH ERROR — {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _check_scanner_complete(self):
+        """Poll om alla strategi-analyser är klara. Timeout efter 5 min."""
+        elapsed = time.time() - self._scanner_start_time
+        still_running = []
+        for name, attr in [
+            ('EPS MR', '_eps_mr_running'),
+            ('TTM Squeeze', '_squeeze_running'),
+            ('Markov', '_markov_batch_running'),
+        ]:
+            if getattr(self, attr, False):
+                still_running.append(name)
+
+        if still_running and elapsed < 300:  # 5 min timeout (EPS startar efter Markov)
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            self.scanner_status.setText(f"Waiting for: {', '.join(still_running)}... ({mins}:{secs:02d})")
+        else:
+            if still_running:
+                print(f"[SCANNER] TIMEOUT after {elapsed:.0f}s — still running: {still_running}")
+                # Force-reset stuck flags
+                for name, attr in [
+                    ('EPS MR', '_eps_mr_running'),
+                    ('TTM Squeeze', '_squeeze_running'),
+                    ('Markov', '_markov_batch_running'),
+                ]:
+                    if getattr(self, attr, False):
+                        print(f"[SCANNER]   Force-resetting {name}")
+                        setattr(self, attr, False)
+
+            self._scanner_check_timer.stop()
+            self._scanner_pending = False
+            self.scanner_refresh_btn.setEnabled(True)
+            print(f"[SCANNER] All strategies complete ({elapsed:.0f}s) — collecting signals...")
+            self._collect_scanner_signals()
+
+    def _collect_scanner_signals(self):
+        """Samla signaler från alla cachade strategi-resultat."""
+        print(f"\n[SCANNER] --- Collecting signals ---")
+        self.scanner_status.setText("Collecting signals...")
+        QApplication.processEvents()
+
+        signals = []
+        now_str = datetime.now().strftime("%H:%M")
+
+        # ── 1. Pairs signals ──
+        print(f"[SCANNER]   Pairs: engine={self.engine is not None}, "
+              f"viable_pairs={self.engine.viable_pairs is not None if self.engine else 'N/A'}")
+        if self.engine is not None and self.engine.viable_pairs is not None:
+            vp = self.engine.viable_pairs
+            n_pairs_checked = 0
+            n_pairs_signal = 0
+            for _, row in vp.iterrows():
+                pair = row.get('pair', '')
+                z = row.get('z_score', 0)
+                opt_z = row.get('optimal_z', 2.0)
+                hl = row.get('half_life_days', 0)
+                hurst = row.get('hurst_exponent', 0.5)
+                n_pairs_checked += 1
+
+                # Strikt: enbart par med |z| >= optimal_z
+                if abs(z) >= opt_z:
+                    direction = "SHORT" if z > 0 else "LONG"
+                    score = min(abs(z) / (opt_z * 2), 1.0)
+                    signals.append({
+                        'ticker': pair,
+                        'strategy': 'Pairs',
+                        'signal': f'ENTRY Z = {z:+.2f} (opt: {opt_z:.1f})',
+                        'score': round(score, 2),
+                        'direction': direction,
+                        'details': f'HL {hl:.0f}d | Hurst {hurst:.2f}',
+                        'time': now_str,
+                        'nav_index': 1,
+                    })
+                    n_pairs_signal += 1
+            print(f"[SCANNER]   Pairs: {n_pairs_checked} viable, {n_pairs_signal} with entry signal")
+
+        # ── 2. EPS Mean Reversion signals ──
+        print(f"[SCANNER]   EPS MR: result={self._eps_mr_result is not None}")
+        if self._eps_mr_result is not None:
+            try:
+                data, df, pe_analyses = self._eps_mr_result
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        sig = str(row.get('Signal', 'Neutral'))
+                        if sig == 'Neutral' or not sig:
+                            continue
+                        ticker = str(row.get('Ticker', '?'))
+                        try:
+                            spr_z = float(row.get('Spr Z', 0) or 0)
+                        except (ValueError, TypeError):
+                            spr_z = 0.0
+                        try:
+                            adf_p = float(row.get('ADF p', 1.0) or 1.0)
+                        except (ValueError, TypeError):
+                            adf_p = 1.0
+                        try:
+                            hl = float(row.get('HL(d)', 0) or 0)
+                        except (ValueError, TypeError):
+                            hl = 0.0
+                        passes = str(row.get('Pass', '0/4'))
+                        direction = "LONG" if 'ndervärderad' in sig else "SHORT"
+                        score = min(abs(spr_z) / 3.0, 1.0)
+                        print(f"[SCANNER]   EPS MR signal: {ticker} {sig} Z={spr_z:+.2f} dir={direction} score={score:.2f}")
+                        signals.append({
+                            'ticker': ticker,
+                            'strategy': 'EPS Reversion',
+                            'signal': sig,
+                            'score': round(score, 2),
+                            'direction': direction,
+                            'details': f'Z {spr_z:+.2f} | ADF {adf_p:.3f} | HL {hl:.0f}d | {passes}',
+                            'time': now_str,
+                            'nav_index': 10,
+                        })
+            except Exception as e:
+                print(f"[SCANNER]   EPS MR error: {e}")
+
+        # ── 7. Markov signals (batch) ──
+        markov_sources = {}
+        # Inkludera enskilt resultat (om manuell analys körts)
+        if self._markov_result is not None:
+            t = getattr(self._markov_result, 'ticker', '?')
+            markov_sources[t] = self._markov_result
+        # Inkludera batch-resultat
+        if self._markov_batch_results:
+            markov_sources.update(self._markov_batch_results)
+        print(f"[SCANNER]   Markov: {len(markov_sources)} tickers analyzed")
+
+        n_markov_sig = 0
+        for ticker, res in markov_sources.items():
+            state = getattr(res, 'current_state', -1)
+            forecast = getattr(res, 'forecast_probs', None)
+            exp_ret = getattr(res, 'expected_return', 0) or 0
+
+            if forecast is not None and len(forecast) >= 2:
+                max_prob = max(forecast)
+                # Strikt: bara visa starka signaler (P > 0.65)
+                if max_prob > 0.65:
+                    direction = "LONG" if state == 1 else "SHORT"
+                    state_name = "POS" if state == 1 else "NEG"
+                    score = round(max_prob, 2)
+                    signals.append({
+                        'ticker': ticker,
+                        'strategy': 'Markov',
+                        'signal': f'State: {state_name}',
+                        'score': score,
+                        'direction': direction,
+                        'details': f'E[r] {exp_ret:+.2%} | P(next) {forecast[0]:.0%}/{forecast[1]:.0%}',
+                        'time': now_str,
+                        'nav_index': 5,
+                    })
+                    n_markov_sig += 1
+        print(f"[SCANNER]   Markov: {n_markov_sig} signals (P > 0.65)")
+
+        # ── 8. TTM Squeeze signals ──
+        print(f"[SCANNER]   TTM Squeeze: result={self._squeeze_result is not None}")
+        if self._squeeze_result is not None:
+            n_sqz_sig = 0
+            for ticker, tr in self._squeeze_result.ticker_results.items():
+                if tr.squeeze_on or tr.squeeze_firing:
+                    sig_text = f"SQUEEZE ({tr.squeeze_days}d)"
+                    score = round(tr.score / 100.0, 2)
+
+                    # Lägg till straddle-info om tillgänglig
+                    details = f"Sqz {tr.squeeze_days}d"
+                    opts = self._options_data.get(ticker, {})
+                    if opts and 'error' not in opts and opts.get('nearest_atm') is not None:
+                        atm = opts['nearest_atm']
+                        straddle = atm['Straddle'] if 'Straddle' in atm.index else None
+                        cost_pct = atm['Cost_pct'] if 'Cost_pct' in atm.index else None
+                        if straddle and not pd.isna(straddle):
+                            details += f" | Straddle {straddle:.1f} ({cost_pct:.1f}%)"
+
+                    signals.append({
+                        'ticker': ticker,
+                        'strategy': 'TTM Squeeze',
+                        'signal': sig_text,
+                        'score': score,
+                        'direction': 'NEUTRAL',
+                        'details': details,
+                        'time': now_str,
+                        'nav_index': 12,
+                    })
+                    n_sqz_sig += 1
+            print(f"[SCANNER]   TTM Squeeze: {n_sqz_sig} signals (squeeze on/firing)")
+
+        # Sortera efter score
+        signals.sort(key=lambda s: s['score'], reverse=True)
+        self._scanner_signals = signals
+        self._populate_scanner_table(signals)
+
+        # Uppdatera summary cards
+        n_total = len(signals)
+        n_buy = sum(1 for s in signals if s['direction'] == 'LONG')
+        n_sell = sum(1 for s in signals if s['direction'] == 'SHORT')
+        n_neutral = n_total - n_buy - n_sell
+
+        print(f"\n[SCANNER] === RESULTS ===")
+        print(f"[SCANNER] Total: {n_total} | Buy: {n_buy} | Sell: {n_sell} | Neutral: {n_neutral}")
+        for s in signals[:20]:
+            print(f"[SCANNER]   {s['direction']:6s} | {s['score']:.2f} | {s['strategy']:15s} | {s['ticker']:15s} | {s['signal']}")
+        if len(signals) > 20:
+            print(f"[SCANNER]   ... and {len(signals) - 20} more")
+        print(f"[SCANNER] {'='*50}")
+
+        self._scanner_total_card.findChild(QLabel, "value").setText(str(n_total))
+        self._scanner_buy_card.findChild(QLabel, "value").setText(str(n_buy))
+        self._scanner_sell_card.findChild(QLabel, "value").setText(str(n_sell))
+        self._scanner_neutral_card.findChild(QLabel, "value").setText(str(n_neutral))
+
+        strategies_with_data = set(s['strategy'] for s in signals)
+        all_strategies = {'Pairs', 'EPS Reversion', 'Markov', 'TTM Squeeze'}
+        missing = all_strategies - strategies_with_data
+        if missing:
+            status_msg = f"{n_total} signals found. No signals from: {', '.join(sorted(missing))}"
+            print(f"[SCANNER] {status_msg}")
+            self.scanner_status.setText(status_msg)
+        else:
+            self.scanner_status.setText(f"{n_total} signals found across all strategies")
+
+        # Spara resultat till disk-cache
+        self._save_scanner_cache(signals)
+
+    # ── Scanner disk-cache ─────────────────────────────────────────────
+
+    _SCANNER_CACHE_FILE = os.path.join(os.path.dirname(__file__), 'scan_reports', 'scanner_cache.json')
+
+    def _save_scanner_cache(self, signals: list):
+        """Spara scanner-signaler till disk."""
+        try:
+            cache = {
+                'timestamp': datetime.now().isoformat(),
+                'signals': signals,
+            }
+            os.makedirs(os.path.dirname(self._SCANNER_CACHE_FILE), exist_ok=True)
+            with open(self._SCANNER_CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+            print(f"[SCANNER] Cache saved: {len(signals)} signals → {self._SCANNER_CACHE_FILE}")
+        except Exception as e:
+            print(f"[SCANNER] Cache save error: {e}")
+
+    def _load_scanner_cache(self):
+        """Ladda cachade scanner-signaler från disk och visa i tabellen."""
+        try:
+            if not os.path.exists(self._SCANNER_CACHE_FILE):
+                return
+            with open(self._SCANNER_CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+
+            signals = cache.get('signals', [])
+            timestamp = cache.get('timestamp', '')
+            if not signals:
+                return
+
+            # Parsea timestamp (cache gäller tills nästa schemalagda scan)
+            try:
+                ts = datetime.fromisoformat(timestamp)
+                age = datetime.now() - ts
+                if age.days >= 1:
+                    age_str = f"{ts.strftime('%Y-%m-%d %H:%M')}"
+                else:
+                    age_str = ts.strftime('%H:%M')
+            except Exception:
+                age_str = "?"
+
+            self._scanner_signals = signals
+            self._populate_scanner_table(signals)
+
+            # Uppdatera summary cards
+            n_total = len(signals)
+            n_buy = sum(1 for s in signals if s['direction'] == 'LONG')
+            n_sell = sum(1 for s in signals if s['direction'] == 'SHORT')
+            n_neutral = n_total - n_buy - n_sell
+
+            self._scanner_total_card.findChild(QLabel, "value").setText(str(n_total))
+            self._scanner_buy_card.findChild(QLabel, "value").setText(str(n_buy))
+            self._scanner_sell_card.findChild(QLabel, "value").setText(str(n_sell))
+            self._scanner_neutral_card.findChild(QLabel, "value").setText(str(n_neutral))
+
+            self.scanner_status.setText(f"Cached: {n_total} signals from {age_str}")
+            print(f"[SCANNER] Cache loaded: {n_total} signals from {timestamp}")
+        except Exception as e:
+            print(f"[SCANNER] Cache load error: {e}")
+
+    def _populate_scanner_table(self, signals: list):
+        """Fyll scanner-tabellen med signaler."""
+        self.scanner_table.setSortingEnabled(False)
+        self.scanner_table.setRowCount(len(signals))
+
+        for row, sig in enumerate(signals):
+            # Ticker
+            ticker_item = QTableWidgetItem(sig['ticker'])
+            ticker_item.setForeground(QColor(COLORS['text_primary']))
+            self.scanner_table.setItem(row, 0, ticker_item)
+
+            # Strategy — färg per strategi
+            strategy_colors = {
+                'Pairs': '#d4a574',
+                'EPS Reversion': '#f59e0b',
+                'Markov': '#ec4899',
+                'TTM Squeeze': '#f97316',
+            }
+            strat_item = QTableWidgetItem(sig['strategy'])
+            strat_color = strategy_colors.get(sig['strategy'], COLORS['text_secondary'])
+            strat_item.setForeground(QColor(strat_color))
+            self.scanner_table.setItem(row, 1, strat_item)
+
+            # Signal
+            signal_item = QTableWidgetItem(sig['signal'])
+            self.scanner_table.setItem(row, 2, signal_item)
+
+            # Score — numerisk sortering (explicit float() för numpy-kompatibilitet)
+            score_val = float(sig['score']) if sig['score'] is not None else 0.0
+            score_item = QTableWidgetItem(f"{score_val:.2f}")
+            score_item.setData(Qt.UserRole, score_val)
+            if score_val >= 0.7:
+                score_item.setForeground(QColor(COLORS['positive']))
+            elif score_val >= 0.4:
+                score_item.setForeground(QColor(COLORS['warning']))
+            else:
+                score_item.setForeground(QColor(COLORS['text_muted']))
+            self.scanner_table.setItem(row, 3, score_item)
+
+            # Direction
+            dir_item = QTableWidgetItem(sig['direction'])
+            if sig['direction'] == 'LONG':
+                dir_item.setForeground(QColor(COLORS['positive']))
+            elif sig['direction'] == 'SHORT':
+                dir_item.setForeground(QColor(COLORS['negative']))
+            else:
+                dir_item.setForeground(QColor(COLORS['text_muted']))
+            self.scanner_table.setItem(row, 4, dir_item)
+
+            # Details
+            detail_item = QTableWidgetItem(sig['details'])
+            detail_item.setForeground(QColor(COLORS['text_secondary']))
+            self.scanner_table.setItem(row, 5, detail_item)
+
+            # Time
+            time_item = QTableWidgetItem(sig['time'])
+            time_item.setForeground(QColor(COLORS['text_muted']))
+            self.scanner_table.setItem(row, 6, time_item)
+
+            # Spara nav_index som data på första kolumnen
+            ticker_item.setData(Qt.UserRole, sig['nav_index'])
+
+        self.scanner_table.setSortingEnabled(True)
+
+    def _apply_scanner_filter(self):
+        """Filtrera scanner-tabellen baserat på valda filter."""
+        if not hasattr(self, '_scanner_signals'):
+            return
+        strategy_filter = self._scanner_strategy_filter.currentText()
+        direction_filter = self._scanner_direction_filter.currentText()
+        min_score = self._scanner_min_score.value()
+
+        filtered = []
+        strategy_map = {
+            'All Strategies': None,
+            'Pairs': 'Pairs',
+            'EPS Reversion': 'EPS Reversion',
+            'Markov': 'Markov',
+            'TTM Squeeze': 'TTM Squeeze',
+        }
+        direction_map = {
+            'All Directions': None,
+            'LONG': 'LONG',
+            'SHORT': 'SHORT',
+            'NEUTRAL': 'NEUTRAL',
+        }
+
+        strat_val = strategy_map.get(strategy_filter)
+        dir_val = direction_map.get(direction_filter)
+
+        for sig in self._scanner_signals:
+            if strat_val and sig['strategy'] != strat_val:
+                continue
+            if dir_val and sig['direction'] != dir_val:
+                continue
+            if sig['score'] < min_score:
+                continue
+            filtered.append(sig)
+
+        self._populate_scanner_table(filtered)
+
+    def _on_scanner_row_activated(self, index):
+        """Dubbelklick på scanner-rad → navigera till rätt strategi."""
+        row = index.row()
+        ticker_item = self.scanner_table.item(row, 0)
+        if ticker_item is None:
+            return
+        nav_index = ticker_item.data(Qt.UserRole)
+        if nav_index is not None:
+            self.navigate_to_page(nav_index)
+
     # ========================================================================
     # TAB 1: MARKET OVERVIEW
     # ========================================================================
@@ -8599,19 +10535,19 @@ class PairsTradingTerminal(QMainWindow):
         vol_cards_row.setSpacing(10)
 
         self.vix_card = VolatilityCard("^VIX", "VIX", "Fear Index")
-        vol_cards_row.addWidget(self.vix_card)
+        vol_cards_row.addWidget(self.vix_card, 1)
 
         self.vvix_card = VolatilityCard("^VVIX", "VVIX", "Vol of Vol")
-        vol_cards_row.addWidget(self.vvix_card)
+        vol_cards_row.addWidget(self.vvix_card, 1)
 
         self.skew_card = VolatilityCard("^SKEW", "SKEW", "Tail Risk")
-        vol_cards_row.addWidget(self.skew_card)
+        vol_cards_row.addWidget(self.skew_card, 1)
 
         self.vvix_vix_card = VolatilityCard("VVIX/VIX", "VVIX/VIX", "Vol Ratio")
-        vol_cards_row.addWidget(self.vvix_vix_card)
+        vol_cards_row.addWidget(self.vvix_vix_card, 1)
 
         self.move_card = VolatilityCard("^MOVE", "MOVE", "Bond Vol")
-        vol_cards_row.addWidget(self.move_card)
+        vol_cards_row.addWidget(self.move_card, 1)
 
         vol_section_layout.addLayout(vol_cards_row)
         center_layout.addWidget(vol_section)
@@ -9295,11 +11231,11 @@ class PairsTradingTerminal(QMainWindow):
             
             # Spread plot (wider — stretch 2 in row)
             zscore_col = QVBoxLayout()
-            zscore_col.addWidget(SectionHeader("SPREAD (Y − β·X − α)"))
+            zscore_col.addWidget(SectionHeader("Z-SCORE (Y − β·X − α)"))
             
             self.ou_zscore_date_axis = DateAxisItem(orientation='bottom')
             self.ou_zscore_plot = pg.PlotWidget(axisItems={'bottom': self.ou_zscore_date_axis})
-            self.ou_zscore_plot.setLabel('left', 'Spread')
+            self.ou_zscore_plot.setLabel('left', 'Z-Score')
             self.ou_zscore_plot.showGrid(x=False, y=False, alpha=0.3)
             self.ou_zscore_plot.setMinimumHeight(100)
             self.ou_zscore_plot.setMouseEnabled(x=True, y=True)
@@ -10048,14 +11984,14 @@ class PairsTradingTerminal(QMainWindow):
             right_layout.addWidget(self.signal_price_plot, stretch=2)
             
             # Spread plot
-            zscore_header = QLabel("SPREAD (Y − β·X − α)")
+            zscore_header = QLabel("Z-SCORE (Y − β·X − α)")
             zscore_header.setStyleSheet(f"color: {COLORS['accent']}; font-size: 12px; font-weight: 700; letter-spacing: 1px;")
             right_layout.addWidget(zscore_header)
             
             # Create date axis for spread plot
             self.signal_zscore_date_axis = DateAxisItem(orientation='bottom')
             self.signal_zscore_plot = pg.PlotWidget(axisItems={'bottom': self.signal_zscore_date_axis})
-            self.signal_zscore_plot.setLabel('left', 'Spread')
+            self.signal_zscore_plot.setLabel('left', 'Z-Score')
             self.signal_zscore_plot.showGrid(x=False, y=False, alpha=0.3)
             self.signal_zscore_plot.setMinimumHeight(120)
             self.signal_zscore_plot.setMouseEnabled(x=True, y=True)
@@ -10207,9 +12143,9 @@ class PairsTradingTerminal(QMainWindow):
         self.positions_table = QTableWidget()
         self.positions_table.setColumnCount(13)
         self.positions_table.setHorizontalHeaderLabels([
-            "PAIR", "DIRECTION", "Z-SCORE", "STATUS",
-            "Y LEG", "ENTRY PRICE", "QUANTITY", "P/L",
-            "X LEG", "ENTRY PRICE", "QUANTITY", "P/L",
+            "POSITION", "TYPE", "SIGNAL", "STATUS",
+            "LEG 1 (Y/CALL)", "ENTRY PRICE", "QUANTITY", "P/L",
+            "LEG 2 (X/PUT)", "ENTRY PRICE", "QUANTITY", "P/L",
             "CLOSE"
         ])
 
@@ -10630,8 +12566,8 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_matrix_grid.setSpacing(2)
         self.markov_matrix_grid.setContentsMargins(6, 6, 6, 6)
         self.markov_matrix_labels = {}
-        # Create 6×6 grid (header row + header col + 5×5 cells)
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        n_states = N_MARKOV_STATES if MARKOV_AVAILABLE else 2
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n_states)] if MARKOV_AVAILABLE else ['NEG', 'POS']
         # Corner
         corner = QLabel("")
         corner.setStyleSheet(f"background:transparent;border:none;")
@@ -10648,7 +12584,7 @@ class PairsTradingTerminal(QMainWindow):
             rh.setAlignment(Qt.AlignCenter)
             rh.setStyleSheet(f"color:{COLORS['accent']};font-size:11px;font-weight:600;background:transparent;border:none;")
             self.markov_matrix_grid.addWidget(rh, i + 1, 0)
-            for j in range(5):
+            for j in range(n_states):
                 cell = QLabel("-")
                 cell.setAlignment(Qt.AlignCenter)
                 cell.setFixedSize(52, 28)
@@ -10679,9 +12615,8 @@ class PairsTradingTerminal(QMainWindow):
                 forecast_row.addWidget(card)
                 self.markov_forecast_cards[s_id] = card
         else:
-            for s_id in range(5):
-                names = ['SD', 'D', 'F', 'U', 'SU']
-                card = CompactMetricCard(f"P({names[s_id]})", "-")
+            for s_id, name in enumerate(['NEG', 'POS']):
+                card = CompactMetricCard(f"P({name})", "-")
                 card.setFixedWidth(80)
                 forecast_row.addWidget(card)
                 self.markov_forecast_cards[s_id] = card
@@ -10732,8 +12667,9 @@ class PairsTradingTerminal(QMainWindow):
             h.setStyleSheet(f"color:{COLORS['text_muted']};font-size:10px;font-weight:600;text-transform:uppercase;background:transparent;border:none;")
             stats_grid.addWidget(h, 0, col_idx)
         self.markov_stats_labels = {}
-        state_shorts_full = ['SD', 'D', 'F', 'U', 'SU']
-        for row in range(5):
+        n_states = N_MARKOV_STATES if MARKOV_AVAILABLE else 2
+        state_shorts_full = [MARKOV_STATES[i]['short'] for i in range(n_states)] if MARKOV_AVAILABLE else ['NEG', 'POS']
+        for row in range(n_states):
             name_lbl = QLabel(state_shorts_full[row])
             name_lbl.setAlignment(Qt.AlignCenter)
             clr = MARKOV_STATES[row]['color'] if MARKOV_AVAILABLE else '#888'
@@ -10927,8 +12863,9 @@ class PairsTradingTerminal(QMainWindow):
     def _update_markov_matrix(self, r):
         """Update transition matrix grid cells with intensity coloring."""
         T = r.transition_matrix
-        for i in range(5):
-            for j in range(5):
+        n_st = T.shape[0]
+        for i in range(n_st):
+            for j in range(n_st):
                 val = T[i, j]
                 cell = self.markov_matrix_labels.get((i, j))
                 if cell is None:
@@ -10951,7 +12888,7 @@ class PairsTradingTerminal(QMainWindow):
 
     def _update_markov_forecast(self, r):
         """Update forecast probability cards."""
-        for s_id in range(5):
+        for s_id in range(r.n_states):
             card = self.markov_forecast_cards.get(s_id)
             if card is None:
                 continue
@@ -10994,7 +12931,7 @@ class PairsTradingTerminal(QMainWindow):
 
     def _update_markov_state_stats(self, r):
         """Update state statistics table."""
-        for s_id in range(5):
+        for s_id in range(r.n_states):
             st = r.state_stats.get(s_id, {})
             avg_ret = st.get('avg_return', 0)
             vol = st.get('volatility', 0)
@@ -11020,9 +12957,9 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_diag_range.set_value(f"{r.data_start}\n{r.data_end}")
         # Stationary dist compact
         if MARKOV_AVAILABLE:
-            parts = [f"{MARKOV_STATES[i]['short']}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+            parts = [f"{MARKOV_STATES[i]['short']}:{r.stationary_dist[i]:.0%}" for i in range(r.n_states)]
         else:
-            parts = [f"S{i}:{r.stationary_dist[i]:.0%}" for i in range(5)]
+            parts = [f"S{i}:{r.stationary_dist[i]:.0%}" for i in range(r.n_states)]
         self.markov_diag_stat.set_value(" ".join(parts))
 
     # ── Chart rendering ───────────────────────────────────────────────────
@@ -11065,7 +13002,7 @@ class PairsTradingTerminal(QMainWindow):
         if MARKOV_AVAILABLE:
             state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
 
-        for s_id in range(5):
+        for s_id in range(r.n_states):
             mask = states == s_id
             if not mask.any():
                 continue
@@ -11119,8 +13056,9 @@ class PairsTradingTerminal(QMainWindow):
         self.markov_heatmap_texts = []
 
         # Add text annotations
-        for i in range(5):
-            for j in range(5):
+        n_st = T.shape[0]
+        for i in range(n_st):
+            for j in range(n_st):
                 txt = pg.TextItem(f"{T[i, j]:.0%}", color='#ffffff', anchor=(0.5, 0.5))
                 txt.setPos(j + 0.5, i + 0.5)
                 txt.setFont(QFont('JetBrains Mono', 9))
@@ -11128,13 +13066,13 @@ class PairsTradingTerminal(QMainWindow):
                 self.markov_heatmap_texts.append(txt)
 
         # Axis labels
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n_st)] if MARKOV_AVAILABLE else [f'S{i}' for i in range(n_st)]
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
         y_axis = plot.getAxis('left')
         y_axis.setTicks([[(i + 0.5, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(0, 5)
-        plot.setYRange(0, 5)
+        plot.setXRange(0, n_st)
+        plot.setYRange(0, n_st)
 
     def _render_markov_forecast_bars(self, r, pg):
         """Chart 3: Next week forecast bar chart."""
@@ -11148,7 +13086,8 @@ class PairsTradingTerminal(QMainWindow):
         if MARKOV_AVAILABLE:
             state_colors = {k: v['color'] for k, v in MARKOV_STATES.items()}
 
-        for i in range(5):
+        n_st = r.n_states
+        for i in range(n_st):
             bar = pg.BarGraphItem(
                 x=[i], height=[probs[i]], width=0.6,
                 brush=pg.mkBrush(state_colors.get(i, '#888')),
@@ -11161,13 +13100,13 @@ class PairsTradingTerminal(QMainWindow):
             txt.setFont(QFont('JetBrains Mono', 9))
             plot.addItem(txt)
 
-        # Baseline at 20% (uniform)
-        plot.addLine(y=20, pen=pg.mkPen('#666666', width=1, style=Qt.DashLine))
+        # Baseline at uniform probability
+        plot.addLine(y=100.0 / n_st, pen=pg.mkPen('#666666', width=1, style=Qt.DashLine))
 
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n_st)] if MARKOV_AVAILABLE else [f'S{i}' for i in range(n_st)]
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(-0.5, 4.5)
+        plot.setXRange(-0.5, n_st - 0.5)
         plot.setYRange(0, max(probs) * 1.2 + 5)
 
     def _render_markov_horizon_chart(self, r, pg):
@@ -11184,8 +13123,9 @@ class PairsTradingTerminal(QMainWindow):
         offsets = [-bar_width, 0, bar_width]
         horizon_colors = [COLORS['accent'], COLORS['info'], COLORS['text_muted']]
 
+        n_st = r.n_states
         for h_idx, (label, probs) in enumerate(horizons):
-            x = np.arange(5) + offsets[h_idx]
+            x = np.arange(n_st) + offsets[h_idx]
             bar = pg.BarGraphItem(
                 x=x, height=probs * 100, width=bar_width,
                 brush=pg.mkBrush(horizon_colors[h_idx]),
@@ -11194,13 +13134,2074 @@ class PairsTradingTerminal(QMainWindow):
             )
             plot.addItem(bar)
 
-        state_shorts = ['SD', 'D', 'F', 'U', 'SU']
+        state_shorts = [MARKOV_STATES[i]['short'] for i in range(n_st)] if MARKOV_AVAILABLE else [f'S{i}' for i in range(n_st)]
         x_axis = plot.getAxis('bottom')
         x_axis.setTicks([[(i, s) for i, s in enumerate(state_shorts)]])
-        plot.setXRange(-0.5, 4.5)
+        plot.setXRange(-0.5, n_st - 0.5)
         max_val = max(r.forecast_probs.max(), r.forecast_2w.max(), r.forecast_4w.max()) * 100
         plot.setYRange(0, max_val * 1.2 + 5)
         plot.addLegend(offset=(10, 10))
+
+    # ========================================================================
+    # TAB 11: EPS MEAN REVERSION
+    # ========================================================================
+
+    def create_eps_reversion_tab(self) -> QWidget:
+        """Create EPS Mean Reversion tab with ticker input, screening table, and P/E charts."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 10, 15, 10)
+
+        # ── Top bar ──────────────────────────────────────────────────────
+        top_bar = QFrame()
+        top_bar.setStyleSheet(f"""
+            QFrame {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {COLORS['bg_elevated']}, stop:1 {COLORS['bg_card']});
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 6px;
+            }}
+        """)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(12, 8, 12, 8)
+        top_layout.setSpacing(10)
+
+        lbl = QLabel("TICKERS")
+        lbl.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;text-transform:uppercase;letter-spacing:1px;background:transparent;border:none;")
+        top_layout.addWidget(lbl)
+
+        self.eps_ticker_input = QLineEdit()
+        self.eps_ticker_input.setPlaceholderText("AAPL, MSFT, GOOG, JNJ, JPM, PG, XOM, V")
+        self.eps_ticker_input.setMinimumWidth(400)
+        self.eps_ticker_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLORS['bg_dark']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_default']};
+                border-radius: 4px;
+                padding: 5px 10px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 12px;
+            }}
+        """)
+        top_layout.addWidget(self.eps_ticker_input)
+
+        self.eps_run_btn = QPushButton("ANALYZE EPS")
+        self.eps_run_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none; border-radius: 4px;
+                padding: 6px 18px; font-weight: 600; font-size: 12px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_bright']}; }}
+            QPushButton:disabled {{ background: {COLORS['text_disabled']}; color: {COLORS['text_muted']}; }}
+        """)
+        self.eps_run_btn.clicked.connect(self.run_eps_mr_analysis)
+        top_layout.addWidget(self.eps_run_btn)
+
+        self.eps_status_label = QLabel("")
+        self.eps_status_label.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;background:transparent;border:none;")
+        top_layout.addWidget(self.eps_status_label)
+        top_layout.addStretch()
+
+        self.eps_card_tickers = CompactMetricCard("TICKERS", "-")
+        self.eps_card_signals = CompactMetricCard("SIGNALS", "-")
+        self.eps_card_underval = CompactMetricCard("UNDERVALUED", "-")
+        self.eps_card_overval = CompactMetricCard("OVERVALUED", "-")
+        for card in [self.eps_card_tickers, self.eps_card_signals,
+                     self.eps_card_underval, self.eps_card_overval]:
+            card.setFixedWidth(140)
+            top_layout.addWidget(card)
+
+        main_layout.addWidget(top_bar)
+
+        # ── Splitter ─────────────────────────────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(3)
+        splitter.setStyleSheet(f"QSplitter::handle {{ background: {COLORS['border_subtle']}; }}")
+
+        # ── LEFT: Screening table ────────────────────────────────────────
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(5, 5, 10, 5)
+        left_layout.setSpacing(8)
+
+        left_layout.addWidget(SectionHeader("EPS SCREENING"))
+        self.eps_screening_table = QTableWidget()
+        self.eps_screening_table.setColumnCount(9)
+        self.eps_screening_table.setHorizontalHeaderLabels(
+            ["Ticker", "Spr Z", "ADF p", "HL(d)", "R²", "Hurst", "β", "Pass", "Signal"])
+        self.eps_screening_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.eps_screening_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.eps_screening_table.setAlternatingRowColors(True)
+        self.eps_screening_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {COLORS['bg_card']};
+                alternate-background-color: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                gridline-color: {COLORS['border_subtle']};
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 11px;
+            }}
+            QTableWidget::item {{ padding: 3px 6px; }}
+            QHeaderView::section {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['accent']};
+                font-weight: 600; font-size: 10px;
+                border: none; border-bottom: 1px solid {COLORS['border_subtle']};
+                padding: 4px;
+            }}
+        """)
+        self.eps_screening_table.currentCellChanged.connect(self._on_eps_ticker_selected)
+        left_layout.addWidget(self.eps_screening_table)
+        splitter.addWidget(left_widget)
+
+        # ── RIGHT: Charts ────────────────────────────────────────────────
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(8)
+
+        pg = get_pyqtgraph()
+        if pg is not None:
+            DateAxisItem = get_date_axis_item_class()
+
+            right_layout.addWidget(SectionHeader("PRICE & TTM EPS"))
+            self.eps_pe_date_axis = DateAxisItem(orientation='bottom')
+            self.eps_pe_plot = pg.PlotWidget(
+                axisItems={'bottom': self.eps_pe_date_axis})
+            self.eps_pe_plot.setMinimumHeight(200)
+            self.eps_pe_plot.showGrid(x=True, y=True, alpha=0.15)
+            # Sekundär y-axel för EPS
+            self.eps_pe_plot.setLabel('left', 'Price', color=COLORS['accent'])
+            self._eps_vb2 = pg.ViewBox()
+            self.eps_pe_plot.scene().addItem(self._eps_vb2)
+            self.eps_pe_plot.getAxis('right').linkToView(self._eps_vb2)
+            self._eps_vb2.setXLink(self.eps_pe_plot)
+            self.eps_pe_plot.getAxis('right').setLabel('TTM EPS', color='#22c55e')
+            self.eps_pe_plot.showAxis('right')
+            # Synka viewboxar vid resize
+            self.eps_pe_plot.getViewBox().sigResized.connect(
+                lambda: self._eps_vb2.setGeometry(self.eps_pe_plot.getViewBox().sceneBoundingRect()))
+            right_layout.addWidget(self.eps_pe_plot)
+
+            right_layout.addWidget(SectionHeader("PRICE vs EPS SPREAD (Z-SCORE)"))
+            self.eps_spread_date_axis = DateAxisItem(orientation='bottom')
+            self.eps_spread_plot = pg.PlotWidget(
+                axisItems={'bottom': self.eps_spread_date_axis})
+            self.eps_spread_plot.setMinimumHeight(200)
+            self.eps_spread_plot.showGrid(x=True, y=True, alpha=0.15)
+            right_layout.addWidget(self.eps_spread_plot)
+        else:
+            right_layout.addWidget(QLabel("Install pyqtgraph for charts"))
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([450, 550])
+        main_layout.addWidget(splitter)
+
+        return tab
+
+    # ── EPS worker methods ───────────────────────────────────────────────
+
+    def run_eps_mr_analysis(self):
+        if not EPS_MR_AVAILABLE:
+            self.eps_status_label.setText("eps_mean_reversion.py not found")
+            return
+        if self._eps_mr_running:
+            self.eps_status_label.setText("Already running...")
+            return
+
+        # Get tickers from input or use defaults
+        raw = self.eps_ticker_input.text().strip()
+        if raw:
+            tickers = [t.strip().upper() for t in raw.replace(';', ',').split(',') if t.strip()]
+        else:
+            tickers = ["AAPL", "MSFT", "GOOG", "JNJ", "JPM", "PG", "XOM", "V"]
+            self.eps_ticker_input.setText(", ".join(tickers))
+
+        if not tickers:
+            self.eps_status_label.setText("Enter at least one ticker")
+            return
+
+        self._eps_mr_running = True
+        self.eps_run_btn.setEnabled(False)
+        self.eps_status_label.setText(f"Analyzing {len(tickers)} tickers...")
+
+        self._eps_mr_thread = QThread()
+        self._eps_mr_worker = EPSMeanReversionWorker(tickers)
+        self._eps_mr_worker.moveToThread(self._eps_mr_thread)
+
+        self._eps_mr_thread.started.connect(self._eps_mr_worker.run)
+        self._eps_mr_worker.progress.connect(self._on_eps_mr_progress)
+        self._eps_mr_worker.result.connect(self._on_eps_mr_result)
+        self._eps_mr_worker.error.connect(self._on_eps_mr_error)
+        self._eps_mr_worker.finished.connect(self._on_eps_mr_finished)
+        self._eps_mr_worker.finished.connect(self._eps_mr_thread.quit)
+
+        self._eps_mr_thread.start()
+
+    def _on_eps_mr_progress(self, pct, msg):
+        if hasattr(self, 'eps_status_label'):
+            self.eps_status_label.setText(f"[{pct}%] {msg}")
+
+    def _on_eps_mr_error(self, msg):
+        print(f"[SCANNER] EPS MR error: {msg}")
+        self._eps_mr_running = False
+        if hasattr(self, 'eps_status_label'):
+            self.eps_status_label.setText(f"Error: {msg}")
+            self.eps_status_label.setStyleSheet(f"color:{COLORS['negative']};font-size:11px;background:transparent;border:none;")
+
+    def _on_eps_mr_finished(self):
+        self._eps_mr_running = False
+        if hasattr(self, 'eps_run_btn'):
+            self.eps_run_btn.setEnabled(True)
+
+    def _on_eps_mr_result(self, result):
+        self._eps_mr_result = result
+
+        if not hasattr(self, 'eps_card_tickers'):
+            return
+
+        data, df, pe_analyses = result
+        self._eps_mr_data = data
+        self._eps_mr_pe_analyses = pe_analyses
+
+        n_tickers = len(data)
+        n_signals = len(df[df['Signal'] != 'Neutral']) if len(df) > 0 else 0
+        n_under = len(df[df['Signal'].str.contains('Undervärderad', na=False)]) if len(df) > 0 else 0
+        n_over = len(df[df['Signal'].str.contains('Övervärderad', na=False)]) if len(df) > 0 else 0
+
+        self.eps_status_label.setText(f"Complete — {n_tickers} tickers analyzed")
+        self.eps_status_label.setStyleSheet(f"color:{COLORS['positive']};font-size:11px;background:transparent;border:none;")
+        self.eps_card_tickers.set_value(str(n_tickers))
+        self.eps_card_signals.set_value(str(n_signals), COLORS['accent'] if n_signals > 0 else COLORS['text_muted'])
+        self.eps_card_underval.set_value(str(n_under), COLORS['positive'] if n_under > 0 else COLORS['text_muted'])
+        self.eps_card_overval.set_value(str(n_over), COLORS['negative'] if n_over > 0 else COLORS['text_muted'])
+
+        # Populate screening table
+        self._update_eps_screening_table(df)
+
+    def _update_eps_screening_table(self, df):
+        """Populate EPS screening table."""
+        self.eps_screening_table.setRowCount(len(df))
+        for row in range(len(df)):
+            r = df.iloc[row]
+            for col, key in enumerate(["Ticker", "Spr Z", "ADF p", "HL(d)", "R²", "Hurst", "β", "Pass", "Signal"]):
+                val = r.get(key, "")
+                item = QTableWidgetItem(str(val) if val is not None else "-")
+
+                # Color coding
+                if key == "Signal":
+                    if "Undervärderad" in str(val):
+                        item.setForeground(QColor(COLORS['positive']))
+                    elif "Övervärderad" in str(val):
+                        item.setForeground(QColor(COLORS['negative']))
+                elif key == "Spr Z":
+                    try:
+                        z = float(val)
+                        item.setForeground(QColor(COLORS['positive'] if z < -1 else COLORS['negative'] if z > 1 else COLORS['text_primary']))
+                    except (ValueError, TypeError):
+                        pass
+                elif key == "ADF p":
+                    try:
+                        p = float(val)
+                        item.setForeground(QColor(COLORS['positive'] if p <= 0.10 else COLORS['text_muted']))
+                    except (ValueError, TypeError):
+                        pass
+                elif key == "Pass":
+                    if "4/4" in str(val):
+                        item.setForeground(QColor(COLORS['positive']))
+                    elif "3/4" in str(val):
+                        item.setForeground(QColor(COLORS['accent']))
+
+                self.eps_screening_table.setItem(row, col, item)
+
+    def _on_eps_ticker_selected(self, row, col, prev_row, prev_col):
+        """Handle ticker selection in EPS table — update P/E and spread charts."""
+        if self._eps_mr_result is None or row < 0:
+            return
+
+        data, df, pe_analyses = self._eps_mr_result
+        if row >= len(df):
+            return
+
+        ticker = df.iloc[row]['Ticker']
+        if ticker not in data:
+            return
+
+        self._render_eps_charts(ticker, data[ticker], pe_analyses.get(ticker))
+
+    def _render_eps_charts(self, ticker, ticker_data, pe_analysis):
+        """Render Price+EPS (dual axis) and spread Z-score charts for selected ticker."""
+        pg = get_pyqtgraph()
+        if pg is None:
+            return
+
+        # Chart 1: Price (vänster y-axel) + TTM EPS (höger y-axel)
+        if hasattr(self, 'eps_pe_plot'):
+            plot = self.eps_pe_plot
+            plot.clear()
+            self._eps_vb2.clear()
+
+            price = ticker_data.get('price')
+            ttm_eps = ticker_data.get('ttm_eps')
+
+            if price is not None and len(price) > 0:
+                # Gemensamt index (price har daglig data, ttm_eps interpolerad)
+                if ttm_eps is not None and len(ttm_eps) > 0:
+                    common = price.index.intersection(ttm_eps.index)
+                    price_plot = price.loc[common]
+                    eps_plot = ttm_eps.loc[common]
+                else:
+                    price_plot = price
+                    eps_plot = None
+
+                x = np.arange(len(price_plot))
+                self.eps_pe_date_axis.set_dates(price_plot.index)
+
+                # Price på primär y-axel
+                price_y = price_plot.values.flatten().astype(float)
+                plot.plot(x, price_y, pen=pg.mkPen(COLORS['accent'], width=2), name=f'{ticker} Price')
+
+                # TTM EPS på sekundär y-axel
+                if eps_plot is not None and len(eps_plot) > 0:
+                    eps_y = eps_plot.values.flatten().astype(float)
+                    eps_curve = pg.PlotCurveItem(x, eps_y,
+                                                  pen=pg.mkPen('#22c55e', width=2), name='TTM EPS')
+                    self._eps_vb2.addItem(eps_curve)
+                    # Synka geometry
+                    self._eps_vb2.setGeometry(plot.getViewBox().sceneBoundingRect())
+                    # Autoscale EPS-axeln
+                    self._eps_vb2.enableAutoRange(axis=pg.ViewBox.YAxis)
+
+                # Aktuella värden
+                curr_price = float(price_plot.iloc[-1])
+                label_parts = [f"Price: {curr_price:,.1f}"]
+                if eps_plot is not None and len(eps_plot) > 0:
+                    curr_eps = float(eps_plot.iloc[-1])
+                    label_parts.append(f"EPS: {curr_eps:.2f}")
+                    if curr_eps > 0:
+                        label_parts.append(f"P/E: {curr_price/curr_eps:.1f}")
+                txt = pg.TextItem('\n'.join(label_parts), color='#e8e8e8', anchor=(1, 0))
+                txt.setPos(len(price_plot) - 1, price_plot.iloc[-1])
+                txt.setFont(QFont('JetBrains Mono', 9))
+                plot.addItem(txt)
+
+        # Chart 2: Price-EPS spread Z-score
+        if hasattr(self, 'eps_spread_plot'):
+            plot = self.eps_spread_plot
+            plot.clear()
+
+            spread_result = analyze_spread_mean_reversion(ticker_data['price'], ticker_data['ttm_eps'])
+            if spread_result and 'spread' in spread_result:
+                spread = spread_result['spread']
+                s_mean = spread_result['spread_mean']
+                s_std = spread_result['spread_std']
+
+                # Normalize to z-score
+                z_series = (spread - s_mean) / s_std if s_std > 0 else spread * 0
+                x = np.arange(len(z_series))
+                self.eps_spread_date_axis.set_dates(z_series.index)
+                plot.plot(x, z_series.values, pen=pg.mkPen(COLORS['accent'], width=2), name='Spread Z')
+
+                # Horisontella linjer vid z=0, ±1, ±2
+                plot.addLine(y=0, pen=pg.mkPen('#888888', width=1))
+                plot.addLine(y=1, pen=pg.mkPen(COLORS['negative'], width=1, style=Qt.DashLine))
+                plot.addLine(y=-1, pen=pg.mkPen(COLORS['positive'], width=1, style=Qt.DashLine))
+                plot.addLine(y=2, pen=pg.mkPen(COLORS['negative'], width=1, style=Qt.DotLine))
+                plot.addLine(y=-2, pen=pg.mkPen(COLORS['positive'], width=1, style=Qt.DotLine))
+
+                # Aktuellt värde
+                txt = pg.TextItem(f"Z: {spread_result['z_score']:.2f}\nHL: {spread_result['half_life']:.0f}d",
+                                  color='#e8e8e8', anchor=(1, 0))
+                txt.setPos(len(z_series) - 1, z_series.iloc[-1])
+                txt.setFont(QFont('JetBrains Mono', 9))
+                plot.addItem(txt)
+
+    # ========================================================================
+    # TTM SQUEEZE
+    # ========================================================================
+
+    def create_squeeze_tab(self) -> QWidget:
+        """Create TTM Squeeze tab with scanner table and charts."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(10, 6, 10, 6)
+
+        # ── Top bar (compact) ─────────────────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(10)
+
+        self.squeeze_run_btn = QPushButton("ANALYZE SQUEEZE")
+        self.squeeze_run_btn.setFixedHeight(28)
+        self.squeeze_run_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_darkest']};
+                border: none; border-radius: 4px;
+                padding: 4px 16px; font-weight: 600; font-size: 11px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: {COLORS['accent_bright']}; }}
+            QPushButton:disabled {{ background: {COLORS['text_disabled']}; color: {COLORS['text_muted']}; }}
+        """)
+        self.squeeze_run_btn.clicked.connect(self.run_squeeze_analysis)
+        top_row.addWidget(self.squeeze_run_btn)
+
+        self.squeeze_open_pos_btn = QPushButton("OPEN STRADDLE")
+        self.squeeze_open_pos_btn.setFixedHeight(28)
+        self.squeeze_open_pos_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['positive']};
+                color: {COLORS['bg_darkest']};
+                border: none; border-radius: 4px;
+                padding: 4px 16px; font-weight: 600; font-size: 11px; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: #4ade80; }}
+            QPushButton:disabled {{ background: {COLORS['text_disabled']}; color: {COLORS['text_muted']}; }}
+        """)
+        self.squeeze_open_pos_btn.clicked.connect(self._open_straddle_dialog)
+        self.squeeze_open_pos_btn.setEnabled(False)
+        top_row.addWidget(self.squeeze_open_pos_btn)
+
+        self.squeeze_status_label = QLabel("")
+        self.squeeze_status_label.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;")
+        top_row.addWidget(self.squeeze_status_label)
+        top_row.addStretch()
+
+        self.squeeze_card_total = CompactMetricCard("TICKERS", "-")
+        self.squeeze_card_squeezing = CompactMetricCard("SQUEEZING", "-")
+        for card in [self.squeeze_card_total, self.squeeze_card_squeezing]:
+            card.setFixedWidth(100)
+            card.setFixedHeight(36)
+            top_row.addWidget(card)
+
+        main_layout.addLayout(top_row)
+
+        # ── Shared scroll CSS ─────────────────────────────────────────────
+        scroll_css = f"""
+            QScrollArea {{
+                background: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+            }}
+            QScrollBar:vertical {{
+                background: {COLORS['bg_dark']}; width: 8px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['text_disabled']}; border-radius: 4px;
+            }}
+            QScrollBar:horizontal {{
+                background: {COLORS['bg_dark']}; height: 8px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {COLORS['text_disabled']}; border-radius: 4px;
+            }}
+        """
+        table_css = f"""
+            QTableWidget {{
+                background: {COLORS['bg_card']};
+                alternate-background-color: {COLORS['bg_elevated']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 4px;
+                gridline-color: {COLORS['border_subtle']};
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 11px;
+            }}
+            QTableWidget::item {{ padding: 3px 6px; }}
+            QHeaderView::section {{
+                background: {COLORS['bg_elevated']};
+                color: {COLORS['accent']};
+                font-weight: 600; font-size: 10px;
+                border: none; border-bottom: 1px solid {COLORS['border_subtle']};
+                padding: 4px;
+            }}
+        """
+
+        # ── MAIN VERTICAL SPLITTER (top row / bottom row) ───────────────
+        v_splitter = QSplitter(Qt.Vertical)
+        v_splitter.setHandleWidth(3)
+        v_splitter.setStyleSheet(f"QSplitter::handle {{ background: {COLORS['border_subtle']}; }}")
+
+        # ════════════════════════════════════════════════════════════════
+        # TOP ROW: Scanner (left) | Price Chart (right)
+        # ════════════════════════════════════════════════════════════════
+        top_splitter = QSplitter(Qt.Horizontal)
+        top_splitter.setHandleWidth(3)
+        top_splitter.setStyleSheet(f"QSplitter::handle {{ background: {COLORS['border_subtle']}; }}")
+
+        # ── TOP-LEFT: Squeeze Scanner table ──
+        tl_widget = QWidget()
+        tl_layout = QVBoxLayout(tl_widget)
+        tl_layout.setContentsMargins(4, 4, 4, 4)
+        tl_layout.setSpacing(4)
+        tl_layout.addWidget(SectionHeader("SQUEEZE SCANNER"))
+
+        self.squeeze_table = QTableWidget()
+        self.squeeze_table.setColumnCount(7)
+        self.squeeze_table.setHorizontalHeaderLabels(
+            ["Ticker", "Signal", "Sqz Days", "Strike", "Straddle", "Cost%", "IV%"])
+        self.squeeze_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.squeeze_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.squeeze_table.setAlternatingRowColors(True)
+        self.squeeze_table.setStyleSheet(table_css)
+        self.squeeze_table.currentCellChanged.connect(self._on_squeeze_ticker_selected)
+        tl_layout.addWidget(self.squeeze_table, 1)
+        top_splitter.addWidget(tl_widget)
+
+        # ── TOP-RIGHT: Tabs (Price Chart | Vol Surface) ──
+        tr_widget = QWidget()
+        tr_layout = QVBoxLayout(tr_widget)
+        tr_layout.setContentsMargins(4, 4, 4, 4)
+        tr_layout.setSpacing(0)
+
+        self.squeeze_chart_tabs = QTabWidget()
+        self.squeeze_chart_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ border: none; }}
+            QTabBar::tab {{
+                background: {COLORS['bg_elevated']}; color: {COLORS['text_muted']};
+                padding: 6px 16px; border: none; font-size: 11px; font-weight: 600;
+            }}
+            QTabBar::tab:selected {{
+                background: {COLORS['bg_card']}; color: {COLORS['accent']};
+                border-bottom: 2px solid {COLORS['accent']};
+            }}
+        """)
+
+        # Tab 1: Price + BB/KC chart
+        chart_tab = QWidget()
+        chart_layout = QVBoxLayout(chart_tab)
+        chart_layout.setContentsMargins(0, 4, 0, 0)
+        chart_layout.setSpacing(0)
+
+        pg = get_pyqtgraph()
+        if pg is not None:
+            DateAxisItem = get_date_axis_item_class()
+            self.squeeze_price_date_axis = DateAxisItem(orientation='bottom')
+            self.squeeze_price_plot = pg.PlotWidget(
+                axisItems={'bottom': self.squeeze_price_date_axis})
+            self.squeeze_price_plot.showGrid(x=True, y=True, alpha=0.15)
+            self.squeeze_price_plot.addLegend(offset=(10, 10))
+            chart_layout.addWidget(self.squeeze_price_plot, 1)
+        else:
+            chart_layout.addWidget(QLabel("Install pyqtgraph for charts"))
+        self.squeeze_chart_tabs.addTab(chart_tab, "PRICE + BB/KC")
+
+        # Tab 2: Volatility Surface
+        surface_tab = QWidget()
+        surface_layout = QVBoxLayout(surface_tab)
+        surface_layout.setContentsMargins(0, 4, 0, 0)
+        surface_layout.setSpacing(0)
+
+        if WEBENGINE_AVAILABLE:
+            self.vol_surface_view = QWebEngineView()
+            self.vol_surface_view.setStyleSheet(f"background: {COLORS['bg_card']};")
+            self.vol_surface_view.setHtml(
+                f"<body style='background:{COLORS['bg_card']};color:{COLORS['text_muted']};"
+                f"font-family:monospace;display:flex;align-items:center;justify-content:center;"
+                f"height:100vh;margin:0'><p>Select a ticker to load vol surface</p></body>")
+            surface_layout.addWidget(self.vol_surface_view, 1)
+        else:
+            surface_layout.addWidget(QLabel("Install QtWebEngine for vol surface"))
+        self.squeeze_chart_tabs.addTab(surface_tab, "VOL SURFACE")
+
+        tr_layout.addWidget(self.squeeze_chart_tabs, 1)
+        top_splitter.addWidget(tr_widget)
+
+        top_splitter.setSizes([280, 720])
+        v_splitter.addWidget(top_splitter)
+
+        # ════════════════════════════════════════════════════════════════
+        # BOTTOM ROW: Straddle Pricing (left) | Key Insights (right)
+        # ════════════════════════════════════════════════════════════════
+        bot_splitter = QSplitter(Qt.Horizontal)
+        bot_splitter.setHandleWidth(3)
+        bot_splitter.setStyleSheet(f"QSplitter::handle {{ background: {COLORS['border_subtle']}; }}")
+
+        # ── BOTTOM-LEFT: Straddle Pricing ──
+        bl_widget = QWidget()
+        bl_layout = QVBoxLayout(bl_widget)
+        bl_layout.setContentsMargins(2, 2, 2, 2)
+        bl_layout.setSpacing(2)
+        bl_layout.addWidget(SectionHeader("STRADDLE PRICING"))
+
+        self.squeeze_options_label = QLabel("Run squeeze scan to load options data")
+        self.squeeze_options_label.setTextFormat(Qt.RichText)
+        self.squeeze_options_label.setOpenExternalLinks(True)
+        self.squeeze_options_label.setWordWrap(False)
+        self.squeeze_options_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.squeeze_options_label.setStyleSheet(f"""
+            color: {COLORS['text_muted']}; font-size: 13px;
+            font-family: 'JetBrains Mono', monospace;
+            background: {COLORS['bg_card']};
+            padding: 2px 4px;
+        """)
+        options_scroll = QScrollArea()
+        options_scroll.setWidget(self.squeeze_options_label)
+        options_scroll.setWidgetResizable(True)
+        options_scroll.setStyleSheet(scroll_css)
+        bl_layout.addWidget(options_scroll, 1)
+        bot_splitter.addWidget(bl_widget)
+
+        # ── BOTTOM-RIGHT: Key Insights ──
+        br_widget = QWidget()
+        br_layout = QVBoxLayout(br_widget)
+        br_layout.setContentsMargins(4, 4, 4, 4)
+        br_layout.setSpacing(4)
+        br_layout.addWidget(SectionHeader("KEY INSIGHTS"))
+
+        self.squeeze_insights_label = QLabel("Select a ticker to view insights")
+        self.squeeze_insights_label.setTextFormat(Qt.RichText)
+        self.squeeze_insights_label.setWordWrap(True)
+        self.squeeze_insights_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.squeeze_insights_label.setStyleSheet(f"""
+            color: {COLORS['text_primary']}; font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            background: {COLORS['bg_card']};
+            padding: 10px;
+        """)
+        insights_scroll = QScrollArea()
+        insights_scroll.setWidget(self.squeeze_insights_label)
+        insights_scroll.setWidgetResizable(True)
+        insights_scroll.setStyleSheet(scroll_css)
+        br_layout.addWidget(insights_scroll, 1)
+        bot_splitter.addWidget(br_widget)
+
+        bot_splitter.setSizes([680, 320])
+        v_splitter.addWidget(bot_splitter)
+
+        v_splitter.setSizes([450, 450])
+        main_layout.addWidget(v_splitter)
+
+        return tab
+
+    def run_squeeze_analysis(self):
+        """Launch TTM Squeeze analysis on OMXS Large Cap tickers."""
+        if not SQUEEZE_AVAILABLE:
+            if hasattr(self, 'squeeze_status_label'):
+                self.squeeze_status_label.setText("squeeze.py not found")
+            return
+        if self._squeeze_running:
+            return
+
+        self._squeeze_running = True
+        if hasattr(self, 'squeeze_run_btn'):
+            self.squeeze_run_btn.setEnabled(False)
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText("Downloading OMXS Large Cap data...")
+
+        from app_config import OMXS_LARGE_CAP
+        self._squeeze_thread = QThread()
+        self._squeeze_worker = SqueezeWorker(OMXS_LARGE_CAP)
+        self._squeeze_worker.moveToThread(self._squeeze_thread)
+
+        self._squeeze_thread.started.connect(self._squeeze_worker.run)
+        self._squeeze_worker.progress.connect(self._on_squeeze_progress)
+        self._squeeze_worker.result.connect(self._on_squeeze_result)
+        self._squeeze_worker.error.connect(self._on_squeeze_error)
+        self._squeeze_worker.finished.connect(self._on_squeeze_finished)
+        self._squeeze_worker.finished.connect(self._squeeze_thread.quit)
+
+        self._squeeze_thread.start()
+
+    def _on_squeeze_progress(self, pct, msg):
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(f"[{pct}%] {msg}")
+
+    def _on_squeeze_error(self, msg):
+        print(f"[SCANNER] TTM Squeeze error: {msg}")
+        self._squeeze_running = False
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(f"Error: {msg}")
+            self.squeeze_status_label.setStyleSheet(f"color:{COLORS['negative']};font-size:11px;background:transparent;border:none;")
+
+    def _on_squeeze_finished(self):
+        self._squeeze_running = False
+        if hasattr(self, 'squeeze_run_btn'):
+            self.squeeze_run_btn.setEnabled(True)
+
+    def _on_squeeze_result(self, result):
+        self._squeeze_result = result
+        n_squeeze = result.n_squeeze_on + result.n_squeeze_firing
+        print(f"[SQUEEZE] Complete: {result.n_total} tickers, {n_squeeze} in squeeze")
+
+        if not hasattr(self, 'squeeze_card_total'):
+            return
+
+        self.squeeze_status_label.setText(f"Complete — {n_squeeze} in squeeze")
+        self.squeeze_status_label.setStyleSheet(
+            f"color:{COLORS['positive']};font-size:11px;")
+
+        self.squeeze_card_total.set_value(str(result.n_total))
+        sqz_color = COLORS['warning'] if n_squeeze > 0 else COLORS['text_muted']
+        self.squeeze_card_squeezing.set_value(str(n_squeeze), sqz_color)
+
+        # Populate table
+        self._populate_squeeze_table(result)
+
+        # Auto-fetch options data
+        if OPTIONS_AVAILABLE:
+            self._run_options_fetch(result)
+
+    def _populate_squeeze_table(self, result):
+        """Fill squeeze scanner table — only tickers in squeeze, filtered to .ST."""
+        df = result.summary
+        if df is None or df.empty:
+            self.squeeze_table.setRowCount(0)
+            return
+
+        # Bara tickers i aktiv squeeze (SQUEEZE_ON eller SQUEEZE_FIRE_*), filtrera bort NO_SQUEEZE + icke-.ST
+        squeeze_df = df[
+            (df['Signal'] != 'NO_SQUEEZE') &
+            (df['Ticker'].str.endswith('.ST', na=False))
+        ].copy()
+
+        self.squeeze_table.setSortingEnabled(False)
+        self.squeeze_table.setRowCount(len(squeeze_df))
+
+        for row_idx, (_, row) in enumerate(squeeze_df.iterrows()):
+            # Ticker
+            ticker_item = QTableWidgetItem(str(row.get('Ticker', '')))
+            ticker_item.setForeground(QColor(COLORS['text_primary']))
+            self.squeeze_table.setItem(row_idx, 0, ticker_item)
+
+            # Signal
+            signal_item = QTableWidgetItem('SQUEEZE')
+            signal_item.setForeground(QColor(COLORS['warning']))
+            self.squeeze_table.setItem(row_idx, 1, signal_item)
+
+            # Sqz Days
+            sqz_days = int(row.get('Sqz Days', 0) or 0)
+            days_item = QTableWidgetItem(str(sqz_days) if sqz_days > 0 else '-')
+            days_item.setData(Qt.UserRole, sqz_days)
+            days_item.setForeground(QColor(COLORS['text_primary']))
+            self.squeeze_table.setItem(row_idx, 2, days_item)
+
+            # Options-kolumner fylls i senare av _update_squeeze_table_options
+            for col in (3, 4, 5, 6):
+                item = QTableWidgetItem('-')
+                item.setForeground(QColor(COLORS['text_disabled']))
+                self.squeeze_table.setItem(row_idx, col, item)
+
+        self.squeeze_table.setSortingEnabled(True)
+
+    def _on_squeeze_ticker_selected(self, row, col, prev_row, prev_col):
+        """Render charts and options panel for selected ticker."""
+        if row < 0 or self._squeeze_result is None:
+            return
+        ticker_item = self.squeeze_table.item(row, 0)
+        if ticker_item is None:
+            return
+        ticker = ticker_item.text()
+        if ticker in self._squeeze_result.ticker_results:
+            self._render_squeeze_charts(self._squeeze_result.ticker_results[ticker])
+        # Update options panel + insights
+        if self._options_data:
+            self._update_options_panel(ticker)
+            self._load_vol_surface(ticker)
+        self._update_squeeze_insights(ticker)
+        # Enable open straddle button
+        if hasattr(self, 'squeeze_open_pos_btn'):
+            has_opts = bool(self._options_data.get(ticker, {}).get('atm_straddles') is not None)
+            self.squeeze_open_pos_btn.setEnabled(has_opts)
+
+    def _render_squeeze_charts(self, tr):
+        """Render price+bands and momentum charts for a ticker."""
+        pg = get_pyqtgraph()
+        if pg is None:
+            return
+
+        # ── Chart 1: Price + BB + KC ────────────────────────────────────
+        if hasattr(self, 'squeeze_price_plot') and len(tr.price) > 0:
+            plot = self.squeeze_price_plot
+            plot.clear()
+            # Visa senaste 252 dagar
+            n_show = min(252, len(tr.price))
+            price = tr.price.iloc[-n_show:]
+            bb_u = tr.bb_upper.iloc[-n_show:]
+            bb_l = tr.bb_lower.iloc[-n_show:]
+            bb_m = tr.bb_mid.iloc[-n_show:]
+            kc_u = tr.kc_upper.iloc[-n_show:]
+            kc_l = tr.kc_lower.iloc[-n_show:]
+            sqz = tr.squeeze_hist.iloc[-n_show:]
+
+            x = np.arange(len(price))
+            self.squeeze_price_date_axis.set_dates(price.index)
+
+            # Price
+            plot.plot(x, price.values.flatten().astype(float),
+                      pen=pg.mkPen(COLORS['accent'], width=2), name=f'{tr.ticker}')
+            # BB
+            plot.plot(x, bb_u.values.flatten().astype(float),
+                      pen=pg.mkPen('#e74c3c', width=1, style=Qt.DashLine), name='BB Upper')
+            plot.plot(x, bb_l.values.flatten().astype(float),
+                      pen=pg.mkPen('#e74c3c', width=1, style=Qt.DashLine), name='BB Lower')
+            # KC
+            plot.plot(x, kc_u.values.flatten().astype(float),
+                      pen=pg.mkPen('#3b82f6', width=1, style=Qt.DotLine), name='KC Upper')
+            plot.plot(x, kc_l.values.flatten().astype(float),
+                      pen=pg.mkPen('#3b82f6', width=1, style=Qt.DotLine), name='KC Lower')
+            # SMA midline
+            plot.plot(x, bb_m.values.flatten().astype(float),
+                      pen=pg.mkPen('#888888', width=1))
+
+            # Squeeze-bakgrund: markera perioder där squeeze är on (höjd = BB-banden)
+            sqz_vals = sqz.values.flatten().astype(float)
+            bb_u_vals = bb_u.values.flatten().astype(float)
+            bb_l_vals = bb_l.values.flatten().astype(float)
+            for i in range(len(sqz_vals)):
+                if sqz_vals[i] > 0.5:
+                    bar_bottom = bb_l_vals[i] if not np.isnan(bb_l_vals[i]) else 0
+                    bar_top = bb_u_vals[i] if not np.isnan(bb_u_vals[i]) else 0
+                    bar_h = bar_top - bar_bottom
+                    if bar_h > 0:
+                        bar = pg.BarGraphItem(x=[i], height=[bar_h],
+                                              width=1, y0=bar_bottom,
+                                              brush=pg.mkBrush(255, 165, 0, 25))
+                        plot.addItem(bar)
+
+            # Info text
+            sqz_label = 'SQUEEZE' if (tr.squeeze_on or tr.squeeze_firing) else 'OFF'
+            sqz_txt = f"{sqz_label} ({tr.squeeze_days}d)" if tr.squeeze_days > 0 else sqz_label
+            txt = pg.TextItem(sqz_txt, color='#e8e8e8', anchor=(1, 0))
+            txt.setPos(len(price) - 1, float(price.iloc[-1]))
+            txt.setFont(QFont('JetBrains Mono', 9))
+            plot.addItem(txt)
+
+    # ========================================================================
+    # OPTIONS / STRADDLE DATA
+    # ========================================================================
+
+    def _run_options_fetch(self, squeeze_result):
+        """Launch options worker to fetch straddle data for squeeze tickers only."""
+        if self._options_running:
+            return
+
+        # Bara .ST tickers som är i squeeze
+        squeeze_tickers = []
+        last_prices = {}
+        for ticker, tr in squeeze_result.ticker_results.items():
+            if not ticker.endswith('.ST'):
+                continue
+            if tr.squeeze_on or tr.squeeze_firing:
+                squeeze_tickers.append(ticker)
+            if hasattr(tr, 'price') and len(tr.price) > 0:
+                last_prices[ticker] = float(tr.price.iloc[-1])
+
+        if not squeeze_tickers:
+            return
+
+        self._options_running = True
+        is_silent = getattr(self, '_options_refresh_silent', False)
+
+        if not is_silent:
+            self.squeeze_status_label.setText(f"Loading options for {len(squeeze_tickers)} squeeze tickers...")
+            self.squeeze_status_label.setStyleSheet(
+                f"color:{COLORS['text_muted']};font-size:11px;")
+            if hasattr(self, 'squeeze_options_label'):
+                self.squeeze_options_label.setText(
+                    f"Fetching straddle data for {len(squeeze_tickers)} tickers...")
+
+        self._options_thread = QThread()
+        self._options_worker = OptionsWorker(squeeze_tickers, last_prices)
+        self._options_worker.moveToThread(self._options_thread)
+
+        self._options_thread.started.connect(self._options_worker.run)
+        self._options_worker.progress.connect(self._on_options_progress)
+        self._options_worker.result.connect(self._on_options_result)
+        self._options_worker.error.connect(self._on_options_error)
+        self._options_worker.finished.connect(self._on_options_finished)
+        self._options_worker.finished.connect(self._options_thread.quit)
+
+        self._options_thread.start()
+
+    def _on_options_progress(self, pct, msg):
+        if getattr(self, '_options_refresh_silent', False):
+            return
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(f"[Options {pct}%] {msg}")
+
+    def _on_options_error(self, msg):
+        print(f"[OPTIONS] Error: {msg}")
+        self._options_running = False
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(f"Options error: {msg}")
+
+    def _on_options_finished(self):
+        self._options_running = False
+        self._options_refresh_silent = False
+
+    def _on_options_result(self, results):
+        """Handle options data — update table and store data."""
+        self._options_data = results
+        n_with_options = sum(1 for v in results.values() if 'error' not in v)
+        print(f"[OPTIONS] Complete: {n_with_options}/{len(results)} tickers with options")
+
+        if hasattr(self, 'squeeze_status_label'):
+            n_squeeze = 0
+            if self._squeeze_result:
+                n_squeeze = self._squeeze_result.n_squeeze_on + self._squeeze_result.n_squeeze_firing
+            self.squeeze_status_label.setText(
+                f"Complete — {n_squeeze} in squeeze, {n_with_options} with options")
+            self.squeeze_status_label.setStyleSheet(
+                f"color:{COLORS['positive']};font-size:11px;")
+
+        # Uppdatera tabellen med options-kolumner
+        self._update_squeeze_table_options()
+
+        # Starta vol analytics (efter options så vi har DTE-matchade fönster)
+        if self._squeeze_result and not self._vol_analytics_running:
+            self._run_vol_analytics(self._squeeze_result)
+
+        # Starta auto-refresh timer (var 60:e sekund under marknadstid)
+        if not hasattr(self, '_options_refresh_timer'):
+            self._options_refresh_timer = QTimer(self)
+            self._options_refresh_timer.timeout.connect(self._refresh_options_data)
+        self._options_refresh_timer.start(60_000)  # 60 sekunder
+
+    def _refresh_options_data(self):
+        """Periodisk uppdatering av options-data (bara under marknadstid)."""
+        if self._options_running or not self._squeeze_result:
+            return
+
+        # Kolla om det är marknadstid (Stockholm 09:00-17:30)
+        from datetime import datetime
+        now = datetime.now()
+        if now.weekday() >= 5:  # Lördag/söndag
+            return
+        hour_min = now.hour * 100 + now.minute
+        if hour_min < 900 or hour_min > 1730:
+            return
+
+        print("[OPTIONS] Auto-refreshing options data...")
+        self._options_refresh_silent = True
+        self._run_options_fetch(self._squeeze_result)
+
+    def _update_squeeze_table_options(self):
+        """Fill in Strike/Straddle/Cost%/IV% columns from options data."""
+        table = self.squeeze_table
+        for row_idx in range(table.rowCount()):
+            ticker_item = table.item(row_idx, 0)
+            if not ticker_item:
+                continue
+            ticker = ticker_item.text()
+            opts = self._options_data.get(ticker, {})
+
+            if not opts or 'error' in opts or opts.get('nearest_atm') is None:
+                for col in (3, 4, 5, 6):
+                    item = QTableWidgetItem('-')
+                    item.setForeground(QColor(COLORS['text_disabled']))
+                    table.setItem(row_idx, col, item)
+                continue
+
+            atm = opts['nearest_atm']
+            strike = atm['Strike'] if 'Strike' in atm.index else 0
+            straddle = atm['Straddle'] if 'Straddle' in atm.index else 0
+            cost_pct = atm['Cost_pct'] if 'Cost_pct' in atm.index else 0
+            iv = atm['IV'] if 'IV' in atm.index else None
+
+            # Strike
+            strike_item = QTableWidgetItem(f"{strike:.0f}" if strike else '-')
+            strike_item.setForeground(QColor(COLORS['text_primary']))
+            strike_item.setData(Qt.UserRole, float(strike or 0))
+            table.setItem(row_idx, 3, strike_item)
+
+            # Straddle price
+            if straddle and not pd.isna(straddle):
+                straddle_item = QTableWidgetItem(f"{straddle:.1f}")
+                straddle_item.setForeground(QColor(COLORS['accent']))
+                straddle_item.setData(Qt.UserRole, float(straddle))
+            else:
+                straddle_item = QTableWidgetItem('-')
+                straddle_item.setForeground(QColor(COLORS['text_disabled']))
+            table.setItem(row_idx, 4, straddle_item)
+
+            # Cost %
+            if cost_pct and not pd.isna(cost_pct):
+                cost_item = QTableWidgetItem(f"{cost_pct:.1f}%")
+                if cost_pct < 4:
+                    cost_color = COLORS['positive']
+                elif cost_pct < 7:
+                    cost_color = COLORS['warning']
+                else:
+                    cost_color = COLORS['negative']
+                cost_item.setForeground(QColor(cost_color))
+                cost_item.setData(Qt.UserRole, float(cost_pct))
+            else:
+                cost_item = QTableWidgetItem('-')
+                cost_item.setForeground(QColor(COLORS['text_disabled']))
+            table.setItem(row_idx, 5, cost_item)
+
+            # IV %
+            if iv and not pd.isna(iv):
+                iv_item = QTableWidgetItem(f"{iv:.0f}%")
+                if iv < 20:
+                    iv_color = COLORS['positive']
+                elif iv < 35:
+                    iv_color = COLORS['warning']
+                else:
+                    iv_color = COLORS['negative']
+                iv_item.setForeground(QColor(iv_color))
+                iv_item.setData(Qt.UserRole, float(iv))
+            else:
+                iv_item = QTableWidgetItem('-')
+                iv_item.setForeground(QColor(COLORS['text_disabled']))
+            table.setItem(row_idx, 6, iv_item)
+
+    # ========================================================================
+    # KEY INSIGHTS (rule-based analysis per squeeze ticker)
+    # ========================================================================
+
+    def _update_squeeze_insights(self, ticker: str):
+        """Generate and display rule-based key insights for a squeeze ticker."""
+        if not hasattr(self, 'squeeze_insights_label'):
+            return
+
+        accent = COLORS['accent']
+        muted = COLORS['text_muted']
+        pos = COLORS['positive']
+        warn = COLORS['warning']
+        neg = COLORS['negative']
+        text = COLORS['text_primary']
+
+        insights = []
+
+        def _add(icon, title, body, color=text):
+            insights.append(
+                f"<div style='margin-bottom:10px'>"
+                f"<span style='color:{accent};font-weight:700;font-size:13px'>{icon} {title}</span><br>"
+                f"<span style='color:{color};font-size:12px;line-height:1.5'>{body}</span>"
+                f"</div>")
+
+        # ── Squeeze data ──
+        tr = None
+        if self._squeeze_result and ticker in self._squeeze_result.ticker_results:
+            tr = self._squeeze_result.ticker_results[ticker]
+
+        opts = self._options_data.get(ticker, {})
+        vol_data = self._vol_analytics_data.get(ticker, {})
+        atm_df = opts.get('atm_straddles')
+        spot = opts.get('spot', 0)
+
+        # HV from price series
+        hv_20d = hv_60d = hv_252d = None
+        hv_pct = None
+        if tr and hasattr(tr, 'price') and len(tr.price) > 20:
+            returns = tr.price.pct_change().dropna()
+            sqrt252 = 252 ** 0.5
+            hv_20d = float(returns.iloc[-20:].std() * sqrt252 * 100)
+            if len(returns) > 60:
+                hv_60d = float(returns.iloc[-60:].std() * sqrt252 * 100)
+            if len(returns) > 252:
+                hv_252d = float(returns.iloc[-252:].std() * sqrt252 * 100)
+            hv_pct = tr.hv_percentile
+
+        # ── 1. SQUEEZE CONTEXT ──
+        if tr:
+            sqz_days = tr.squeeze_days
+            if sqz_days >= 30:
+                _add("1.", "Squeeze — Lång kompression",
+                     f"{ticker} har varit i squeeze i <b>{sqz_days} dagar</b>. "
+                     f"Långvariga squeezes tenderar att resultera i starkare breakouts. "
+                     f"Hög sannolikhet för signifikant volatilitetsexpansion.", warn)
+            elif sqz_days >= 10:
+                _add("1.", "Squeeze — Mogen",
+                     f"Squeeze pågår sedan <b>{sqz_days} dagar</b>. "
+                     f"Bollinger Bands har komprimerat inuti Keltner Channels, "
+                     f"vilket signalerar ackumulerad energi för ett kommande utbrott.")
+            else:
+                _add("1.", "Squeeze — Tidig fas",
+                     f"Squeeze startade för <b>{sqz_days} dagar</b> sedan. "
+                     f"Volatiliteten har precis börjat komprimera. "
+                     f"Avvakta bekräftelse eller ta position i förväg för bättre priser.")
+
+        # ── 2. VOLATILITY ANALYSIS ──
+        garch_data = vol_data.get('garch', {})
+        garch_current = garch_data.get('current_vol')
+        garch_lr = garch_data.get('long_run_vol')
+        yz_20d = vol_data.get('yz_20d')
+
+        if hv_20d and hv_252d:
+            compression = (1 - hv_20d / hv_252d) * 100
+            if compression > 30:
+                vol_verdict = f"Kraftig volkompress: HV(20d) {hv_20d:.0f}% vs HV(1y) {hv_252d:.0f}% " \
+                              f"(<b>{compression:.0f}% under normalen</b>)."
+                vol_color = warn
+            elif compression > 10:
+                vol_verdict = f"Måttlig kompression: HV(20d) {hv_20d:.0f}% vs HV(1y) {hv_252d:.0f}% " \
+                              f"({compression:.0f}% under normalen)."
+                vol_color = text
+            else:
+                vol_verdict = f"Begränsad kompression: HV(20d) {hv_20d:.0f}% nära HV(1y) {hv_252d:.0f}%."
+                vol_color = muted
+
+            extras = []
+            if yz_20d:
+                extras.append(f"Yang-Zhang(20d): {yz_20d:.1f}%")
+            if garch_current:
+                extras.append(f"GARCH nuvarande: {garch_current:.1f}%")
+            if garch_lr:
+                extras.append(f"GARCH lång sikt: {garch_lr:.1f}%")
+            if extras:
+                vol_verdict += " " + " · ".join(extras) + "."
+
+            if garch_current and garch_lr and garch_lr > garch_current * 1.15:
+                vol_verdict += f" <b>GARCH-modellen förväntar sig mean reversion uppåt</b> " \
+                               f"({garch_current:.0f}% → {garch_lr:.0f}%)."
+
+            _add("2.", "Volatilitet", vol_verdict, vol_color)
+        elif hv_20d:
+            _add("2.", "Volatilitet", f"HV(20d): {hv_20d:.0f}%"
+                 + (f", HV Rank {hv_pct:.0f}%ile" if hv_pct else ""))
+
+        # ── 3. POST-SQUEEZE EXPANSION ──
+        post_squeeze = vol_data.get('post_squeeze', {})
+        if post_squeeze:
+            # Hitta bäst populerad bucket
+            best_ps = None
+            for w in [90, 60, 120, 30, 180]:
+                ps = post_squeeze.get(w, {})
+                if ps.get('n_samples', 0) >= 3:
+                    best_ps = (w, ps)
+                    break
+
+            if best_ps:
+                w, ps = best_ps
+                exp_mean = ps.get('expansion_mean', 0)
+                post_rv = ps.get('post_rv_mean', 0)
+                n = ps.get('n_samples', 0)
+                during_rv = ps.get('during_rv_mean', 0)
+
+                if exp_mean and exp_mean > 1.5:
+                    ps_verdict = (
+                        f"Stark historisk expansion: efter {n} tidigare squeezes "
+                        f"ökade realiserad vol i snitt <b>{exp_mean:.2f}x</b> "
+                        f"(från {during_rv:.0f}% → {post_rv:.0f}%) inom {w} dagar. "
+                        f"Talar starkt för straddle-strategi.")
+                    ps_color = pos
+                elif exp_mean and exp_mean > 1.2:
+                    ps_verdict = (
+                        f"Måttlig expansion: {exp_mean:.2f}x i snitt "
+                        f"({during_rv:.0f}% → {post_rv:.0f}%) efter {n} squeezes ({w}d fönster). "
+                        f"Straddle kan vara lönsam om priset är rimligt.")
+                    ps_color = text
+                else:
+                    ps_verdict = (
+                        f"Begränsad expansion: {exp_mean:.2f}x i snitt efter {n} squeezes. "
+                        f"Historiken stöder inte en aggressiv straddle-position.")
+                    ps_color = muted
+
+                _add("3.", "Post-Squeeze Historik (5y)", ps_verdict, ps_color)
+            else:
+                _add("3.", "Post-Squeeze Historik", "Otillräckligt med data (< 3 squeezes).", muted)
+
+        # ── 4. OPTIONS PRICING ──
+        if atm_df is not None and not atm_df.empty:
+            from datetime import date as _date, datetime as _dt
+            _today = _date.today()
+            hv_ref = hv_252d or hv_60d or hv_20d
+
+            # Analysera alla rader
+            best_row = None
+            best_score = -999
+
+            for _, row in atm_df.iterrows():
+                exp = str(row.get('Expiry', ''))[:10]
+                try:
+                    dte = (_dt.strptime(exp, '%Y-%m-%d').date() - _today).days
+                except (ValueError, TypeError):
+                    continue
+
+                iv = row.get('IV', float('nan'))
+                cost = row.get('Cost_pct', float('nan'))
+
+                # Scoring: prefer 60-180d, low IV/HV, low cost
+                score = 0
+                if 60 <= dte <= 180:
+                    score += 20
+                elif 30 <= dte <= 270:
+                    score += 10
+
+                if pd.notna(iv) and hv_ref and hv_ref > 0:
+                    ratio = iv / hv_ref
+                    if ratio < 0.7:
+                        score += 15
+                    elif ratio < 1.0:
+                        score += 10
+                    elif ratio > 1.3:
+                        score -= 10
+
+                # GARCH spread bonus
+                garch_ts = garch_data.get('term_structure', {})
+                if garch_ts and pd.notna(iv):
+                    keys = sorted(garch_ts.keys())
+                    if keys:
+                        g_key = min(keys, key=lambda k: abs(k - dte))
+                        g_val = garch_ts[g_key].get('garch_vol', 0)
+                        if g_val and iv < g_val:
+                            score += 10  # IV under GARCH = billigt
+
+                if pd.notna(cost) and cost < 12:
+                    score += 5
+
+                if score > best_score:
+                    best_score = score
+                    best_row = row
+                    best_dte = dte
+
+            if best_row is not None:
+                b_exp = str(best_row.get('Expiry', ''))[:10]
+                b_cost = best_row.get('Cost_pct', float('nan'))
+                b_iv = best_row.get('IV', float('nan'))
+                b_straddle = best_row.get('Straddle', float('nan'))
+                b_strike = best_row.get('Strike', 0)
+
+                rec_parts = [f"<b>Rekommenderad expiry: {b_exp} ({best_dte}d)</b>"]
+                if pd.notna(b_straddle):
+                    rec_parts.append(f"Straddle: {b_straddle:.1f} SEK (strike {b_strike:.0f})")
+                if pd.notna(b_cost):
+                    rec_parts.append(f"Kostnad: {b_cost:.1f}% av strike")
+                if pd.notna(b_iv) and hv_ref and hv_ref > 0:
+                    ratio = b_iv / hv_ref
+                    if ratio < 0.8:
+                        rec_parts.append(f"IV/HV = {ratio:.2f}x — <span style='color:{pos}'>IV billig vs historisk vol</span>")
+                    elif ratio < 1.2:
+                        rec_parts.append(f"IV/HV = {ratio:.2f}x — rimlig prissättning")
+                    else:
+                        rec_parts.append(f"IV/HV = {ratio:.2f}x — <span style='color:{neg}'>IV dyr</span>")
+
+                # GARCH-based assessment
+                garch_ts = garch_data.get('term_structure', {})
+                if garch_ts and pd.notna(b_iv):
+                    keys = sorted(garch_ts.keys())
+                    if keys:
+                        g_key = min(keys, key=lambda k: abs(k - best_dte))
+                        g_vol = garch_ts[g_key].get('garch_vol', 0)
+                        if g_vol:
+                            spread = b_iv - g_vol
+                            if spread < -3:
+                                rec_parts.append(
+                                    f"GARCH forecasar {g_vol:.0f}% men IV är {b_iv:.0f}% — "
+                                    f"<span style='color:{pos}'>{abs(spread):.0f}pp underprissatt</span>")
+                            elif spread > 3:
+                                rec_parts.append(
+                                    f"GARCH forecasar {g_vol:.0f}% men IV är {b_iv:.0f}% — "
+                                    f"<span style='color:{neg}'>{spread:.0f}pp överprissatt</span>")
+
+                _add("4.", "Optimal Straddle", "<br>".join(rec_parts), accent)
+
+            # IV skew analysis
+            c_ivs = atm_df['C_IV'].dropna()
+            p_ivs = atm_df['P_IV'].dropna()
+            if len(c_ivs) > 0 and len(p_ivs) > 0:
+                avg_c_iv = c_ivs.mean()
+                avg_p_iv = p_ivs.mean()
+                skew = avg_p_iv - avg_c_iv
+                if skew > 5:
+                    _add("5.", "Put-Skew",
+                         f"Kraftig put-skew: Put IV {avg_p_iv:.0f}% vs Call IV {avg_c_iv:.0f}% "
+                         f"(diff {skew:.0f}pp). Marknaden prisar in nedsiderisk. "
+                         f"Breakeven lägre på nedsidan, potentiellt fördelaktigt vid volexpansion nedåt.", warn)
+                elif skew > 2:
+                    _add("5.", "Put-Skew",
+                         f"Normal put-skew: Put IV {avg_p_iv:.0f}% vs Call IV {avg_c_iv:.0f}% "
+                         f"({skew:.0f}pp skillnad).", muted)
+
+        elif not opts or 'error' in opts:
+            _add("4.", "Options", "Ingen optionsdata tillgänglig för denna ticker.", muted)
+
+        # ── 5. OVERALL VERDICT ──
+        if tr and opts and not ('error' in opts):
+            verdict_parts = []
+            verdict_color = text
+
+            # Count bullish/bearish signals
+            bullish = 0
+            bearish = 0
+
+            if hv_20d and hv_252d and (hv_20d / hv_252d) < 0.7:
+                bullish += 1  # Significant vol compression
+            if garch_current and garch_lr and garch_lr > garch_current * 1.2:
+                bullish += 1  # GARCH mean reversion up
+            if post_squeeze:
+                for w in [60, 90, 120]:
+                    ps = post_squeeze.get(w, {})
+                    if ps.get('expansion_mean', 0) and ps['expansion_mean'] > 1.3:
+                        bullish += 1
+                        break
+
+            # IV pricing check
+            if atm_df is not None and not atm_df.empty and hv_ref:
+                med_iv = atm_df['IV'].dropna().median()
+                if pd.notna(med_iv):
+                    if med_iv / hv_ref < 0.7:
+                        bullish += 1  # Cheap IV
+                    elif med_iv / hv_ref > 1.3:
+                        bearish += 1  # Expensive IV
+
+            if bullish >= 3:
+                verdict = "STARK SIGNAL"
+                verdict_parts.append(
+                    f"<span style='color:{pos};font-weight:700;font-size:14px'>{verdict}</span><br>"
+                    f"Flera faktorer talar för straddle: volkompress, historisk expansion, "
+                    f"och/eller rimlig IV-prissättning.")
+                verdict_color = pos
+            elif bullish >= 2:
+                verdict = "POSITIV SIGNAL"
+                verdict_parts.append(
+                    f"<span style='color:{pos}'>{verdict}</span><br>"
+                    f"Goda förutsättningar för straddle-strategi, "
+                    f"men kontrollera specifik expiry och kostnad.")
+                verdict_color = pos
+            elif bearish >= 2:
+                verdict = "SVAG SIGNAL"
+                verdict_parts.append(
+                    f"<span style='color:{neg}'>{verdict}</span><br>"
+                    f"IV relativt dyr och/eller begränsad historisk expansion. "
+                    f"Överväg att avvakta bättre priser.")
+                verdict_color = neg
+            else:
+                verdict = "NEUTRAL"
+                verdict_parts.append(
+                    f"<span style='color:{warn}'>{verdict}</span><br>"
+                    f"Blandade signaler. Squeeze identifierad men "
+                    f"ingen tydlig edge i prissättningen.")
+                verdict_color = warn
+
+            _add("&#9733;", "Sammanfattning", "".join(verdict_parts), verdict_color)
+
+        # Build HTML
+        if not insights:
+            _add("-", ticker, "Kör squeeze-scan och invänta options/vol-data.", muted)
+
+        html = (
+            f"<div style='font-family:JetBrains Mono,monospace;padding:2px;"
+            f"color:{COLORS['text_primary']}'>"
+            + "".join(insights) +
+            "</div>")
+        self.squeeze_insights_label.setText(html)
+
+    # ========================================================================
+    # VOL ANALYTICS (Post-Squeeze Expansion, Yang-Zhang, GARCH)
+    # ========================================================================
+
+    def _run_vol_analytics(self, squeeze_result):
+        """Launch VolAnalyticsWorker for squeeze tickers with DTE-matched windows."""
+        if self._vol_analytics_running:
+            return
+
+        if not VOL_ANALYTICS_AVAILABLE:
+            return
+
+        # Samla .ST tickers i squeeze
+        squeeze_tickers = []
+        for ticker, tr in squeeze_result.ticker_results.items():
+            if not ticker.endswith('.ST'):
+                continue
+            if tr.squeeze_on or tr.squeeze_firing:
+                squeeze_tickers.append(ticker)
+
+        if not squeeze_tickers:
+            return
+
+        # Bestäm forward_windows baserat på options-DTEs om tillgängliga
+        forward_windows = set()
+        for ticker in squeeze_tickers:
+            opts = self._options_data.get(ticker, {})
+            atm_df = opts.get('atm_straddles')
+            if atm_df is not None and not atm_df.empty:
+                from datetime import date as _date, datetime as _dt
+                _today = _date.today()
+                for _, row in atm_df.iterrows():
+                    exp = str(row.get('Expiry', ''))[:10]
+                    try:
+                        dte = (_dt.strptime(exp, '%Y-%m-%d').date() - _today).days
+                        if dte > 5:
+                            forward_windows.add(dte)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Fallback: standardfönster
+        if not forward_windows:
+            forward_windows = {30, 60, 90, 120, 180}
+        # Lägg alltid till standard-referenspunkter
+        forward_windows.update({30, 60, 90, 120, 180})
+        fw_list = sorted(forward_windows)
+
+        self._vol_analytics_running = True
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(
+                f"Running vol analytics for {len(squeeze_tickers)} tickers...")
+            self.squeeze_status_label.setStyleSheet(
+                f"color:{COLORS['text_muted']};font-size:11px;")
+
+        self._vol_thread = QThread()
+        self._vol_worker = VolAnalyticsWorker(squeeze_tickers, fw_list)
+        self._vol_worker.moveToThread(self._vol_thread)
+
+        self._vol_thread.started.connect(self._vol_worker.run)
+        self._vol_worker.progress.connect(self._on_vol_analytics_progress)
+        self._vol_worker.result.connect(self._on_vol_analytics_result)
+        self._vol_worker.error.connect(self._on_vol_analytics_error)
+        self._vol_worker.finished.connect(self._on_vol_analytics_finished)
+        self._vol_worker.finished.connect(self._vol_thread.quit)
+
+        self._vol_thread.start()
+
+    def _on_vol_analytics_progress(self, pct, msg):
+        if hasattr(self, 'squeeze_status_label'):
+            self.squeeze_status_label.setText(f"[Vol {pct}%] {msg}")
+
+    def _on_vol_analytics_error(self, msg):
+        print(f"[VOL_ANALYTICS] Error: {msg}")
+        self._vol_analytics_running = False
+
+    def _on_vol_analytics_finished(self):
+        self._vol_analytics_running = False
+
+    def _on_vol_analytics_result(self, results):
+        """Store vol analytics results and refresh panel if a ticker is selected."""
+        self._vol_analytics_data = results
+        n = len(results)
+        print(f"[VOL_ANALYTICS] Complete: {n} tickers analyzed")
+
+        if hasattr(self, 'squeeze_status_label'):
+            n_squeeze = 0
+            if self._squeeze_result:
+                n_squeeze = self._squeeze_result.n_squeeze_on + self._squeeze_result.n_squeeze_firing
+            n_opts = sum(1 for v in self._options_data.values() if 'error' not in v)
+            self.squeeze_status_label.setText(
+                f"Complete — {n_squeeze} in squeeze, {n_opts} with options, {n} vol analytics")
+            self.squeeze_status_label.setStyleSheet(
+                f"color:{COLORS['positive']};font-size:11px;")
+
+        # Refresh panel + insights om en ticker är vald
+        if hasattr(self, 'squeeze_table'):
+            current_row = self.squeeze_table.currentRow()
+            if current_row >= 0:
+                ticker_item = self.squeeze_table.item(current_row, 0)
+                if ticker_item:
+                    self._update_options_panel(ticker_item.text())
+                    self._update_squeeze_insights(ticker_item.text())
+
+    # ========================================================================
+    # VOLATILITY SURFACE (3D Plotly)
+    # ========================================================================
+
+    def _load_vol_surface(self, ticker: str):
+        """Launch worker to fetch full chain and build vol surface."""
+        if not WEBENGINE_AVAILABLE or not hasattr(self, 'vol_surface_view'):
+            return
+        if not OPTIONS_AVAILABLE:
+            return
+
+        opts = self._options_data.get(ticker, {})
+        if not opts or 'error' in opts:
+            return
+
+        spot = opts.get('spot', 0)
+        expiries = opts.get('expiries', [])
+        if not expiries or spot <= 0:
+            return
+
+        # Avanza orderbookId for underlying
+        avanza_id = opts.get('orderbook_id', '')
+        if not avanza_id:
+            return
+
+        # GARCH term structure
+        vol_data = self._vol_analytics_data.get(ticker, {})
+        garch_ts = vol_data.get('garch', {}).get('term_structure', {})
+
+        # Risk-free rate from options greeks (if available)
+        r = 0.02
+        atm_df = opts.get('atm_straddles')
+        if atm_df is not None and not atm_df.empty:
+            # Try to get rate from first row that has greeks
+            for _, row in atm_df.iterrows():
+                rfr = row.get('risk_free_rate')
+                if rfr is not None and rfr > 0:
+                    r = rfr / 100 if rfr > 1 else rfr
+                    break
+
+        # Stoppa eventuell pagaende vol surface-worker
+        if hasattr(self, '_vol_surface_thread') and self._vol_surface_thread is not None:
+            try:
+                if self._vol_surface_thread.isRunning():
+                    self._vol_surface_thread.quit()
+                    self._vol_surface_thread.wait(2000)
+            except RuntimeError:
+                pass
+            self._vol_surface_thread = None
+            self._vol_surface_worker = None
+
+        # Visa laddar-indikator
+        n_exp = len([e for e in expiries if e >= datetime.now().strftime('%Y-%m-%d')])
+        self.vol_surface_view.setHtml(
+            f"<html><body style='background:{COLORS['bg_card']};color:{COLORS['text_muted']};"
+            f"font-family:JetBrains Mono,monospace;display:flex;align-items:center;"
+            f"justify-content:center;height:100vh;font-size:13px;'>"
+            f"<div>Hamtar IV fran Avanza for {ticker} ({n_exp} expiries)...</div>"
+            f"</body></html>")
+
+        # Ateranvand cachad straddle-data (alla strikes, inte bara ATM)
+        cached_straddles = opts.get('all_straddles')
+
+        self._vol_surface_thread = QThread()
+        self._vol_surface_worker = VolSurfaceWorker(
+            avanza_id, ticker, spot, expiries, garch_ts, r,
+            cached_straddles=cached_straddles)
+        self._vol_surface_worker.moveToThread(self._vol_surface_thread)
+
+        self._vol_surface_thread.started.connect(self._vol_surface_worker.run)
+        self._vol_surface_worker.result.connect(self._render_vol_surface)
+        self._vol_surface_worker.error.connect(
+            lambda e: print(f"[VOLSURF] Error: {e}"))
+        self._vol_surface_worker.finished.connect(self._vol_surface_thread.quit)
+
+        self._vol_surface_thread.start()
+
+    def _render_vol_surface(self, data: dict):
+        """Render 3D volatility surface with GARCH reference plane."""
+        try:
+            if not hasattr(self, 'vol_surface_view'):
+                return
+
+            surface_df = data.get('surface_df')
+            if surface_df is None or surface_df.empty:
+                return
+
+            # Ignorera resultat om anvandaren redan bytt ticker
+            ticker = data['ticker']
+            current_row = self.squeeze_table.currentRow() if hasattr(self, 'squeeze_table') else -1
+            if current_row >= 0:
+                current_item = self.squeeze_table.item(current_row, 0)
+                if current_item and current_item.text() != ticker:
+                    print(f"[VOLSURF] Skipping stale result for {ticker}")
+                    return
+
+            spot = data['spot']
+            garch_ts = data.get('garch_ts', {})
+
+            # Pivot: DTE × Strike → MidIV
+            pivot = surface_df.pivot_table(values='MidIV', index='DTE', columns='Strike')
+            pivot = pivot.dropna(how='all').dropna(axis=1, how='all')
+
+            if pivot.empty or pivot.shape[0] < 2 or pivot.shape[1] < 2:
+                print(f"[VOLSURF] {ticker}: Not enough data for surface "
+                      f"({pivot.shape[0]} expiries x {pivot.shape[1]} strikes)")
+                return
+
+            strikes = pivot.columns.values.astype(float)
+            dtes = pivot.index.values.astype(float)
+            iv_grid = pivot.values  # shape (n_dte, n_strike)
+
+            # Check we have enough valid data points
+            valid_mask = ~np.isnan(iv_grid)
+            if valid_mask.sum() < 4:
+                return
+
+            # Build GARCH reference plane (flat across strikes, varies by DTE)
+            has_garch = False
+            garch_grid = np.full_like(iv_grid, np.nan)
+            if garch_ts:
+                # Keys might be int or str — normalize
+                norm_ts = {}
+                for k, v in garch_ts.items():
+                    try:
+                        norm_ts[int(k)] = v
+                    except (ValueError, TypeError):
+                        pass
+                if norm_ts:
+                    garch_keys = sorted(norm_ts.keys())
+                    for i, dte in enumerate(dtes):
+                        closest = min(garch_keys, key=lambda k: abs(k - dte))
+                        gv = norm_ts[closest]
+                        garch_vol = gv.get('garch_vol') if isinstance(gv, dict) else gv
+                        if garch_vol is not None:
+                            garch_grid[i, :] = float(garch_vol)
+                            has_garch = True
+
+            # Compute edge: IV - GARCH (negative = IV cheap = edge)
+            # Om GARCH saknas, farg baseras pa absolutniva istallet
+            if has_garch:
+                edge_grid = iv_grid - garch_grid
+                colorbar_title = 'IV − GARCH (pp)'
+            else:
+                # Farg baseras pa IV relativt median
+                median_iv = np.nanmedian(iv_grid)
+                edge_grid = iv_grid - median_iv
+                colorbar_title = 'IV − Median (pp)'
+
+            # Build Plotly HTML
+            bg = COLORS['bg_card']
+            text_col = COLORS['text_primary']
+            accent = COLORS['accent']
+
+            import json as _json
+
+            # Konvertera NaN → null for JSON
+            def _grid_to_json(grid):
+                return _json.dumps([
+                    [None if (v is None or np.isnan(v)) else round(float(v), 2) for v in row]
+                    for row in grid
+                ])
+
+            # Y-axel: sekventiella index (0,1,2,...) med DTE som tick-labels
+            # Sa att varje expiry far lika spacing istallet for interpolerade mellanrum
+            dte_labels = [f"{int(d)}d" for d in dtes]
+            y_indices = list(range(len(dtes)))
+
+            # Bygg custom hover med riktiga DTE-varden
+            # customdata[i][j] = faktisk DTE for rad i
+            dte_ints = [int(d) for d in dtes]
+
+            html = f"""<!DOCTYPE html>
+<html><head>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  body {{ margin:0; padding:0; background:{bg}; overflow:hidden; }}
+  #chart {{ width:100%; height:100vh; }}
+</style>
+</head><body>
+<div id="chart"></div>
+<script>
+var strikes = {_json.dumps([round(float(s), 1) for s in strikes])};
+var yIdx = {_json.dumps(y_indices)};
+var dteLabels = {_json.dumps(dte_labels)};
+var dteValues = {_json.dumps(dte_ints)};
+var iv_z = {_grid_to_json(iv_grid)};
+var garch_z = {_grid_to_json(garch_grid)};
+var edge_z = {_grid_to_json(edge_grid)};
+var spot = {spot};
+
+// Bygg customdata: varje cell far [dte, edge]
+var customdata = [];
+for (var i = 0; i < dteValues.length; i++) {{
+  var row = [];
+  for (var j = 0; j < strikes.length; j++) {{
+    row.push([dteValues[i], edge_z[i] ? edge_z[i][j] : null]);
+  }}
+  customdata.push(row);
+}}
+
+// IV Surface colored by edge
+var ivSurface = {{
+  x: strikes, y: yIdx, z: iv_z,
+  type: 'surface',
+  name: 'Implied Vol (Avanza)',
+  surfacecolor: edge_z,
+  customdata: customdata,
+  colorscale: [
+    [0, '#22c55e'],
+    [0.35, '#166534'],
+    [0.5, '#374151'],
+    [0.65, '#7f1d1d'],
+    [1, '#ef4444']
+  ],
+  cmin: -10, cmid: 0, cmax: 10,
+  colorbar: {{
+    title: '{colorbar_title}',
+    titleside: 'right',
+    titlefont: {{color: '{text_col}', size: 11}},
+    tickfont: {{color: '{text_col}', size: 10}},
+    ticksuffix: 'pp',
+    len: 0.6, y: 0.5,
+  }},
+  opacity: 0.92,
+  hovertemplate: 'Strike: %{{x:.0f}}<br>DTE: %{{customdata[0]}}d<br>IV: %{{z:.1f}}%<br>Edge: %{{customdata[1]:.1f}}pp<extra></extra>',
+  contours: {{
+    z: {{ show: true, usecolormap: false, color: 'rgba(255,255,255,0.15)', width: 1 }}
+  }},
+}};
+
+var traces = [ivSurface];
+
+// GARCH reference plane (only if data exists)
+var hasGarch = {_json.dumps(has_garch)};
+if (hasGarch) {{
+  var garchPlane = {{
+    x: strikes, y: yIdx, z: garch_z,
+    type: 'surface',
+    name: 'GARCH Forecast',
+    colorscale: [[0, '{accent}'], [1, '{accent}']],
+    showscale: false,
+    opacity: 0.25,
+    hovertemplate: 'GARCH: %{{z:.1f}}%<extra>GARCH</extra>',
+  }};
+  traces.push(garchPlane);
+}}
+
+var layout = {{
+  scene: {{
+    xaxis: {{
+      title: 'Strike',
+      color: '{text_col}',
+      gridcolor: 'rgba(255,255,255,0.08)',
+      zerolinecolor: 'rgba(255,255,255,0.15)',
+    }},
+    yaxis: {{
+      title: 'Expiry (DTE)',
+      color: '{text_col}',
+      gridcolor: 'rgba(255,255,255,0.08)',
+      tickvals: yIdx,
+      ticktext: dteLabels,
+    }},
+    zaxis: {{
+      title: 'IV %',
+      color: '{text_col}',
+      gridcolor: 'rgba(255,255,255,0.08)',
+    }},
+    bgcolor: '{bg}',
+    camera: {{
+      eye: {{x: 1.5, y: -1.8, z: 0.8}},
+    }},
+  }},
+  paper_bgcolor: '{bg}',
+  plot_bgcolor: '{bg}',
+  font: {{ color: '{text_col}', family: 'JetBrains Mono, monospace', size: 11 }},
+  title: {{
+    text: '{ticker} Volatility Surface (green = edge)',
+    font: {{ size: 14, color: '{accent}' }},
+  }},
+  margin: {{ l: 0, r: 0, t: 40, b: 0 }},
+  showlegend: true,
+  legend: {{
+    x: 0.01, y: 0.98,
+    bgcolor: 'rgba(0,0,0,0.5)',
+    font: {{ color: '{text_col}', size: 10 }},
+  }},
+}};
+
+Plotly.newPlot('chart', traces, layout, {{
+  responsive: true,
+  displayModeBar: true,
+  modeBarButtonsToRemove: ['toImage', 'sendDataToCloud'],
+}});
+</script></body></html>"""
+
+            self.vol_surface_view.setHtml(html)
+            print(f"[VOLSURF] {ticker}: Surface rendered "
+                  f"({len(dtes)} expiries x {len(strikes)} strikes, GARCH={'yes' if has_garch else 'no'})")
+
+        except Exception as e:
+            print(f"[VOLSURF] Render error: {e}")
+            traceback.print_exc()
+
+    def _update_options_panel(self, ticker: str):
+        """Update the straddle pricing panel for selected ticker."""
+        if not hasattr(self, 'squeeze_options_label'):
+            return
+
+        opts = self._options_data.get(ticker, {})
+        if not opts or 'error' in opts:
+            self.squeeze_options_label.setText(
+                f"<span style='color:{COLORS['text_muted']}'>{ticker}: No options data</span>")
+            return
+
+        spot = opts.get('spot', 0)
+        n_opts = opts.get('n_options', 0)
+        expiries = opts.get('expiries', [])
+        atm_df = opts.get('atm_straddles')
+
+        # Hämta HV från squeeze-resultatet
+        hv_pct = None
+        hv_20d = hv_60d = hv_252d = None
+        if self._squeeze_result and ticker in self._squeeze_result.ticker_results:
+            tr = self._squeeze_result.ticker_results[ticker]
+            hv_pct = tr.hv_percentile  # 0-100 percentil
+
+            if hasattr(tr, 'price') and len(tr.price) > 20:
+                returns = tr.price.pct_change().dropna()
+                sqrt252 = 252 ** 0.5
+                hv_20d = float(returns.iloc[-20:].std() * sqrt252 * 100)
+                if len(returns) > 60:
+                    hv_60d = float(returns.iloc[-60:].std() * sqrt252 * 100)
+                if len(returns) > 252:
+                    hv_252d = float(returns.iloc[-252:].std() * sqrt252 * 100)
+
+        # CSS
+        accent = COLORS['accent']
+        muted = COLORS['text_muted']
+        pos = COLORS['positive']
+        warn = COLORS['warning']
+        neg = COLORS['negative']
+
+        # Vol analytics data for this ticker
+        vol_data = self._vol_analytics_data.get(ticker, {})
+        yz_20d = vol_data.get('yz_20d')
+        yz_60d = vol_data.get('yz_60d')
+        garch_data = vol_data.get('garch', {})
+        garch_current = garch_data.get('current_vol')
+        garch_lr = garch_data.get('long_run_vol')
+        post_squeeze = vol_data.get('post_squeeze', {})
+        has_vol_analytics = bool(vol_data)
+
+        html = [f"<div style='font-family:JetBrains Mono,monospace;font-size:12px;color:{COLORS['text_primary']};margin:0;padding:0'>"]
+
+        # Header: ticker + spot + HV info
+        header_parts = [f"<span style='color:{accent};font-size:13px;font-weight:700'>{ticker}</span>"]
+        header_parts.append(f"<span style='color:{muted}'>&nbsp;Spot {spot:.1f}")
+        if hv_20d is not None:
+            header_parts.append(f" &middot; HV(20d) {hv_20d:.0f}%")
+        if hv_60d is not None:
+            header_parts.append(f" &middot; HV(60d) {hv_60d:.0f}%")
+        if hv_252d is not None:
+            header_parts.append(f" &middot; HV(1y) {hv_252d:.0f}%")
+        if hv_pct is not None:
+            header_parts.append(f" &middot; HV Rank {hv_pct:.0f}%ile")
+        header_parts.append(f" &middot; {len(expiries)} expiries</span>")
+        html.append("".join(header_parts))
+
+        # Vol analytics header line
+        if has_vol_analytics:
+            vol_parts = [f"<br><span style='color:{muted};font-size:12px'>"]
+            if yz_20d is not None:
+                vol_parts.append(f"YZ(20d) {yz_20d:.1f}%")
+            if yz_60d is not None:
+                vol_parts.append(f" &middot; YZ(60d) {yz_60d:.1f}%")
+            if garch_current is not None:
+                vol_parts.append(f" &middot; GARCH now {garch_current:.1f}%")
+            if garch_lr is not None:
+                vol_parts.append(f" &middot; GARCH LR {garch_lr:.1f}%")
+            # Best post-squeeze expansion summary
+            if post_squeeze:
+                # Visa det mest relevanta fönstret (90d)
+                ps_90 = post_squeeze.get(90, {})
+                if ps_90.get('expansion_mean') is not None:
+                    vol_parts.append(
+                        f" &middot; Post-squeeze exp {ps_90['expansion_mean']:.2f}x"
+                        f" (n={ps_90.get('n_samples', 0)})")
+            vol_parts.append("</span>")
+            html.append("".join(vol_parts))
+
+        avanza_base = "https://www.avanza.se/borshandlade-produkter/optioner-terminer/om-optionen.html"
+        link_css = f"color:{accent};text-decoration:none"
+
+        if atm_df is not None and not atm_df.empty:
+            # Sub-header CSS
+            sub_hdr = f"color:{COLORS['text_muted']};font-size:11px;font-weight:400;padding:1px 3px;text-align:center;border-bottom:1px solid {COLORS['border_subtle']}"
+            grp_hdr = f"color:{accent};font-weight:700;font-size:11px;padding:2px 3px;text-align:center;border-bottom:1px solid {COLORS['border_subtle']}"
+            cell_sm = f"padding:2px 3px;text-align:right;font-size:12px;white-space:nowrap"
+
+            bdr_subtle = COLORS['border_subtle']
+            bdr_l = f"border-left:1px solid {bdr_subtle}"
+
+            # HV for ratio: prefer 1y, fallback 60d, then 20d
+            hv_ref = hv_252d or hv_60d or hv_20d
+            hv_label = "1y" if hv_252d else ("60d" if hv_60d else "20d")
+
+            vol_cols = 3 if has_vol_analytics else 0
+
+            html.append(f"<table style='width:100%;border-collapse:collapse;margin-top:4px'>")
+            # Group header row
+            vol_hdr = ""
+            if has_vol_analytics:
+                vol_hdr = f"<td style='{grp_hdr};{bdr_l}' colspan='3'>VOL ANALYTICS</td>"
+            html.append(
+                f"<tr>"
+                f"<td style='{grp_hdr};text-align:left' rowspan='2'>Expiry</td>"
+                f"<td style='{grp_hdr}' rowspan='2'>DTE</td>"
+                f"<td style='{grp_hdr}' rowspan='2'>Strike</td>"
+                f"<td style='{grp_hdr};{bdr_l}' colspan='5'>CALL</td>"
+                f"<td style='{grp_hdr};{bdr_l}' colspan='5'>PUT</td>"
+                f"<td style='{grp_hdr};{bdr_l}' colspan='3'>STRADDLE</td>"
+                f"{vol_hdr}"
+                f"</tr>")
+            # Sub-header row
+            vol_sub = ""
+            if has_vol_analytics:
+                vol_sub = (
+                    f"<td style='{sub_hdr};{bdr_l}'>PostSqz</td>"
+                    f"<td style='{sub_hdr}'>GARCH</td>"
+                    f"<td style='{sub_hdr}'>IV&minus;G</td>"
+                )
+            html.append(
+                f"<tr>"
+                f"<td style='{sub_hdr};{bdr_l}'>Ask</td>"
+                f"<td style='{sub_hdr}'>IV%</td>"
+                f"<td style='{sub_hdr}'>&Delta;</td>"
+                f"<td style='{sub_hdr}'>&Theta;</td>"
+                f"<td style='{sub_hdr}'>Vega</td>"
+                f"<td style='{sub_hdr};{bdr_l}'>Ask</td>"
+                f"<td style='{sub_hdr}'>IV%</td>"
+                f"<td style='{sub_hdr}'>&Delta;</td>"
+                f"<td style='{sub_hdr}'>&Theta;</td>"
+                f"<td style='{sub_hdr}'>Vega</td>"
+                f"<td style='{sub_hdr};{bdr_l}'>Price</td>"
+                f"<td style='{sub_hdr}'>Cost%</td>"
+                f"<td style='{sub_hdr}'>IV/HV({hv_label})</td>"
+                f"{vol_sub}"
+                f"</tr>")
+
+            from datetime import date as _date, datetime as _dt
+            _today = _date.today()
+
+            def _iv_fmt(iv_val):
+                if pd.notna(iv_val):
+                    color = pos if iv_val < 20 else (warn if iv_val < 35 else neg)
+                    return f"<span style='color:{color};font-weight:600'>{iv_val:.1f}</span>"
+                return f"<span style='color:{muted}'>-</span>"
+
+            def _greek_fmt(val, fmt='.3f'):
+                return f"{val:{fmt}}" if pd.notna(val) else "-"
+
+            row_bdr = f"border-bottom:1px solid {COLORS['bg_elevated']}"
+
+            for _, row in atm_df.iterrows():
+                exp = str(row.get('Expiry', ''))[:10]
+                try:
+                    dte = (_dt.strptime(exp, '%Y-%m-%d').date() - _today).days
+                except (ValueError, TypeError):
+                    dte = 0
+                strike = row.get('Strike', 0)
+                c_ask = row.get('C_Ask', float('nan'))
+                p_ask = row.get('P_Ask', float('nan'))
+                c_name = row.get('C_Name', '')
+                c_id = str(row.get('C_Id', ''))
+                p_name = row.get('P_Name', '')
+                p_id = str(row.get('P_Id', ''))
+                straddle = row.get('Straddle', float('nan'))
+                cost = row.get('Cost_pct', float('nan'))
+                # Separate greeks per leg
+                c_iv = row.get('C_IV', float('nan'))
+                p_iv = row.get('P_IV', float('nan'))
+                c_delta = row.get('C_Delta', float('nan'))
+                p_delta = row.get('P_Delta', float('nan'))
+                c_theta = row.get('C_Theta', float('nan'))
+                p_theta = row.get('P_Theta', float('nan'))
+                c_vega = row.get('C_Vega', float('nan'))
+                p_vega = row.get('P_Vega', float('nan'))
+
+                # Call ask with link
+                if pd.notna(c_ask) and c_name:
+                    c_url = f"{avanza_base}/{c_id}/{c_name.lower()}"
+                    c_str = f"<a href='{c_url}' style='{link_css}' title='{c_name}'>{c_ask:.2f}</a>"
+                elif pd.notna(c_ask):
+                    c_str = f"{c_ask:.2f}"
+                else:
+                    c_str = "-"
+
+                # Put ask with link
+                if pd.notna(p_ask) and p_name:
+                    p_url = f"{avanza_base}/{p_id}/{p_name.lower()}"
+                    p_str = f"<a href='{p_url}' style='{link_css}' title='{p_name}'>{p_ask:.2f}</a>"
+                elif pd.notna(p_ask):
+                    p_str = f"{p_ask:.2f}"
+                else:
+                    p_str = "-"
+
+                # Straddle
+                s_str = f"{straddle:.1f}" if pd.notna(straddle) else "-"
+                cost_str = f"{cost:.1f}" if pd.notna(cost) else "-"
+                s_color = accent if pd.notna(straddle) else muted
+
+                # IV/HV ratio vs 1y HV (not 20d)
+                avg_iv = row.get('IV', float('nan'))
+                if pd.notna(avg_iv) and hv_ref and hv_ref > 0:
+                    ratio = avg_iv / hv_ref
+                    ratio_str = f"{ratio:.2f}x"
+                    ratio_color = pos if ratio < 0.8 else (warn if ratio < 1.2 else neg)
+                else:
+                    ratio_str = "-"
+                    ratio_color = muted
+
+                # Highlight 60-180d range (ideal for straddles)
+                dte_color = accent if 60 <= dte <= 180 else muted
+
+                # Vol analytics columns: find closest DTE match
+                vol_cells = ""
+                if has_vol_analytics:
+                    # Post-squeeze RV for this DTE
+                    ps_rv_str = "-"
+                    ps_rv_color = muted
+                    garch_str = "-"
+                    garch_color = muted
+                    iv_garch_str = "-"
+                    iv_garch_color = muted
+
+                    # Hitta närmaste fönster i post_squeeze och garch term structure
+                    garch_ts = garch_data.get('term_structure', {})
+
+                    # Exakt DTE-match eller närmaste
+                    def _find_nearest(data_dict, target_dte):
+                        if not data_dict:
+                            return None, None
+                        keys = sorted(data_dict.keys())
+                        best_k = min(keys, key=lambda k: abs(k - target_dte))
+                        if abs(best_k - target_dte) <= max(15, target_dte * 0.3):
+                            return best_k, data_dict[best_k]
+                        return None, None
+
+                    if dte > 5:
+                        # Post-squeeze expansion
+                        ps_key, ps_val = _find_nearest(post_squeeze, dte)
+                        if ps_val and ps_val.get('post_rv_mean') is not None:
+                            ps_rv = ps_val['post_rv_mean']
+                            ps_n = ps_val.get('n_samples', 0)
+                            ps_rv_str = f"{ps_rv:.0f}%"
+                            ps_rv_color = warn if ps_rv > (hv_20d or 20) else pos
+                            if ps_val.get('expansion_mean') is not None:
+                                ps_rv_str += f" ({ps_val['expansion_mean']:.1f}x)"
+
+                        # GARCH forecast
+                        g_key, g_val = _find_nearest(garch_ts, dte)
+                        if g_val and g_val.get('garch_vol') is not None:
+                            garch_vol = g_val['garch_vol']
+                            garch_str = f"{garch_vol:.0f}%"
+                            garch_color = warn if garch_vol > (hv_20d or 20) else pos
+
+                            # IV minus GARCH spread
+                            avg_iv_val = row.get('IV', float('nan'))
+                            if pd.notna(avg_iv_val):
+                                spread = avg_iv_val - garch_vol
+                                iv_garch_str = f"{spread:+.1f}"
+                                # Positiv = IV dyrt vs GARCH, negativ = billigt
+                                iv_garch_color = neg if spread > 5 else (pos if spread < -2 else warn)
+
+                    vol_cells = (
+                        f"<td style='{cell_sm};{bdr_l};color:{ps_rv_color}'>{ps_rv_str}</td>"
+                        f"<td style='{cell_sm};color:{garch_color}'>{garch_str}</td>"
+                        f"<td style='{cell_sm};color:{iv_garch_color};font-weight:600'>{iv_garch_str}</td>"
+                    )
+
+                html.append(
+                    f"<tr style='{row_bdr}'>"
+                    f"<td style='{cell_sm};text-align:left;color:{muted}'>{exp}</td>"
+                    f"<td style='{cell_sm};color:{dte_color}'>{dte}d</td>"
+                    f"<td style='{cell_sm}'>{strike:.0f}</td>"
+                    # Call columns
+                    f"<td style='{cell_sm};{bdr_l}'>{c_str}</td>"
+                    f"<td style='{cell_sm}'>{_iv_fmt(c_iv)}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(c_delta, '+.2f')}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(c_theta)}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(c_vega)}</td>"
+                    # Put columns
+                    f"<td style='{cell_sm};{bdr_l}'>{p_str}</td>"
+                    f"<td style='{cell_sm}'>{_iv_fmt(p_iv)}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(p_delta, '+.2f')}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(p_theta)}</td>"
+                    f"<td style='{cell_sm};color:{muted}'>{_greek_fmt(p_vega)}</td>"
+                    # Straddle columns
+                    f"<td style='{cell_sm};{bdr_l};color:{s_color};font-weight:700'>{s_str}</td>"
+                    f"<td style='{cell_sm}'>{cost_str}%</td>"
+                    f"<td style='{cell_sm};color:{ratio_color};font-weight:600'>{ratio_str}</td>"
+                    # Vol analytics columns
+                    f"{vol_cells}"
+                    f"</tr>")
+
+            html.append("</table>")
+        else:
+            html.append(f"<p style='color:{muted}'>No priced ATM straddles found</p>")
+
+        html.append("</div>")
+        self.squeeze_options_label.setText("".join(html))
 
     # ========================================================================
     # WORLD MAP
@@ -12689,12 +16690,50 @@ class PairsTradingTerminal(QMainWindow):
             else:
                 # Multiple tickers: Close is already a DataFrame with ticker columns
                 daily_close = daily['Close'] if 'Close' in daily.columns else daily
+            from datetime import date as _date
+            today = _date.today()
+            _COMMODITY_FUTURES_DBG = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
             for tk in tickers:
                 if tk in daily_close.columns:
                     dc = daily_close[tk].dropna()
                     if len(dc) >= 2:
-                        self._daily_prev_close[tk] = float(dc.iloc[-2])
-            # Log some key tickers for verification
+                        # Check if last bar is from today
+                        last_dt = dc.index[-1]
+                        last_d = last_dt.date() if hasattr(last_dt, 'date') else last_dt
+                        if last_d >= today:
+                            # Today's bar exists → previous close is second-to-last
+                            self._daily_prev_close[tk] = float(dc.iloc[-2])
+                        else:
+                            # Today's bar not yet available → last bar IS previous close
+                            self._daily_prev_close[tk] = float(dc.iloc[-1])
+                        # Debug for commodity futures
+                        if tk in _COMMODITY_FUTURES_DBG:
+                            print(f"[DailyPrev] {tk}: dates={[str(d.date()) for d in dc.index]}, "
+                                  f"last_d={last_d}, today={today}, "
+                                  f"used={'iloc[-2]' if last_d >= today else 'iloc[-1]'}, "
+                                  f"value={self._daily_prev_close[tk]:.2f}")
+                elif tk in _COMMODITY_FUTURES_DBG:
+                    print(f"[DailyPrev] WARNING: {tk} NOT in daily_close columns! "
+                          f"columns={list(daily_close.columns)[:10]}...")
+            # For index futures: override with fast_info previousClose (settlement price)
+            # yf.download daily Close ≠ settlement, causing wrong implied open calculation.
+            # Commodity futures don't need this — treemap uses WS change directly.
+            _INDEX_FUTURES = {'ES=F', 'NQ=F', 'YM=F', 'RTY=F'}
+            futures_in_tickers = [t for t in tickers if t in _INDEX_FUTURES]
+            for ftk in futures_in_tickers:
+                try:
+                    t = yf.Ticker(ftk)
+                    fi = t.fast_info
+                    pc = float(fi.get('previousClose', 0) or fi.get('previous_close', 0) or 0)
+                    if pc > 0:
+                        old = self._daily_prev_close.get(ftk, 0)
+                        self._daily_prev_close[ftk] = pc
+                        if old and abs(pc - old) / old > 0.005:
+                            print(f"[MarketWatch]   {ftk} prev_close: {old:.2f} → {pc:.2f} (fast_info override)")
+                except Exception as e:
+                    print(f"[MarketWatch]   {ftk} fast_info failed: {e}")
+
+            # Log key futures for verification
             for ftk in ['CL=F', 'BZ=F', 'GC=F', 'ES=F', 'NQ=F', 'YM=F', 'RTY=F']:
                 if ftk in self._daily_prev_close:
                     print(f"[MarketWatch]   {ftk} prev_close = {self._daily_prev_close[ftk]:.2f}")
@@ -12879,10 +16918,12 @@ class PairsTradingTerminal(QMainWindow):
                 if close_price > 0 and not cached.get('price'):
                     name, market = self.MARKET_INSTRUMENTS[symbol]
                     prev_close = info.get('previous_close', 0)
-                    # Använd daily prev close om tillgänglig (fixar futures-rollover)
-                    # 15-min data ger fel prev_close vid kontraktsbyten (t.ex. CL=F $115→$90)
+                    # Commodity futures: use daily_prev_close (full session close)
+                    # instead of intraday previous_close (regular session close only).
+                    # This matches Yahoo Finance website's "Last Price" reference.
+                    _COMMODITY_FUTURES = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
                     daily_prev = self._daily_prev_close.get(symbol)
-                    if daily_prev and daily_prev > 0:
+                    if symbol in _COMMODITY_FUTURES and daily_prev and daily_prev > 0:
                         prev_close = daily_prev
                         change_pct = round((close_price - daily_prev) / daily_prev * 100, 2)
                     change = close_price - prev_close if prev_close > 0 else 0
@@ -13064,23 +17105,33 @@ class PairsTradingTerminal(QMainWindow):
             cached = self._market_data_cache[symbol]
             cached['price'] = update['price']
 
-            # Use daily previous close for accurate change% (WS change_percent
-            # is wrong for futures due to contract rollovers)
+            # For commodity futures: WS previous_close is regularMarketPreviousClose
+            # (regular session close), but Yahoo Finance website calculates change from
+            # the previous FULL session last trade (including extended hours). These differ
+            # by ~$40-50 for Gold. yf.download daily Close matches Yahoo's reference better.
+            # So: use daily_prev_close for commodity change%, WS for everything else.
+            _COMMODITY_FUTURES = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
             daily_prev = self._daily_prev_close.get(symbol)
-            if daily_prev and daily_prev > 0:
+            if symbol in _COMMODITY_FUTURES and daily_prev and daily_prev > 0:
                 cached['change'] = round(update['price'] - daily_prev, 4)
                 cached['change_pct'] = round((update['price'] - daily_prev) / daily_prev * 100, 2)
+                # Log first commodity override to verify
+                if not cached.get('_commodity_override_logged'):
+                    cached['_commodity_override_logged'] = True
+                    print(f"[MarketWatch] {symbol}: WS price={update['price']:.2f}, "
+                          f"daily_prev={daily_prev:.2f}, "
+                          f"calc_chg%={cached['change_pct']:.2f}%, "
+                          f"ws_chg%={update['change_pct']:.2f}%")
             else:
                 cached['change'] = update['change']
                 cached['change_pct'] = update['change_pct']
-
-            # Debug: log first update for commodities to verify correction
-            if symbol in ('CL=F', 'BZ=F') and not cached.get('_debug_logged'):
-                cached['_debug_logged'] = True
-                print(f"[MarketWatch] {symbol}: price={update['price']:.2f} "
-                      f"ws_chg_pct={update['change_pct']:.2f}% "
-                      f"daily_prev={daily_prev} "
-                      f"corrected_pct={cached['change_pct']:.2f}%")
+                # Debug: why commodity NOT overridden?
+                if symbol in _COMMODITY_FUTURES and not cached.get('_commodity_miss_logged'):
+                    cached['_commodity_miss_logged'] = True
+                    print(f"[MarketWatch] WARNING: {symbol} NOT overridden! "
+                          f"daily_prev={daily_prev}, "
+                          f"len(_daily_prev_close)={len(self._daily_prev_close)}, "
+                          f"keys={[k for k in self._daily_prev_close if '=F' in k]}")
 
             self._ws_cache_dirty = True
             self._ws_changed_symbols.add(symbol)
@@ -13724,15 +17775,20 @@ class PairsTradingTerminal(QMainWindow):
         
         self.statusBar().showMessage(f"Analysis complete: {n_viable} viable pairs found")
 
+        # Auto-run strategy analyses after scan (regardless of tab state)
+
         # If this was a scheduled scan, send Discord and refresh volatility cache
         if self._is_scheduled_scan:
             self._is_scheduled_scan = False
             self._scheduled_scan_running = False
             self.send_scan_results_to_discord()
             # Skicka dagligt sammanfattningsmail (fördröjt så Discord hinner först)
-            QTimer.singleShot(3000, self.send_daily_summary_email)
+            QTimer.singleShot(5000, self.send_daily_summary_email)
             # Uppdatera volatilitets-percentilcache (daglig refresh)
-            QTimer.singleShot(5000, self._start_volatility_refresh_safe)
+            QTimer.singleShot(8000, self._start_volatility_refresh_safe)
+            # Kör Master Scanner (alla 4 strategier) efter pairs-scan
+            # Fördröjd start så att Discord/email hinner skickas
+            QTimer.singleShot(12000, self._run_master_scanner_after_scheduled)
             self.statusBar().showMessage("Scheduled scan complete - results sent to Discord & Email")
     
     # ------------------------------------------------------------------
@@ -13884,9 +17940,25 @@ class PairsTradingTerminal(QMainWindow):
                     self.viable_table.setItem(i, 14, td_item)
                 else:
                     self.viable_table.setItem(i, 14, QTableWidgetItem("-"))
-                # Optimal Z* (column 15) — pre-computed during screening
+                # Optimal Z* (column 15) — beräkna om den saknas
                 _oz = getattr(row, 'optimal_z', None)
-                self.viable_table.setItem(i, 15, QTableWidgetItem(f"{_oz:.2f}" if _oz else "-"))
+                if _oz is None or (isinstance(_oz, float) and np.isnan(_oz)):
+                    # Kolumnen saknas i cache — beräkna on-the-fly
+                    try:
+                        _ou_tmp = OUProcess(row.theta, row.mu, row.eq_std)
+                        _oz = _ou_tmp.optimal_entry_zscore(
+                            garch_persistence=getattr(row, 'garch_persistence', 0.0),
+                            fractional_d=getattr(row, 'fractional_d', 0.5),
+                            hurst=getattr(row, 'hurst_exponent', 0.5),
+                        ).get('optimal_z', 2.0)
+                    except Exception:
+                        _oz = None
+                if _oz is not None and _oz != 0:
+                    oz_item = QTableWidgetItem(f"{float(_oz):.2f}")
+                    oz_item.setForeground(QColor(COLORS['accent']))
+                    self.viable_table.setItem(i, 15, oz_item)
+                else:
+                    self.viable_table.setItem(i, 15, QTableWidgetItem("-"))
         finally:
             self.viable_table.setUpdatesEnabled(True)
     
@@ -13953,7 +18025,7 @@ class PairsTradingTerminal(QMainWindow):
         pair = pair_item.text()
         self.selected_pair = pair
         # Switch to OU tab first (triggers lazy load if needed), then select pair
-        self.tabs.setCurrentIndex(2)
+        self.navigate_to_page(2)
         self.ou_pair_combo.setCurrentText(pair)
     
     def update_ou_pair_list(self):
@@ -14277,6 +18349,7 @@ class PairsTradingTerminal(QMainWindow):
             band_z = 2.0
         band_color = '#ffaa00'  # guldgul för entry-zoner
 
+        # Normalize spread to z-score: z = (spread - μ) / σ
         # Use Kalman time-varying μ and σ if available
         kalman = getattr(ou, '_kalman', None)
         if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
@@ -14292,57 +18365,53 @@ class PairsTradingTerminal(QMainWindow):
                 mu_vals = mu_hist[-len(x_axis):]
                 std_vals = std_hist[-len(x_axis):]
 
-            upper_band = mu_vals + band_z * std_vals
-            lower_band = mu_vals - band_z * std_vals
-
-            # Plot ±Opt.Z*σ band as fill
-            try:
-                upper_curve = self.ou_zscore_plot.plot(x_axis, upper_band, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-                lower_curve = self.ou_zscore_plot.plot(x_axis, lower_band, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-                fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 170, 0, 20))
-                self.ou_zscore_plot.addItem(fill)
-            except Exception:
-                pass
-
-            # Plot μ line
-            self.ou_zscore_plot.plot(x_axis, mu_vals, pen=pg.mkPen('#ffffff', width=1), name='μ')
+            with np.errstate(divide='ignore', invalid='ignore'):
+                z_values = (spread_values - mu_vals) / std_vals
+                z_values = np.where(np.isfinite(z_values), z_values, 0.0)
         else:
             # Fallback: static μ and σ from final OU params
-            mu_val = ou.mu
-            eq_std_val = ou.eq_std
-            self.ou_zscore_plot.addLine(y=mu_val, pen=pg.mkPen('#ffffff', width=1))
-            self.ou_zscore_plot.addLine(y=mu_val + band_z*eq_std_val, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-            self.ou_zscore_plot.addLine(y=mu_val - band_z*eq_std_val, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
+            mu_vals = np.full(len(spread_values), ou.mu)
+            std_vals = np.full(len(spread_values), ou.eq_std)
+            z_values = (spread_values - ou.mu) / ou.eq_std if ou.eq_std > 0 else np.zeros(len(spread_values))
 
-        # Plot the raw spread as bar chart (cleaner than noisy line)
-        # Color bars: cyan above μ, orange below μ
+        # Plot z-score bands: ±Opt.Z* as fill, μ=0 line
+        upper_z = np.full(len(x_axis), band_z)
+        lower_z = np.full(len(x_axis), -band_z)
         try:
-            ref_line = mu_vals if len(mu_vals) == len(spread_values) else np.full(len(spread_values), ou.mu)
-        except NameError:
-            ref_line = np.full(len(spread_values), ou.mu)
-        bar_colors = [pg.mkBrush(0, 229, 255, 160) if s >= m else pg.mkBrush(255, 140, 0, 160)
-                      for s, m in zip(spread_values, ref_line)]
+            upper_curve = self.ou_zscore_plot.plot(x_axis, upper_z, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
+            lower_curve = self.ou_zscore_plot.plot(x_axis, lower_z, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
+            fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 170, 0, 20))
+            self.ou_zscore_plot.addItem(fill)
+        except Exception:
+            pass
+        self.ou_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+
+        # Plot z-score as bar chart
+        # Color bars: red above upper band, green below lower band, orange within bands
+        bar_colors = []
+        for z in z_values:
+            if z > band_z:
+                bar_colors.append(pg.mkBrush(255, 50, 50, 160))    # red — above upper band
+            elif z < -band_z:
+                bar_colors.append(pg.mkBrush(50, 255, 50, 160))    # green — below lower band
+            else:
+                bar_colors.append(pg.mkBrush(255, 170, 0, 160))    # orange — within bands
+        # Clamp z-score for display to ±3 (keeps plot readable)
+        z_clamped = np.clip(z_values, -3.0, 3.0)
         bar_width = (x_axis[-1] - x_axis[0]) / len(x_axis) * 0.8 if len(x_axis) > 1 else 1.0
-        bar_item = pg.BarGraphItem(x=x_axis, height=spread_values - ref_line,
-                                   y0=ref_line, width=bar_width, brushes=bar_colors,
+        bar_item = pg.BarGraphItem(x=x_axis, height=z_clamped,
+                                   y0=0, width=bar_width, brushes=bar_colors,
                                    pen=pg.mkPen(None))
         self.ou_zscore_plot.addItem(bar_item)
 
-        # Keep zscore Series for crosshair (show spread value on hover)
-        zscore = spread
-        
+        # Keep unclamped z-score values for crosshair tooltip
+        zscore_values = z_values
+
         # ===== AUTO-RANGE: Reset view to show full data after plotting =====
         self._ou_syncing_plots = True
         self.ou_price_plot.enableAutoRange()
-        # Robust y-range for spread plot: use percentiles to avoid outlier compression
-        finite_spread = spread_values[np.isfinite(spread_values)]
-        if len(finite_spread) > 10:
-            p1, p99 = np.percentile(finite_spread, [1, 99])
-            margin = (p99 - p1) * 0.15
-            self.ou_zscore_plot.enableAutoRange(axis='x')
-            self.ou_zscore_plot.setYRange(p1 - margin, p99 + margin, padding=0)
-        else:
-            self.ou_zscore_plot.enableAutoRange()
+        self.ou_zscore_plot.enableAutoRange(axis='x')
+        self.ou_zscore_plot.setYRange(-3.3, 3.3, padding=0)
         QTimer.singleShot(50, lambda: setattr(self, '_ou_syncing_plots', False))
         
         # ===== SETUP CROSSHAIRS FOR INTERACTIVITY =====
@@ -14366,7 +18435,7 @@ class PairsTradingTerminal(QMainWindow):
             self.zscore_crosshair = CrosshairManager(
                 self.ou_zscore_plot,
                 dates=dates,
-                data_series={'Spread': zscore.values},
+                data_series={'Z-Score': zscore_values},
                 label_format="{:.2f}"
             )
             
@@ -14842,6 +18911,7 @@ class PairsTradingTerminal(QMainWindow):
             band_z = getattr(self, '_signal_opt_z', None) or 2.0
             band_color = '#ffaa00'  # guldgul för entry-zoner
 
+            # Normalize spread to z-score: z = (spread - μ) / σ
             kalman = getattr(ou, '_kalman', None)
             if kalman is not None and kalman.mu_history is not None and kalman.eq_std_history is not None:
                 mu_hist = kalman.mu_history
@@ -14855,52 +18925,50 @@ class PairsTradingTerminal(QMainWindow):
                     mu_vals = mu_hist[-len(x_axis):]
                     std_vals = std_hist[-len(x_axis):]
 
-                upper_band = mu_vals + band_z * std_vals
-                lower_band = mu_vals - band_z * std_vals
-
-                try:
-                    upper_curve = self.signal_zscore_plot.plot(x_axis, upper_band, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-                    lower_curve = self.signal_zscore_plot.plot(x_axis, lower_band, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-                    fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 170, 0, 20))
-                    self.signal_zscore_plot.addItem(fill)
-                except Exception:
-                    pass
-
-                self.signal_zscore_plot.plot(x_axis, mu_vals, pen=pg.mkPen('#ffffff', width=1))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    z_values = (spread_values - mu_vals) / std_vals
+                    z_values = np.where(np.isfinite(z_values), z_values, 0.0)
             else:
-                mu_val = ou.mu
-                eq_std_val = ou.eq_std
-                self.signal_zscore_plot.addLine(y=mu_val, pen=pg.mkPen('#ffffff', width=1))
-                self.signal_zscore_plot.addLine(y=mu_val + band_z*eq_std_val, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-                self.signal_zscore_plot.addLine(y=mu_val - band_z*eq_std_val, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
-            
-            # Plot spread as bar chart (cleaner than noisy line)
+                mu_vals = np.full(len(spread_values), ou.mu)
+                std_vals = np.full(len(spread_values), ou.eq_std)
+                z_values = (spread_values - ou.mu) / ou.eq_std if ou.eq_std > 0 else np.zeros(len(spread_values))
+
+            # Plot z-score bands: ±Opt.Z* as fill, μ=0 line
+            upper_z = np.full(len(x_axis), band_z)
+            lower_z = np.full(len(x_axis), -band_z)
             try:
-                ref_line = mu_vals if len(mu_vals) == len(spread_values) else np.full(len(spread_values), ou.mu)
-            except NameError:
-                ref_line = np.full(len(spread_values), ou.mu)
-            bar_colors = [pg.mkBrush(0, 229, 255, 160) if s >= m else pg.mkBrush(255, 140, 0, 160)
-                          for s, m in zip(spread_values, ref_line)]
+                upper_curve = self.signal_zscore_plot.plot(x_axis, upper_z, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
+                lower_curve = self.signal_zscore_plot.plot(x_axis, lower_z, pen=pg.mkPen(band_color, width=1, style=Qt.DashLine))
+                fill = pg.FillBetweenItem(upper_curve, lower_curve, brush=pg.mkBrush(255, 170, 0, 20))
+                self.signal_zscore_plot.addItem(fill)
+            except Exception:
+                pass
+            self.signal_zscore_plot.addLine(y=0, pen=pg.mkPen('#ffffff', width=1))
+
+            # Plot z-score as bar chart
+            # Color bars: red above upper band, green below lower band, orange within bands
+            bar_colors = []
+            for z in z_values:
+                if z > band_z:
+                    bar_colors.append(pg.mkBrush(255, 50, 50, 160))    # red — above upper band
+                elif z < -band_z:
+                    bar_colors.append(pg.mkBrush(50, 255, 50, 160))    # green — below lower band
+                else:
+                    bar_colors.append(pg.mkBrush(255, 170, 0, 160))    # orange — within bands
+            # Clamp z-score for display to ±3 (keeps plot readable)
+            z_clamped = np.clip(z_values, -3.0, 3.0)
             bar_width = (x_axis[-1] - x_axis[0]) / len(x_axis) * 0.8 if len(x_axis) > 1 else 1.0
-            bar_item = pg.BarGraphItem(x=x_axis, height=spread_values - ref_line,
-                                       y0=ref_line, width=bar_width, brushes=bar_colors,
+            bar_item = pg.BarGraphItem(x=x_axis, height=z_clamped,
+                                       y0=0, width=bar_width, brushes=bar_colors,
                                        pen=pg.mkPen(None))
             self.signal_zscore_plot.addItem(bar_item)
-            zscore = spread
-            
+            zscore_values = z_values
+
             # ===== AUTO-RANGE: Reset view to show full data after plotting =====
-            # Temporarily block sync signals to avoid recursive range triggering
             self._signal_syncing_plots = True
             self.signal_price_plot.enableAutoRange()
-            # Robust y-range for spread plot: use percentiles to avoid outlier compression
-            finite_spread = spread_values[np.isfinite(spread_values)]
-            if len(finite_spread) > 10:
-                p1, p99 = np.percentile(finite_spread, [1, 99])
-                margin = (p99 - p1) * 0.15
-                self.signal_zscore_plot.enableAutoRange(axis='x')
-                self.signal_zscore_plot.setYRange(p1 - margin, p99 + margin, padding=0)
-            else:
-                self.signal_zscore_plot.enableAutoRange()
+            self.signal_zscore_plot.enableAutoRange(axis='x')
+            self.signal_zscore_plot.setYRange(-3.3, 3.3, padding=0)
             # Use QTimer to unblock after the event loop processes the range changes
             QTimer.singleShot(50, lambda: setattr(self, '_signal_syncing_plots', False))
             
@@ -14925,7 +18993,7 @@ class PairsTradingTerminal(QMainWindow):
                 self.signal_zscore_crosshair = CrosshairManager(
                     self.signal_zscore_plot,
                     dates=dates,
-                    data_series={'Spread': zscore.values},
+                    data_series={'Z-Score': zscore_values},
                     label_format="{:.2f}"
                 )
                 
@@ -15001,32 +19069,44 @@ class PairsTradingTerminal(QMainWindow):
                     self._ms_fetch_thread.wait(3000)
             except RuntimeError:
                 pass  # Already deleted
+            # Keep old thread ref alive until it finishes (prevent GC crash)
+            if not hasattr(self, '_ms_old_threads'):
+                self._ms_old_threads = []
+            self._ms_old_threads.append(self._ms_fetch_thread)
             self._ms_fetch_thread = None
 
         # Launch async worker
         self._ms_fetch_worker = MSInstrumentWorker(
             y_ticker, x_ticker, dir_y, dir_x, ticker_to_ms, ticker_to_ms_asset)
-        self._ms_fetch_thread = QThread()
-        self._ms_fetch_worker.moveToThread(self._ms_fetch_thread)
+        thread = QThread()
+        self._ms_fetch_thread = thread
+        self._ms_fetch_worker.moveToThread(thread)
 
-        self._ms_fetch_thread.started.connect(self._ms_fetch_worker.run)
+        thread.started.connect(self._ms_fetch_worker.run)
         self._ms_fetch_worker.result.connect(self._on_ms_instruments_loaded)
         self._ms_fetch_worker.error.connect(lambda e: self.statusBar().showMessage(f"MS fetch error: {e}"))
-        self._ms_fetch_worker.finished.connect(self._ms_fetch_thread.quit)
+        self._ms_fetch_worker.finished.connect(thread.quit)
         self._ms_fetch_worker.finished.connect(self._ms_fetch_worker.deleteLater)
-        self._ms_fetch_thread.finished.connect(self._ms_fetch_thread.deleteLater)
-        self._ms_fetch_thread.finished.connect(lambda: setattr(self, '_ms_fetch_thread', None))
+        # Only clear ref if this thread is still the active one (prevents clobbering new thread)
+        thread.finished.connect(lambda t=thread: setattr(self, '_ms_fetch_thread', None) if self._ms_fetch_thread is t else None)
+        thread.finished.connect(thread.deleteLater)
 
-        self._ms_fetch_thread.start()
+        thread.start()
 
     def _on_ms_instruments_loaded(self, all_instruments_y: list, all_instruments_x: list, ticker_to_ms: dict):
         """Callback when MS instrument fetch completes — updates UI on main thread."""
+        # Guard: ignore stale results if user switched pair during fetch
+        pair = getattr(self, '_ms_pair', '')
+        signal_pair = getattr(self, 'signal_selected_pair', '')
+        if pair != signal_pair:
+            print(f"[MS] Ignoring stale result for {pair} (current pair: {signal_pair})")
+            return
+
         # Spara ofiltrerade listor + mapping för produkttyp-toggle
         self._all_instruments_y = all_instruments_y
         self._all_instruments_x = all_instruments_x
         self._last_ticker_to_ms = ticker_to_ms
 
-        pair = getattr(self, '_ms_pair', '')
         tickers = pair.split('/')
         if len(tickers) != 2:
             return
@@ -15126,9 +19206,8 @@ class PairsTradingTerminal(QMainWindow):
                 ux = units_x
                 while True:
                     next_x = ux + 1
-                    next_y = max(1, math.ceil(
-                        next_x * exp_per_unit_x / (beta * exp_per_unit_y)
-                    )) if beta > 0 else 1
+                    ratio = next_x * exp_per_unit_x / (beta * exp_per_unit_y) if (beta > 0 and exp_per_unit_y > 0) else 1.0
+                    next_y = max(1, math.ceil(ratio)) if math.isfinite(ratio) else 1
                     if next_y * inst_price_y + next_x * inst_price_x > notional:
                         break
                     units_x = next_x
@@ -15267,7 +19346,7 @@ class PairsTradingTerminal(QMainWindow):
         self._repopulate_combo_for_leg(leg)
 
     def _repopulate_combo_for_leg(self, leg: str):
-        """Filtrera instrument för ett ben baserat på dess aktiva produkttyp."""
+        """Filtrera instrument for ett ben baserat pa dess aktiva produkttyp."""
         all_insts = getattr(self, f'_all_instruments_{leg}', None)
         if all_insts is None:
             return
@@ -15281,8 +19360,13 @@ class PairsTradingTerminal(QMainWindow):
         else:
             self._instruments_x = filtered
 
-        ticker = filtered[0]['ticker'] if filtered else (all_insts[0]['ticker'] if all_insts else '')
-        direction = filtered[0]['direction'] if filtered else (all_insts[0]['direction'] if all_insts else 'Long')
+        # Anvand alltid originaltickern fran all_insts (forsvinner inte vid tom filtered)
+        if all_insts:
+            ticker = all_insts[0]['ticker']
+            direction = all_insts[0]['direction']
+        else:
+            ticker = ''
+            direction = 'Long'
 
         ticker_to_ms = getattr(self, '_last_ticker_to_ms', {})
         self._populate_instrument_combo(leg, ticker, direction, filtered, ticker_to_ms)
@@ -15592,6 +19676,259 @@ class PairsTradingTerminal(QMainWindow):
                 'kelly': 0
             }
     
+    # ════════════════════════════════════════════════════════════════
+    # STRADDLE POSITION (from TTM Squeeze tab)
+    # ════════════════════════════════════════════════════════════════
+
+    def _open_straddle_dialog(self):
+        """Show dialog to open a straddle position from squeeze tab."""
+        if not hasattr(self, 'squeeze_table'):
+            return
+        row = self.squeeze_table.currentRow()
+        if row < 0:
+            return
+        ticker_item = self.squeeze_table.item(row, 0)
+        if not ticker_item:
+            return
+        ticker = ticker_item.text()
+        opts = self._options_data.get(ticker, {})
+        atm_df = opts.get('atm_straddles')
+        if atm_df is None or atm_df.empty:
+            QMessageBox.warning(self, "No Data", f"No options data for {ticker}")
+            return
+
+        spot = opts.get('spot', 0)
+
+        # Build expiry choices
+        from datetime import date as _date, datetime as _dt
+        _today = _date.today()
+        expiry_choices = []
+        for _, r in atm_df.iterrows():
+            exp = str(r.get('Expiry', ''))[:10]
+            try:
+                dte = (_dt.strptime(exp, '%Y-%m-%d').date() - _today).days
+            except (ValueError, TypeError):
+                dte = 0
+            strike = r.get('Strike', 0)
+            straddle = r.get('Straddle', float('nan'))
+            cost = r.get('Cost_pct', float('nan'))
+            c_name = r.get('C_Name', '')
+            c_id = str(r.get('C_Id', ''))
+            p_name = r.get('P_Name', '')
+            p_id = str(r.get('P_Id', ''))
+            c_ask = r.get('C_Ask', float('nan'))
+            p_ask = r.get('P_Ask', float('nan'))
+            c_iv = r.get('C_IV', float('nan'))
+            p_iv = r.get('P_IV', float('nan'))
+            label = f"{exp} ({dte}d) — Strike {strike:.0f}"
+            if pd.notna(straddle):
+                label += f" — Straddle {straddle:.1f}"
+            if pd.notna(cost):
+                label += f" ({cost:.1f}%)"
+            expiry_choices.append({
+                'label': label, 'expiry': exp, 'dte': dte, 'strike': strike,
+                'c_name': c_name, 'c_id': c_id, 'p_name': p_name, 'p_id': p_id,
+                'c_ask': c_ask, 'p_ask': p_ask, 'c_iv': c_iv, 'p_iv': p_iv,
+                'straddle': straddle, 'cost_pct': cost,
+            })
+
+        # ── Dialog ──
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Open Straddle — {ticker}")
+        dlg.setMinimumWidth(500)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {COLORS['bg_dark']}; color: {COLORS['text_primary']}; }}
+            QLabel {{ color: {COLORS['text_primary']}; font-size: 12px; }}
+            QComboBox, QSpinBox, QDoubleSpinBox {{
+                background: {COLORS['bg_card']}; color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_subtle']}; border-radius: 4px;
+                padding: 6px; font-size: 12px;
+            }}
+        """)
+
+        form = QVBoxLayout(dlg)
+        form.setSpacing(12)
+
+        # Ticker + spot
+        form.addWidget(QLabel(f"<span style='color:{COLORS['accent']};font-size:14px;font-weight:700'>"
+                              f"{ticker}</span> &nbsp; Spot: {spot:.1f}"))
+
+        # Expiry combo
+        form.addWidget(QLabel("Expiry / Strike:"))
+        expiry_combo = QComboBox()
+        for ec in expiry_choices:
+            expiry_combo.addItem(ec['label'])
+        # Pre-select 60-180d if available
+        for idx, ec in enumerate(expiry_choices):
+            if 60 <= ec['dte'] <= 180:
+                expiry_combo.setCurrentIndex(idx)
+                break
+        form.addWidget(expiry_combo)
+
+        # Call entry
+        call_frame = QFrame()
+        call_layout = QHBoxLayout(call_frame)
+        call_layout.setContentsMargins(0, 0, 0, 0)
+        call_layout.addWidget(QLabel("Call entry price:"))
+        call_price_spin = QDoubleSpinBox()
+        call_price_spin.setRange(0, 100000)
+        call_price_spin.setDecimals(2)
+        call_price_spin.setSingleStep(0.1)
+        call_layout.addWidget(call_price_spin)
+        call_layout.addWidget(QLabel("Qty:"))
+        call_qty_spin = QSpinBox()
+        call_qty_spin.setRange(1, 10000)
+        call_qty_spin.setValue(10)
+        call_layout.addWidget(call_qty_spin)
+        form.addWidget(call_frame)
+
+        # Put entry
+        put_frame = QFrame()
+        put_layout = QHBoxLayout(put_frame)
+        put_layout.setContentsMargins(0, 0, 0, 0)
+        put_layout.addWidget(QLabel("Put entry price:"))
+        put_price_spin = QDoubleSpinBox()
+        put_price_spin.setRange(0, 100000)
+        put_price_spin.setDecimals(2)
+        put_price_spin.setSingleStep(0.1)
+        put_layout.addWidget(put_price_spin)
+        put_layout.addWidget(QLabel("Qty:"))
+        put_qty_spin = QSpinBox()
+        put_qty_spin.setRange(1, 10000)
+        put_qty_spin.setValue(10)
+        put_layout.addWidget(put_qty_spin)
+        form.addWidget(put_frame)
+
+        # Parity (multiplikator)
+        parity_frame = QFrame()
+        parity_layout = QHBoxLayout(parity_frame)
+        parity_layout.setContentsMargins(0, 0, 0, 0)
+        parity_layout.addWidget(QLabel("Paritet (multiplikator):"))
+        parity_spin = QSpinBox()
+        parity_spin.setRange(1, 10000)
+        parity_spin.setValue(100)  # Default för svenska aktieoptioner
+        parity_spin.setToolTip("Antal underliggande per kontrakt (vanligtvis 100 för aktieoptioner)")
+        parity_layout.addWidget(parity_spin)
+        parity_layout.addStretch()
+        form.addWidget(parity_frame)
+
+        # Info label (updates with selected expiry)
+        info_label = QLabel("")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;padding:4px;")
+        form.addWidget(info_label)
+
+        def _on_expiry_changed(idx):
+            if 0 <= idx < len(expiry_choices):
+                ec = expiry_choices[idx]
+                if pd.notna(ec['c_ask']):
+                    call_price_spin.setValue(ec['c_ask'])
+                if pd.notna(ec['p_ask']):
+                    put_price_spin.setValue(ec['p_ask'])
+                parts = [f"Call: {ec['c_name']}" if ec['c_name'] else "",
+                         f"Put: {ec['p_name']}" if ec['p_name'] else ""]
+                if pd.notna(ec['c_iv']):
+                    parts.append(f"Call IV: {ec['c_iv']:.1f}%")
+                if pd.notna(ec['p_iv']):
+                    parts.append(f"Put IV: {ec['p_iv']:.1f}%")
+                info_label.setText(" · ".join(p for p in parts if p))
+
+        expiry_combo.currentIndexChanged.connect(_on_expiry_changed)
+        _on_expiry_changed(expiry_combo.currentIndex())
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(f"background:{COLORS['bg_elevated']};color:{COLORS['text_primary']};"
+                                 f"border:1px solid {COLORS['border_subtle']};border-radius:4px;padding:8px 20px;")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        open_btn = QPushButton("Open Position")
+        open_btn.setStyleSheet(f"background:{COLORS['positive']};color:{COLORS['bg_darkest']};"
+                               f"border:none;border-radius:4px;padding:8px 20px;font-weight:700;")
+        open_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(open_btn)
+        form.addLayout(btn_layout)
+
+        if dlg.exec() == QDialog.Accepted:
+            idx = expiry_combo.currentIndex()
+            ec = expiry_choices[idx]
+            self._create_straddle_position(
+                ticker=ticker, spot=spot, expiry=ec['expiry'], dte=ec['dte'],
+                strike=ec['strike'],
+                c_name=ec['c_name'], c_id=ec['c_id'],
+                p_name=ec['p_name'], p_id=ec['p_id'],
+                c_entry=call_price_spin.value(), c_qty=call_qty_spin.value(),
+                p_entry=put_price_spin.value(), p_qty=put_qty_spin.value(),
+                c_iv=ec['c_iv'], p_iv=ec['p_iv'],
+                cost_pct=ec['cost_pct'],
+                parity=parity_spin.value(),
+            )
+
+    def _create_straddle_position(self, ticker, spot, expiry, dte, strike,
+                                   c_name, c_id, p_name, p_id,
+                                   c_entry, c_qty, p_entry, p_qty,
+                                   c_iv, p_iv, cost_pct, parity=100):
+        """Create a straddle position and add to portfolio."""
+        # HV snapshot
+        hv_20d = None
+        if self._squeeze_result and ticker in self._squeeze_result.ticker_results:
+            tr = self._squeeze_result.ticker_results[ticker]
+            if hasattr(tr, 'price') and len(tr.price) > 20:
+                returns = tr.price.pct_change().dropna()
+                hv_20d = float(returns.iloc[-20:].std() * (252 ** 0.5) * 100)
+
+        avg_iv = None
+        if pd.notna(c_iv) and pd.notna(p_iv):
+            avg_iv = (c_iv + p_iv) / 2
+
+        position = {
+            'position_type': 'straddle',
+            'pair': ticker,
+            'direction': 'STRADDLE',
+            'entry_date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'status': 'OPEN',
+            'expiry': expiry,
+            'dte_at_entry': dte,
+            'strike': strike,
+            'entry_spot': spot,
+            'entry_iv': avg_iv,
+            'entry_hv': hv_20d,
+            'entry_cost_pct': cost_pct if pd.notna(cost_pct) else None,
+            # Call leg → Y columns
+            'mini_y_name': c_name,
+            'mini_y_isin': c_id,
+            'mf_entry_price_y': c_entry,
+            'mf_qty_y': c_qty,
+            'mf_current_price_y': c_entry,  # Initial = entry
+            # Put leg → X columns
+            'mini_x_name': p_name,
+            'mini_x_isin': p_id,
+            'mf_entry_price_x': p_entry,
+            'mf_qty_x': p_qty,
+            'mf_current_price_x': p_entry,  # Initial = entry
+            # Parity (multiplikator) — antal underliggande per kontrakt
+            'parity': parity,
+            # Pairs compat fields
+            'entry_z': 0, 'current_z': 0, 'hedge_ratio': 1.0,
+            'notional': round((c_entry * c_qty + p_entry * p_qty) * parity, 2),
+        }
+
+        self.portfolio.append(position)
+        self.update_portfolio_display()
+        self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
+        self._save_and_sync_portfolio()
+
+        self.statusBar().showMessage(
+            f"Opened straddle: {ticker} {expiry} strike {strike} | "
+            f"Call {c_entry:.2f} x{c_qty} + Put {p_entry:.2f} x{p_qty}")
+
+    # ════════════════════════════════════════════════════════════════
+    # PAIRS POSITION (from Signals tab)
+    # ════════════════════════════════════════════════════════════════
+
     def open_position(self, strategy_type: str = "Balanced"):
         """Open a new position."""
         if self.signal_selected_pair is None or self.engine is None:
@@ -15650,7 +19987,7 @@ class PairsTradingTerminal(QMainWindow):
                 'mf_exposure_x': self.current_mf_positions.get('exposure_x') if self.current_mf_positions else None,
                 'mf_total_capital': self.current_mf_positions.get('total_capital') if self.current_mf_positions else None,
                 'mf_effective_leverage': self.current_mf_positions.get('effective_leverage') if self.current_mf_positions else None,
-                'window_size': min(pair_stats['passing_windows']) if pair_stats['passing_windows'] else None,
+                'window_size': None,  # Multi-window removed (single 2y period)
             }
             
             self.portfolio.append(position)
@@ -15696,53 +20033,102 @@ class PairsTradingTerminal(QMainWindow):
         total_invested = 0.0
 
         for i, pos in enumerate(self.portfolio):
-            # PAIR (col 0)
-            pair_item = QTableWidgetItem(pos['pair'])
+            is_straddle = pos.get('position_type') == 'straddle'
+
+            # POSITION (col 0)
+            pos_text = pos['pair']
+            if is_straddle:
+                expiry = pos.get('expiry', '')
+                strike = pos.get('strike', 0)
+                pos_text = f"{pos['pair']} {expiry} K{strike:.0f}"
+            pair_item = QTableWidgetItem(pos_text)
             pair_item.setForeground(_QCOLOR_TEXT)
             pair_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 0, pair_item)
 
-            # DIRECTION (col 1)
-            dir_item = QTableWidgetItem(pos['direction'])
-            dir_item.setForeground(_QCOLOR_TEXT)
+            # TYPE (col 1)
+            dir_text = pos['direction']
+            dir_item = QTableWidgetItem(dir_text)
+            dir_color = QColor(COLORS['accent']) if is_straddle else _QCOLOR_TEXT
+            dir_item.setForeground(dir_color)
             dir_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 1, dir_item)
 
-            # CURRENT Z (col 2)
-            current_z = pos.get('current_z', pos['entry_z'])
-            z_item = QTableWidgetItem(f"{current_z:.2f}")
-            z_item.setForeground(_QCOLOR_TEXT)
+            # SIGNAL (col 2) — Z-score for pairs, DTE for straddles
+            if is_straddle:
+                from datetime import date as _date_p, datetime as _dt_p
+                try:
+                    exp_date = _dt_p.strptime(pos.get('expiry', ''), '%Y-%m-%d').date()
+                    dte_now = (exp_date - _date_p.today()).days
+                    dte_text = f"{dte_now}d"
+                    dte_color = QColor(COLORS['warning']) if dte_now < 30 else _QCOLOR_TEXT
+                except (ValueError, TypeError):
+                    dte_text = "-"
+                    dte_color = _QCOLOR_MUTED
+                z_item = QTableWidgetItem(dte_text)
+                z_item.setForeground(dte_color)
+            else:
+                current_z = pos.get('current_z', pos.get('entry_z', 0))
+                z_item = QTableWidgetItem(f"{current_z:.2f}")
+                z_item.setForeground(_QCOLOR_TEXT)
             z_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 2, z_item)
 
-            # STATUS (col 3) - Purely dynamic: SELL when z crosses zero toward profit
+            # STATUS (col 3)
             direction = pos['direction']
-
-            if direction == 'LONG' and current_z > 0:
-                status_text = 'SELL'
-                status_qcolor = _QCOLOR_AMBER
-            elif direction == 'SHORT' and current_z < 0:
-                status_text = 'SELL'
-                status_qcolor = _QCOLOR_AMBER
+            if is_straddle:
+                # Straddle status: check P/L and DTE
+                c_entry = pos.get('mf_entry_price_y', 0) or 0
+                p_entry = pos.get('mf_entry_price_x', 0) or 0
+                c_cur = pos.get('mf_current_price_y', 0) or 0
+                p_cur = pos.get('mf_current_price_x', 0) or 0
+                c_qty = pos.get('mf_qty_y', 0) or 0
+                p_qty = pos.get('mf_qty_x', 0) or 0
+                total_entry = c_entry * c_qty + p_entry * p_qty
+                total_cur = c_cur * c_qty + p_cur * p_qty
+                if total_entry > 0 and total_cur > 0:
+                    pnl_pct = (total_cur / total_entry - 1) * 100
+                    if pnl_pct > 20:
+                        status_text = 'TAKE PROFIT'
+                        status_qcolor = QColor(COLORS['positive'])
+                    elif pnl_pct < -30:
+                        status_text = 'STOP LOSS'
+                        status_qcolor = _QCOLOR_NEGATIVE
+                    else:
+                        status_text = 'OPEN'
+                        status_qcolor = _QCOLOR_TEXT
+                else:
+                    status_text = 'OPEN'
+                    status_qcolor = _QCOLOR_TEXT
             else:
-                status_text = 'OPEN'
-                status_qcolor = _QCOLOR_TEXT
+                current_z = pos.get('current_z', pos.get('entry_z', 0))
+                if direction == 'LONG' and current_z > 0:
+                    status_text = 'SELL'
+                    status_qcolor = _QCOLOR_AMBER
+                elif direction == 'SHORT' and current_z < 0:
+                    status_text = 'SELL'
+                    status_qcolor = _QCOLOR_AMBER
+                else:
+                    status_text = 'OPEN'
+                    status_qcolor = _QCOLOR_TEXT
 
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(status_qcolor)
             status_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 3, status_item)
 
-            # MINI Y (col 4) - Show NAME (ISIN in tooltip)
+            # LEG 1 / Y / CALL (col 4)
             mini_y_isin = pos.get('mini_y_isin', '')
             mini_y_name = pos.get('mini_y_name', '')
+            leg1_prefix = "CALL: " if is_straddle else ""
             if mini_y_name:
-                mini_y_item = QTableWidgetItem(mini_y_name)
-                mini_y_item.setToolTip(f"{mini_y_name}\nISIN: {mini_y_isin}")
+                mini_y_item = QTableWidgetItem(f"{leg1_prefix}{mini_y_name}")
+                tip = f"{'Call option' if is_straddle else mini_y_name}\nID: {mini_y_isin}"
+                mini_y_item.setToolTip(tip)
                 mini_y_item.setForeground(_QCOLOR_TEXT)
             elif mini_y_isin:
-                mini_y_item = QTableWidgetItem(mini_y_isin[:12])
-                mini_y_item.setToolTip(f"ISIN: {mini_y_isin}")
+                mini_y_item = QTableWidgetItem(f"{leg1_prefix}{mini_y_isin[:12]}")
+                mini_y_item.setToolTip(f"ID: {mini_y_isin}")
                 mini_y_item.setForeground(_QCOLOR_TEXT)
             else:
                 mini_y_item = QTableWidgetItem("-")
@@ -15776,14 +20162,15 @@ class PairsTradingTerminal(QMainWindow):
             entry_price_y = pos.get('mf_entry_price_y', 0.0)
             current_price_y = pos.get('mf_current_price_y', 0.0)
             qty_y = pos.get('mf_qty_y', 0)
+            parity = pos.get('parity', 1)  # 1 for pairs, 100 for options
 
             if entry_price_y > 0 and qty_y > 0:
-                pnl_y = (current_price_y - entry_price_y) * qty_y
+                pnl_y = (current_price_y - entry_price_y) * qty_y * parity
                 pnl_y_pct = ((current_price_y / entry_price_y) - 1) * 100 if entry_price_y > 0 else 0
                 pnl_y_text = f"{pnl_y:+,.0f} ({pnl_y_pct:+.1f}%)"
                 pnl_y_qcolor = _QCOLOR_POSITIVE if pnl_y >= 0 else _QCOLOR_NEGATIVE
                 total_pnl += pnl_y
-                total_invested += entry_price_y * qty_y
+                total_invested += entry_price_y * qty_y * parity
             else:
                 pnl_y_text = "-"
                 pnl_y_qcolor = _QCOLOR_MUTED
@@ -15793,16 +20180,18 @@ class PairsTradingTerminal(QMainWindow):
             pnl_y_item.setTextAlignment(Qt.AlignCenter)
             self.positions_table.setItem(i, 7, pnl_y_item)
 
-            # MINI X (col 8) - Show NAME (ISIN in tooltip)
+            # LEG 2 / X / PUT (col 8)
             mini_x_isin = pos.get('mini_x_isin', '')
             mini_x_name = pos.get('mini_x_name', '')
+            leg2_prefix = "PUT: " if is_straddle else ""
             if mini_x_name:
-                mini_x_item = QTableWidgetItem(mini_x_name)
-                mini_x_item.setToolTip(f"{mini_x_name}\nISIN: {mini_x_isin}")
+                mini_x_item = QTableWidgetItem(f"{leg2_prefix}{mini_x_name}")
+                tip = f"{'Put option' if is_straddle else mini_x_name}\nID: {mini_x_isin}"
+                mini_x_item.setToolTip(tip)
                 mini_x_item.setForeground(_QCOLOR_TEXT)
             elif mini_x_isin:
-                mini_x_item = QTableWidgetItem(mini_x_isin[:12])
-                mini_x_item.setToolTip(f"ISIN: {mini_x_isin}")
+                mini_x_item = QTableWidgetItem(f"{leg2_prefix}{mini_x_isin[:12]}")
+                mini_x_item.setToolTip(f"ID: {mini_x_isin}")
                 mini_x_item.setForeground(_QCOLOR_TEXT)
             else:
                 mini_x_item = QTableWidgetItem("-")
@@ -15838,12 +20227,12 @@ class PairsTradingTerminal(QMainWindow):
             qty_x = pos.get('mf_qty_x', 0)
 
             if entry_price_x > 0 and qty_x > 0:
-                pnl_x = (current_price_x - entry_price_x) * qty_x
+                pnl_x = (current_price_x - entry_price_x) * qty_x * parity
                 pnl_x_pct = ((current_price_x / entry_price_x) - 1) * 100 if entry_price_x > 0 else 0
                 pnl_x_text = f"{pnl_x:+,.0f} ({pnl_x_pct:+.1f}%)"
                 pnl_x_qcolor = _QCOLOR_POSITIVE if pnl_x >= 0 else _QCOLOR_NEGATIVE
                 total_pnl += pnl_x
-                total_invested += entry_price_x * qty_x
+                total_invested += entry_price_x * qty_x * parity
             else:
                 pnl_x_text = "-"
                 pnl_x_qcolor = _QCOLOR_MUTED
@@ -15974,9 +20363,10 @@ class PairsTradingTerminal(QMainWindow):
         entry_price_y = pos.get('mf_entry_price_y', 0.0)
         current_price_y = pos.get('mf_current_price_y', 0.0)
         qty_y = pos.get('mf_qty_y', 0)
+        parity = pos.get('parity', 1)
 
         if entry_price_y > 0 and qty_y > 0 and current_price_y > 0:
-            pnl_y = (current_price_y - entry_price_y) * qty_y
+            pnl_y = (current_price_y - entry_price_y) * qty_y * parity
             pnl_y_pct = ((current_price_y / entry_price_y) - 1) * 100
             pnl_y_text = f"{pnl_y:+,.0f} ({pnl_y_pct:+.1f}%)"
             pnl_y_qcolor = _QCOLOR_POSITIVE if pnl_y >= 0 else _QCOLOR_NEGATIVE
@@ -15994,7 +20384,7 @@ class PairsTradingTerminal(QMainWindow):
         qty_x = pos.get('mf_qty_x', 0)
 
         if entry_price_x > 0 and qty_x > 0 and current_price_x > 0:
-            pnl_x = (current_price_x - entry_price_x) * qty_x
+            pnl_x = (current_price_x - entry_price_x) * qty_x * parity
             pnl_x_pct = ((current_price_x / entry_price_x) - 1) * 100
             pnl_x_text = f"{pnl_x:+,.0f} ({pnl_x_pct:+.1f}%)"
             pnl_x_qcolor = _QCOLOR_POSITIVE if pnl_x >= 0 else _QCOLOR_NEGATIVE
@@ -16015,21 +20405,22 @@ class PairsTradingTerminal(QMainWindow):
         total_invested = 0.0
         
         for pos in self.portfolio:
+            parity = pos.get('parity', 1)
             entry_y = pos.get('mf_entry_price_y', 0.0)
             current_y = pos.get('mf_current_price_y', 0.0)
             qty_y = pos.get('mf_qty_y', 0)
-            
+
             if entry_y > 0 and qty_y > 0 and current_y > 0:
-                total_pnl += (current_y - entry_y) * qty_y
-                total_invested += entry_y * qty_y
-            
+                total_pnl += (current_y - entry_y) * qty_y * parity
+                total_invested += entry_y * qty_y * parity
+
             entry_x = pos.get('mf_entry_price_x', 0.0)
             current_x = pos.get('mf_current_price_x', 0.0)
             qty_x = pos.get('mf_qty_x', 0)
-            
+
             if entry_x > 0 and qty_x > 0 and current_x > 0:
-                total_pnl += (current_x - entry_x) * qty_x
-                total_invested += entry_x * qty_x
+                total_pnl += (current_x - entry_x) * qty_x * parity
+                total_invested += entry_x * qty_x * parity
         
         if total_invested > 0:
             total_pnl_pct = (total_pnl / total_invested) * 100
@@ -16039,57 +20430,83 @@ class PairsTradingTerminal(QMainWindow):
             self.unrealized_pnl_label.setText("Unrealized: <span style='color:#888;'>+0.00%</span>")
     
     def refresh_mf_prices(self):
-        """Refresh current mini futures prices from Morgan Stanley ASYNCHRONOUSLY."""
-        if not MF_PRICE_SCRAPING_AVAILABLE:
-            QMessageBox.warning(self, "Not Available", 
-                "Mini futures price scraping is not available.\n"
-                "Make sure scrape_prices_MS.py is in the same directory.")
-            return
-        
+        """Refresh current prices for all portfolio instruments (MF + options)."""
         if not self.portfolio:
             self.statusBar().showMessage("No positions to update")
             return
-        
-        self.statusBar().showMessage("Fetching mini futures prices...")
-        
-        # Collect all ISINs and store mapping for callback
-        isins_to_fetch = []
-        self._mf_isin_to_positions = {}  # Store for callback use
-        
+
+        # Separate straddle vs pairs positions
+        mf_isins = []
+        opt_ids = []
+        self._mf_isin_to_positions = {}
+        self._opt_id_to_positions = {}
+
         for idx, pos in enumerate(self.portfolio):
-            mini_y_isin = pos.get('mini_y_isin')
-            mini_x_isin = pos.get('mini_x_isin')
-            
-            if mini_y_isin:
-                if mini_y_isin not in self._mf_isin_to_positions:
-                    self._mf_isin_to_positions[mini_y_isin] = []
-                    isins_to_fetch.append(mini_y_isin)
-                self._mf_isin_to_positions[mini_y_isin].append((idx, 'y'))
-            
-            if mini_x_isin:
-                if mini_x_isin not in self._mf_isin_to_positions:
-                    self._mf_isin_to_positions[mini_x_isin] = []
-                    isins_to_fetch.append(mini_x_isin)
-                self._mf_isin_to_positions[mini_x_isin].append((idx, 'x'))
-        
-        if not isins_to_fetch:
-            self.statusBar().showMessage("No mini futures ISINs to update")
-            return
-        
-        # Run in background thread to prevent GUI freeze
-        self._price_thread = QThread()
-        self._price_worker = PriceFetchWorker(isins_to_fetch)
-        self._price_worker.moveToThread(self._price_thread)
-        
-        self._price_thread.started.connect(self._price_worker.run)
-        self._price_worker.finished.connect(self._price_thread.quit)
-        self._price_worker.finished.connect(self._price_worker.deleteLater)
-        self._price_thread.finished.connect(self._price_thread.deleteLater)
-        self._price_worker.result.connect(self._on_mf_prices_received)
-        self._price_worker.error.connect(self._on_mf_prices_error)
-        self._price_worker.status_message.connect(self.statusBar().showMessage)
-        
-        self._price_thread.start()
+            is_straddle = pos.get('position_type') == 'straddle'
+            mini_y_id = pos.get('mini_y_isin')
+            mini_x_id = pos.get('mini_x_isin')
+
+            if is_straddle:
+                # Straddle: fetch from Avanza (orderbookId)
+                if mini_y_id:
+                    if mini_y_id not in self._opt_id_to_positions:
+                        self._opt_id_to_positions[mini_y_id] = []
+                        opt_ids.append(mini_y_id)
+                    self._opt_id_to_positions[mini_y_id].append((idx, 'y'))
+                if mini_x_id:
+                    if mini_x_id not in self._opt_id_to_positions:
+                        self._opt_id_to_positions[mini_x_id] = []
+                        opt_ids.append(mini_x_id)
+                    self._opt_id_to_positions[mini_x_id].append((idx, 'x'))
+            else:
+                # Pairs: fetch from Morgan Stanley (ISIN)
+                if mini_y_id:
+                    if mini_y_id not in self._mf_isin_to_positions:
+                        self._mf_isin_to_positions[mini_y_id] = []
+                        mf_isins.append(mini_y_id)
+                    self._mf_isin_to_positions[mini_y_id].append((idx, 'y'))
+                if mini_x_id:
+                    if mini_x_id not in self._mf_isin_to_positions:
+                        self._mf_isin_to_positions[mini_x_id] = []
+                        mf_isins.append(mini_x_id)
+                    self._mf_isin_to_positions[mini_x_id].append((idx, 'x'))
+
+        launched = 0
+
+        # Launch MF price fetch (pairs positions)
+        if mf_isins and MF_PRICE_SCRAPING_AVAILABLE:
+            self.statusBar().showMessage(f"Fetching {len(mf_isins)} MF + {len(opt_ids)} option prices...")
+            self._price_thread = QThread()
+            self._price_worker = PriceFetchWorker(mf_isins)
+            self._price_worker.moveToThread(self._price_thread)
+            self._price_thread.started.connect(self._price_worker.run)
+            self._price_worker.finished.connect(self._price_thread.quit)
+            self._price_worker.finished.connect(self._price_worker.deleteLater)
+            self._price_thread.finished.connect(self._price_thread.deleteLater)
+            self._price_worker.result.connect(self._on_mf_prices_received)
+            self._price_worker.error.connect(self._on_mf_prices_error)
+            self._price_worker.status_message.connect(self.statusBar().showMessage)
+            self._price_thread.start()
+            launched += 1
+
+        # Launch option price fetch (straddle positions)
+        if opt_ids:
+            self.statusBar().showMessage(f"Fetching {len(opt_ids)} option prices...")
+            self._opt_price_thread = QThread()
+            self._opt_price_worker = OptionPriceFetchWorker(opt_ids)
+            self._opt_price_worker.moveToThread(self._opt_price_thread)
+            self._opt_price_thread.started.connect(self._opt_price_worker.run)
+            self._opt_price_worker.finished.connect(self._opt_price_thread.quit)
+            self._opt_price_worker.finished.connect(self._opt_price_worker.deleteLater)
+            self._opt_price_thread.finished.connect(self._opt_price_thread.deleteLater)
+            self._opt_price_worker.result.connect(self._on_option_prices_received)
+            self._opt_price_worker.error.connect(self._on_mf_prices_error)
+            self._opt_price_worker.status_message.connect(self.statusBar().showMessage)
+            self._opt_price_thread.start()
+            launched += 1
+
+        if launched == 0:
+            self.statusBar().showMessage("No instruments to update")
     
     def _on_mf_prices_received(self, quotes: dict):
         """Handle fetched mini futures prices - runs on GUI thread (safe)."""
@@ -16113,11 +20530,33 @@ class PairsTradingTerminal(QMainWindow):
             print(f"Error processing MF prices: {e}")
             self.statusBar().showMessage(f"Price processing error: {e}")
     
+    def _on_option_prices_received(self, quotes: dict):
+        """Handle fetched option prices from Avanza — update straddle positions."""
+        try:
+            updated_count = 0
+            for ob_id, price_data in quotes.items():
+                if ob_id in self._opt_id_to_positions:
+                    # Använd bid (köpkurs) = vad vi faktiskt får vid försäljning.
+                    # Avanza visar "last" men bid ger sannare exit-värdering.
+                    price = price_data.get('buy') or price_data.get('last')
+                    if price is not None:
+                        for pos_idx, leg in self._opt_id_to_positions[ob_id]:
+                            if pos_idx < len(self.portfolio):
+                                self.portfolio[pos_idx][f'mf_current_price_{leg}'] = price
+                                updated_count += 1
+
+            self._save_and_sync_portfolio()
+            self.update_portfolio_display()
+            self.statusBar().showMessage(f"Updated {updated_count} option prices from {len(quotes)} instruments")
+        except Exception as e:
+            print(f"Error processing option prices: {e}")
+            self.statusBar().showMessage(f"Option price error: {e}")
+
     def _on_mf_prices_error(self, error: str):
-        """Handle mini futures price fetch error."""
-        print(f"MF price fetch error: {error}")
+        """Handle price fetch error."""
+        print(f"Price fetch error: {error}")
         self.statusBar().showMessage(f"Price fetch error: {error}")
-    
+
     def refresh_portfolio_zscores(self):
         """Refresh current Z-scores for all open positions."""
         if not self.portfolio or self.engine is None:
@@ -16161,27 +20600,28 @@ class PairsTradingTerminal(QMainWindow):
             # Calculate realized P/L from MF prices
             pnl_y = 0
             pnl_x = 0
+            parity = pos.get('parity', 1)
 
             entry_y = pos.get('mf_entry_price_y')
             current_y = pos.get('mf_current_price_y')
             qty_y = pos.get('mf_qty_y', 0)
             if entry_y and current_y and qty_y:
-                pnl_y = (current_y - entry_y) * qty_y
+                pnl_y = (current_y - entry_y) * qty_y * parity
 
             entry_x = pos.get('mf_entry_price_x')
             current_x = pos.get('mf_current_price_x')
             qty_x = pos.get('mf_qty_x', 0)
             if entry_x and current_x and qty_x:
-                pnl_x = (current_x - entry_x) * qty_x
+                pnl_x = (current_x - entry_x) * qty_x * parity
 
             realized_pnl_sek = pnl_y + pnl_x
 
-            # Capital = actual invested amount (entry_price * qty per leg)
+            # Capital = actual invested amount (entry_price * qty * parity per leg)
             total_capital = 0
             if entry_y and qty_y:
-                total_capital += entry_y * qty_y
+                total_capital += entry_y * qty_y * parity
             if entry_x and qty_x:
-                total_capital += entry_x * qty_x
+                total_capital += entry_x * qty_x * parity
             # Fallback if no MF data entered
             if total_capital == 0:
                 total_capital = pos.get('mf_total_capital', pos.get('notional', 0))
@@ -16196,16 +20636,25 @@ class PairsTradingTerminal(QMainWindow):
                 # Fallback to Z-score direction when no MF prices available
                 profit = (z_change > 0) if direction == 'LONG' else (z_change < 0)
             
+            is_straddle = pos.get('position_type') == 'straddle'
             status = pos.get('status', 'MANUAL CLOSE')
-            
+
             # Confirmation dialog
-            msg = f"Close position for {pos['pair']}?\n\n"
-            msg += f"Direction: {direction}\n"
-            msg += f"Entry Z: {entry_z:.2f}\n"
-            msg += f"Current Z: {current_z:.2f}\n"
-            msg += f"Z Change: {z_change:+.2f}\n"
-            msg += f"Realized P/L: {realized_pnl_sek:+.0f} SEK ({realized_pnl_pct:+.1f}%)\n"
-            msg += f"Status: {status}"
+            if is_straddle:
+                msg = f"Close straddle for {pos['pair']}?\n\n"
+                msg += f"Expiry: {pos.get('expiry', '?')}\n"
+                msg += f"Strike: {pos.get('strike', 0):.0f}\n"
+                msg += f"Call: {pos.get('mini_y_name', '')} entry {entry_y or 0:.2f} → {current_y or 0:.2f}\n"
+                msg += f"Put: {pos.get('mini_x_name', '')} entry {entry_x or 0:.2f} → {current_x or 0:.2f}\n"
+                msg += f"Realized P/L: {realized_pnl_sek:+.0f} SEK ({realized_pnl_pct:+.1f}%)\n"
+            else:
+                msg = f"Close position for {pos['pair']}?\n\n"
+                msg += f"Direction: {direction}\n"
+                msg += f"Entry Z: {entry_z:.2f}\n"
+                msg += f"Current Z: {current_z:.2f}\n"
+                msg += f"Z Change: {z_change:+.2f}\n"
+                msg += f"Realized P/L: {realized_pnl_sek:+.0f} SEK ({realized_pnl_pct:+.1f}%)\n"
+                msg += f"Status: {status}"
             
             reply = QMessageBox.question(self, "Close Position", msg,
                 QMessageBox.Yes | QMessageBox.No)
@@ -16216,6 +20665,7 @@ class PairsTradingTerminal(QMainWindow):
                 # Create trade history record
                 result = "PROFIT" if profit else "LOSS"
                 trade_record = {
+                    'position_type': pos.get('position_type', 'pairs'),
                     'pair': pos['pair'],
                     'direction': direction,
                     'entry_date': pos.get('entry_date', ''),
@@ -16227,7 +20677,7 @@ class PairsTradingTerminal(QMainWindow):
                     'realized_pnl_pct': round(realized_pnl_pct, 2),
                     'capital': total_capital,
                     'status': status,
-                    # Preserve MF details for reference
+                    # Preserve leg details
                     'mini_y_name': pos.get('mini_y_name', ''),
                     'mini_x_name': pos.get('mini_x_name', ''),
                     'mf_entry_price_y': entry_y,
@@ -16237,16 +20687,27 @@ class PairsTradingTerminal(QMainWindow):
                     'mf_qty_y': qty_y,
                     'mf_qty_x': qty_x,
                 }
+                # Straddle-specific fields
+                if is_straddle:
+                    trade_record['expiry'] = pos.get('expiry', '')
+                    trade_record['strike'] = pos.get('strike', 0)
+                    trade_record['entry_iv'] = pos.get('entry_iv')
+                    trade_record['entry_hv'] = pos.get('entry_hv')
                 self.trade_history.append(trade_record)
                 
                 self.update_portfolio_display()
                 self._update_metric_value(self.positions_metric, str(len(self.portfolio)))
                 self._save_and_sync_portfolio()
                 
-                self.statusBar().showMessage(
-                    f"Closed {pos['pair']} - {result} (Z: {entry_z:.2f} → {current_z:.2f}, "
-                    f"P/L: {realized_pnl_sek:+.0f} SEK)"
-                )
+                if is_straddle:
+                    self.statusBar().showMessage(
+                        f"Closed straddle {pos['pair']} {pos.get('expiry', '')} - {result} "
+                        f"(P/L: {realized_pnl_sek:+.0f} SEK, {realized_pnl_pct:+.1f}%)")
+                else:
+                    self.statusBar().showMessage(
+                        f"Closed {pos['pair']} - {result} (Z: {entry_z:.2f} → {current_z:.2f}, "
+                        f"P/L: {realized_pnl_sek:+.0f} SEK)"
+                    )
     
     def clear_all_positions(self):
         """Clear all positions."""

@@ -20,9 +20,89 @@ from pathlib import Path
 
 # ── Version ──────────────────────────────────────────────────────────────────
 APP_NAME = "Klippinge Investment Trading Terminal"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.1"
 APP_AUTHOR = "Klippinge Investment"
 GITHUB_REPO = "andreasklippinge/klippinge-trading"  # ← Ändra detta!
+
+
+# ── OMXS Large Cap tickers (yfinance format) ─────────────────────────────────
+
+OMXS_LARGE_CAP = [
+    "AAK.ST",           # AAK
+    "ABB.ST",           # ABB Ltd
+    "ADDT-B.ST",        # Addtech B
+    "ALFA.ST",          # Alfa Laval
+    "ALLEI.ST",         # Alleima
+    "ASMO-B.ST",        # Asmodee Group B
+    "ASSA-B.ST",        # ASSA ABLOY B
+    "AZN.ST",           # AstraZeneca
+    "ATCO-A.ST",        # Atlas Copco A
+    "ATCO-B.ST",        # Atlas Copco B
+    "AZA.ST",           # Avanza Bank Holding
+    "AXFO.ST",          # Axfood
+    "BEIJ-B.ST",        # Beijer Ref B
+    "BETS-B.ST",        # Betsson B
+    "BILL.ST",          # Billerud
+    "BOL.ST",           # Boliden
+    "BONEX.ST",         # BONESUPPORT HOLDING
+    "CAST.ST",          # Castellum
+    "COFFEE-B.ST",      # Coffee Stain Group B
+    "DOM.ST",           # Dometic Group
+    "ELUX-B.ST",        # Electrolux B
+    "EKTA-B.ST",        # Elekta B
+    "EMBRAC-B.ST",      # Embracer Group B
+    "EPI-A.ST",         # Epiroc A
+    "EQT.ST",           # EQT
+    "ERIC-B.ST",        # Ericsson B
+    "ESSITY-B.ST",      # Essity B
+    "EVO.ST",           # Evolution
+    "FABG.ST",          # Fabege
+    "BALD-B.ST",        # Fastighets AB Balder B
+    "GETI-B.ST",        # Getinge B
+    "HM-B.ST",          # Hennes & Mauritz B
+    "HEXA-B.ST",        # Hexagon B
+    "HOLM-B.ST",        # Holmen B
+    "HUSQ-B.ST",        # Husqvarna B
+    "INDU-C.ST",        # Industrivärden C
+    "INVE-B.ST",        # Investor B
+    "JM.ST",            # JM
+    "KINV-B.ST",        # Kinnevik B
+    "LATO-B.ST",        # Latour B
+    "LIFCO-B.ST",       # Lifco B
+    "LUMI.ST",          # Lundin Mining Corporation
+    "MTG-B.ST",         # Modern Times Group B
+    "NCC-B.ST",         # NCC B
+    "NEWA-B.ST",        # New Wave B
+    "NIBE-B.ST",        # NIBE Industrier B
+    "NOBA.ST",          # NOBA Bank Group
+    "NDA-SE.ST",        # Nordea Bank Abp
+    "SAVE.ST",          # Nordnet
+    "PEAB-B.ST",        # Peab B
+    "RATO-B.ST",        # Ratos B
+    "SAAB-B.ST",        # SAAB B
+    "SAGA-B.ST",        # Sagax B
+    "SBB-B.ST",         # Samhällsbyggnadsbo. i Norden B
+    "SAND.ST",          # Sandvik
+    "SCA-B.ST",         # SCA B
+    "SEB-A.ST",         # SEB A
+    "SECU-B.ST",        # Securitas B
+    "SINCH.ST",         # Sinch
+    "SKA-B.ST",         # Skanska B
+    "SKF-B.ST",         # SKF B
+    "SSAB-A.ST",        # SSAB A
+    "SSAB-B.ST",        # SSAB B
+    "STERV.ST",         # Stora Enso R
+    "SHB-A.ST",         # Svenska Handelsbanken A
+    "SWED-A.ST",        # Swedbank A
+    "SOBI.ST",          # Swedish Orphan Biovitrum
+    "TEL2-B.ST",        # Tele2 B
+    "TELIA.ST",         # Telia Company
+    "8TRA.ST",          # TRATON
+    "TREL-B.ST",        # Trelleborg B
+    "VERI.ST",          # Verisure
+    "VOLV-B.ST",        # Volvo B
+    "VOLCAR-B.ST",      # Volvo Car B
+]
 
 
 # ── Path Resolution ──────────────────────────────────────────────────────────
