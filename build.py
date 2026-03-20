@@ -30,6 +30,19 @@ VERSION = "1.6.2"
 SPEC_FILE = "build/klippinge.spec"
 INNO_SCRIPT = "build/installer.iss"
 
+# Spyder/conda runtime DLL path (PyInstaller misses these for _ctypes, _lzma, etc.)
+_SPYDER_DLL_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", ""),
+    "spyder-6", "envs", "spyder-runtime", "Library", "bin",
+)
+
+def _spyder_bin(dll: str) -> str:
+    """Return full path to a DLL in the Spyder runtime bin directory."""
+    p = os.path.join(_SPYDER_DLL_DIR, dll)
+    if not os.path.exists(p):
+        print(f"  [WARN] DLL not found: {p}")
+    return p
+
 # Files required in the source directory before building
 REQUIRED_FILES = [
     "dashboard_PyQt5.py",
@@ -140,7 +153,14 @@ def build_exe(one_file: bool = False):
             '--onefile',
             '--noupx',              # Prevent UPX from corrupting VC++ DLLs
             '--icon', 'logo.ico',
-            
+
+            # Missing DLLs from conda/Spyder runtime (not auto-detected by PyInstaller)
+            '--add-binary', f'{_spyder_bin("ffi-8.dll")};.',
+            '--add-binary', f'{_spyder_bin("liblzma.dll")};.',
+            '--add-binary', f'{_spyder_bin("libbz2.dll")};.',
+            '--add-binary', f'{_spyder_bin("libexpat.dll")};.',
+            '--add-binary', f'{_spyder_bin("sqlite3.dll")};.',
+
             # Data files
             '--add-data', 'notification_config.json;.',
             '--add-data', 'logo.ico;.',
