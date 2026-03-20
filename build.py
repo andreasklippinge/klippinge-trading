@@ -138,6 +138,7 @@ def build_exe(one_file: bool = False):
             '--name', APP_NAME,
             '--windowed',           # No console
             '--onefile',
+            '--noupx',              # Prevent UPX from corrupting VC++ DLLs
             '--icon', 'logo.ico',
             
             # Data files
