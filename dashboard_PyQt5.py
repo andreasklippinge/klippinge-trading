@@ -3976,6 +3976,84 @@ class VolatilityDataWorker(QObject):
             self.finished.emit()
 
 
+class StaleInstrumentRefreshWorker(QObject):
+    """Background worker: fetches current prices for instruments that WS doesn't update.
+
+    Uses yf.download to get latest prices for stale tickers and emits results
+    so the main thread can update the treemap cache.
+    """
+    result = Signal(dict)   # {ticker: {'price': float, 'change': float, 'change_pct': float}}
+    finished = Signal()
+
+    def __init__(self, tickers: list, daily_prev_close: dict = None):
+        super().__init__()
+        self.tickers = list(tickers)
+        self.daily_prev_close = daily_prev_close or {}
+
+    @Slot()
+    def run(self):
+        try:
+            import yfinance as yf
+            from datetime import date as _date
+            data = {}
+            if not self.tickers:
+                return
+
+            # Use period='2d' with interval='1d' to get the previous session close
+            # and the last traded price. This ensures closed markets show yesterday's
+            # session change (close vs prior close) instead of 0%.
+            daily_df = yf.download(self.tickers, period='5d', interval='1d',
+                                   progress=False, threads=False,
+                                   ignore_tz=True, multi_level_index=False)
+            if daily_df is None or daily_df.empty:
+                return
+            if len(self.tickers) == 1:
+                daily_close = daily_df[['Close']].rename(columns={'Close': self.tickers[0]}) if 'Close' in daily_df.columns else daily_df
+            else:
+                daily_close = daily_df['Close'] if 'Close' in daily_df.columns else daily_df
+
+            today = _date.today()
+            for ticker in self.tickers:
+                if ticker not in daily_close.columns:
+                    continue
+                series = daily_close[ticker].dropna()
+                if len(series) < 2:
+                    continue
+                last_price = float(series.iloc[-1])
+                if last_price <= 0:
+                    continue
+
+                # Determine prev_close: if last bar is today, use iloc[-2];
+                # otherwise last bar IS the latest close, use iloc[-2] as prev
+                last_dt = series.index[-1]
+                last_d = last_dt.date() if hasattr(last_dt, 'date') else last_dt
+                if last_d >= today:
+                    # Today's bar exists → price = today's close, prev = yesterday
+                    prev_close = float(series.iloc[-2])
+                else:
+                    # No bar for today → price = last close, prev = day before
+                    prev_close = float(series.iloc[-2])
+
+                if prev_close > 0:
+                    change = last_price - prev_close
+                    change_pct = (change / prev_close) * 100
+                else:
+                    change = 0
+                    change_pct = 0
+
+                data[ticker] = {
+                    'price': round(last_price, 4),
+                    'change': round(change, 4),
+                    'change_pct': round(change_pct, 2),
+                }
+            if data:
+                self.result.emit(data)
+        except Exception as e:
+            traceback.print_exc()
+        finally:
+            self.finished.emit()
+
+
 class FuturesImpliedWorker(QObject):
     """Hämtar futures-pris via yf.download och beräknar implied open (futures daglig %)."""
     result = Signal(dict)   # {futures_ticker: {'price': float, 'change_pct': float}, ...}
@@ -7723,6 +7801,8 @@ class PairsTradingTerminal(QMainWindow):
         self._intraday_thread = None
         self._intraday_retry_count = 0     # Retry-räknare för ofullständig OHLC-data
         self._intraday_max_retries = 20    # Max antal retries (keep trying until all loaded)
+        self._ws_last_update_time = {}      # symbol → timestamp of last WS price update
+        self._stale_refresh_running = False  # Guard for stale instrument refresh worker
 
         self._volatility_worker: Optional[VolatilityDataWorker] = None
         self._volatility_thread: Optional[QThread] = None
@@ -7990,7 +8070,7 @@ class PairsTradingTerminal(QMainWindow):
                 self.news_feed.setMaximumWidth(params['news_max'])
             
             # ─── VOLATILITY CARDS ───
-            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'move_card']:
+            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'vvix_vix_card', 'move_card']:
                 if hasattr(self, card_name):
                     card = getattr(self, card_name)
                     if card:
@@ -8146,7 +8226,7 @@ class PairsTradingTerminal(QMainWindow):
     def _apply_volatility_sparkline_scaling(self, scale: float):
         """Apply scaling to volatility cards including their sparklines."""
         try:
-            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'move_card']:
+            for card_name in ['vix_card', 'vvix_card', 'skew_card', 'vvix_vix_card', 'move_card']:
                 if hasattr(self, card_name):
                     card = getattr(self, card_name)
                     if card and hasattr(card, 'scale_to'):
@@ -15864,6 +15944,8 @@ Plotly.newPlot('chart', traces, layout, {{
             var updates = payload.updates || {{}};
             var changedTickers = [];
             var changedDirs = {{}};
+            var nKeys = Object.keys(updates).length;
+            console.log('[JS-DBG] updatePrices called: ' + nKeys + ' symbols, ids.length=' + d.ids.length);
 
             /* Store intraday OHLC and extra WS info */
             if (payload.intraday) {{
@@ -15926,7 +16008,13 @@ Plotly.newPlot('chart', traces, layout, {{
                 changedDirs[dt] = newPct > oldPct ? 'up' : (newPct < oldPct ? 'down' : 'same');
             }}
 
-            if (changedTickers.length === 0) return;
+            if (changedTickers.length === 0) {{
+                console.log('[JS-DBG] updatePrices: 0 matched ids! First 5 update keys: '
+                    + Object.keys(updates).slice(0,5).join(',')
+                    + ' | First 5 ids: ' + d.ids.slice(0,5).join(','));
+                return;
+            }}
+            console.log('[JS-DBG] updatePrices: ' + changedTickers.length + ' tiles matched and updated');
 
             /* Recompute font colors for changed tiles */
             d.font_colors = d.colors.map(function(c) {{ return tileTextColor(c); }});
@@ -16609,7 +16697,16 @@ Plotly.newPlot('chart', traces, layout, {{
 
     def _fetch_futures_implied(self):
         """Hämta futures-priser i bakgrundstråd för implied open."""
-        if self._is_us_market_open():
+        us_open = self._is_us_market_open()
+        if not hasattr(self, '_futures_dbg_count'):
+            self._futures_dbg_count = 0
+        self._futures_dbg_count += 1
+        # Log every 4th call (~2 min) or first call
+        if self._futures_dbg_count <= 2 or self._futures_dbg_count % 4 == 0:
+            print(f"[FUTURES-DBG] _fetch_futures_implied called #{self._futures_dbg_count}, "
+                  f"us_market_open={us_open}, "
+                  f"already_fetching={getattr(self, '_futures_fetching', False)}")
+        if us_open:
             # Rensa implied-flaggor när marknaden är öppen
             for spot in self.US_INDEX_FUTURES:
                 if spot in self._market_data_cache:
@@ -16642,14 +16739,70 @@ Plotly.newPlot('chart', traces, layout, {{
         for futures_sym, fdata in data.items():
             spot_sym = self.FUTURES_TO_SPOT.get(futures_sym)
             if not spot_sym or spot_sym not in self._market_data_cache:
+                print(f"[FUTURES-DBG] {futures_sym} → spot={spot_sym}, "
+                      f"in_cache={spot_sym in self._market_data_cache if spot_sym else 'N/A'}, SKIPPED")
                 continue
             self._market_data_cache[spot_sym]['implied_open'] = True
             self._market_data_cache[spot_sym]['implied_pct'] = fdata['change_pct']
             self._ws_cache_dirty = True
             self._ws_changed_symbols.add(spot_sym)
-        # if data:
-        #     parts = [f"{self.FUTURES_TO_SPOT.get(k,'?')}:{v['change_pct']:+.2f}%" for k, v in data.items()]
-            # print(f"[Futures] Implied open: {', '.join(parts)}")
+        if data:
+            parts = [f"{self.FUTURES_TO_SPOT.get(k,'?')}:{v['change_pct']:+.2f}%" for k, v in data.items()]
+            print(f"[FUTURES-DBG] Implied open: {', '.join(parts)}")
+
+    def _refresh_stale_instruments(self):
+        """Identify instruments that WS hasn't updated recently and fetch via yf.download."""
+        if self._stale_refresh_running:
+            return
+        now = time.time()
+        stale_threshold = 45  # seconds without WS update → considered stale
+
+        stale_tickers = []
+        for symbol in self.MARKET_INSTRUMENTS:
+            last_update = self._ws_last_update_time.get(symbol, 0)
+            if now - last_update > stale_threshold:
+                stale_tickers.append(symbol)
+
+        if not stale_tickers:
+            return
+
+        self._stale_refresh_running = True
+        thread = QThread()
+        worker = StaleInstrumentRefreshWorker(
+            stale_tickers,
+            daily_prev_close=dict(self._daily_prev_close),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._on_stale_refresh_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, '_stale_refresh_running', False))
+        worker.finished.connect(worker.deleteLater)
+        self._stale_refresh_thread_ref = thread  # prevent GC
+        self._stale_refresh_worker_ref = worker
+        thread.start()
+
+    def _on_stale_refresh_result(self, data: dict):
+        """Apply stale instrument prices to the treemap cache."""
+        updated = 0
+        for symbol, info in data.items():
+            if symbol not in self.MARKET_INSTRUMENTS:
+                continue
+            name, market = self.MARKET_INSTRUMENTS[symbol]
+            if symbol not in self._market_data_cache:
+                self._market_data_cache[symbol] = {
+                    'symbol': symbol, 'name': name, 'market': market,
+                }
+            cached = self._market_data_cache[symbol]
+            cached['price'] = info['price']
+            cached['change'] = info['change']
+            cached['change_pct'] = info['change_pct']
+            self._ws_changed_symbols.add(symbol)
+            updated += 1
+
+        if updated:
+            self._ws_cache_dirty = True
 
     def _check_daily_prev_close_refresh(self, tickers):
         """Refresh daily prev close if date has changed (dashboard left running overnight)."""
@@ -16674,12 +16827,10 @@ Plotly.newPlot('chart', traces, layout, {{
             import yfinance as yf
             import socket
             socket.setdefaulttimeout(30)
-            print(f"[MarketWatch] Fetching daily prev close for {len(tickers)} tickers...")
             daily = yf.download(tickers, period='5d', interval='1d',
                                 progress=False, threads=False, ignore_tz=True,
                                 multi_level_index=False)
             if daily is None or daily.empty:
-                print("[MarketWatch] Daily download returned empty!")
                 return
             if len(tickers) == 1:
                 # Single ticker: flat columns → rename Close to ticker name
@@ -16692,29 +16843,18 @@ Plotly.newPlot('chart', traces, layout, {{
                 daily_close = daily['Close'] if 'Close' in daily.columns else daily
             from datetime import date as _date
             today = _date.today()
-            _COMMODITY_FUTURES_DBG = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
             for tk in tickers:
                 if tk in daily_close.columns:
                     dc = daily_close[tk].dropna()
                     if len(dc) >= 2:
-                        # Check if last bar is from today
+                        # If today's bar exists: prev_close = iloc[-2] (yesterday)
+                        # If no bar today: prev_close = iloc[-1] (last close = yesterday)
                         last_dt = dc.index[-1]
                         last_d = last_dt.date() if hasattr(last_dt, 'date') else last_dt
                         if last_d >= today:
-                            # Today's bar exists → previous close is second-to-last
                             self._daily_prev_close[tk] = float(dc.iloc[-2])
                         else:
-                            # Today's bar not yet available → last bar IS previous close
                             self._daily_prev_close[tk] = float(dc.iloc[-1])
-                        # Debug for commodity futures
-                        if tk in _COMMODITY_FUTURES_DBG:
-                            print(f"[DailyPrev] {tk}: dates={[str(d.date()) for d in dc.index]}, "
-                                  f"last_d={last_d}, today={today}, "
-                                  f"used={'iloc[-2]' if last_d >= today else 'iloc[-1]'}, "
-                                  f"value={self._daily_prev_close[tk]:.2f}")
-                elif tk in _COMMODITY_FUTURES_DBG:
-                    print(f"[DailyPrev] WARNING: {tk} NOT in daily_close columns! "
-                          f"columns={list(daily_close.columns)[:10]}...")
             # For index futures: override with fast_info previousClose (settlement price)
             # yf.download daily Close ≠ settlement, causing wrong implied open calculation.
             # Commodity futures don't need this — treemap uses WS change directly.
@@ -16726,18 +16866,9 @@ Plotly.newPlot('chart', traces, layout, {{
                     fi = t.fast_info
                     pc = float(fi.get('previousClose', 0) or fi.get('previous_close', 0) or 0)
                     if pc > 0:
-                        old = self._daily_prev_close.get(ftk, 0)
                         self._daily_prev_close[ftk] = pc
-                        if old and abs(pc - old) / old > 0.005:
-                            print(f"[MarketWatch]   {ftk} prev_close: {old:.2f} → {pc:.2f} (fast_info override)")
-                except Exception as e:
-                    print(f"[MarketWatch]   {ftk} fast_info failed: {e}")
-
-            # Log key futures for verification
-            for ftk in ['CL=F', 'BZ=F', 'GC=F', 'ES=F', 'NQ=F', 'YM=F', 'RTY=F']:
-                if ftk in self._daily_prev_close:
-                    print(f"[MarketWatch]   {ftk} prev_close = {self._daily_prev_close[ftk]:.2f}")
-            print(f"[MarketWatch] Daily prev close loaded for {len(self._daily_prev_close)}/{len(tickers)} tickers")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[MarketWatch] Daily prev close fetch FAILED: {e}")
             import traceback
@@ -16758,6 +16889,15 @@ Plotly.newPlot('chart', traces, layout, {{
         # Fetch daily previous close for accurate change% calculation
         # (WS change_percent is unreliable for futures due to contract rollovers)
         self._fetch_daily_prev_close(tickers)
+
+        # Pre-populate _market_data_cache for ALL instruments so implied open and
+        # stale refresh can find spot symbols immediately (before any WS data arrives)
+        for symbol, (name, market) in self.MARKET_INSTRUMENTS.items():
+            if symbol not in self._market_data_cache:
+                self._market_data_cache[symbol] = {
+                    'symbol': symbol, 'name': name, 'market': market,
+                    'price': 0, 'change': 0, 'change_pct': 0,
+                }
 
         # Clean up old refs
         self._stop_market_websocket()
@@ -16780,13 +16920,21 @@ Plotly.newPlot('chart', traces, layout, {{
         # Fetch intraday OHLC (1d/5m) to seed overlay candlestick charts
         QTimer.singleShot(5000, self._fetch_intraday_ohlc)
 
-        # Implied open: hämta futures-priser periodiskt (var 60:e sekund)
+        # Implied open: hämta futures-priser periodiskt (var 30:e sekund)
         if not hasattr(self, '_futures_timer') or self._futures_timer is None:
             self._futures_timer = QTimer(self)
             self._futures_timer.timeout.connect(self._fetch_futures_implied)
             self._futures_timer.start(30000)  # var 30:e sekund
-        # Första fetch efter att WS-snapshots anlänt (8s)
-        QTimer.singleShot(8000, self._fetch_futures_implied)
+        # Första fetch — vänta 12s så att initial treemap hunnit rendera (populates cache)
+        QTimer.singleShot(12000, self._fetch_futures_implied)
+
+        # Stale instrument refresh: fetch prices for instruments that WS doesn't update
+        # First refresh after 15s (after initial treemap + first futures), then every 60s
+        QTimer.singleShot(15000, self._refresh_stale_instruments)
+        if not hasattr(self, '_stale_refresh_timer') or self._stale_refresh_timer is None:
+            self._stale_refresh_timer = QTimer(self)
+            self._stale_refresh_timer.timeout.connect(self._refresh_stale_instruments)
+            self._stale_refresh_timer.start(60000)  # var 60:e sekund
 
         # Refresh daily prev close periodically (handles overnight dashboard sessions)
         from datetime import date
@@ -16920,7 +17068,6 @@ Plotly.newPlot('chart', traces, layout, {{
                     prev_close = info.get('previous_close', 0)
                     # Commodity futures: use daily_prev_close (full session close)
                     # instead of intraday previous_close (regular session close only).
-                    # This matches Yahoo Finance website's "Last Price" reference.
                     _COMMODITY_FUTURES = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
                     daily_prev = self._daily_prev_close.get(symbol)
                     if symbol in _COMMODITY_FUTURES and daily_prev and daily_prev > 0:
@@ -17021,16 +17168,8 @@ Plotly.newPlot('chart', traces, layout, {{
         """Inner handler — all WS price update logic."""
         symbol = update['symbol']
 
-        # Debug: trace CL=F/BZ=F through the handler
-        if symbol in ('CL=F', 'BZ=F') and not getattr(self, f'_dbg_{symbol}', False):
-            setattr(self, f'_dbg_{symbol}', True)
-            in_mi = symbol in self.MARKET_INSTRUMENTS
-            dp = self._daily_prev_close.get(symbol)
-            print(f"[DBG] {symbol} first WS msg: price={update['price']}, "
-                  f"ws_chg%={update.get('change_pct')}, "
-                  f"in_MARKET_INSTRUMENTS={in_mi}, "
-                  f"daily_prev_close={dp}, "
-                  f"len(_daily_prev_close)={len(self._daily_prev_close)}")
+        # Track last WS update time per symbol (for stale detection)
+        self._ws_last_update_time[symbol] = time.time()
 
         # Accumulate tick history for intraday charts
         ts = update.get('timestamp', time.time())
@@ -17105,33 +17244,18 @@ Plotly.newPlot('chart', traces, layout, {{
             cached = self._market_data_cache[symbol]
             cached['price'] = update['price']
 
-            # For commodity futures: WS previous_close is regularMarketPreviousClose
-            # (regular session close), but Yahoo Finance website calculates change from
-            # the previous FULL session last trade (including extended hours). These differ
-            # by ~$40-50 for Gold. yf.download daily Close matches Yahoo's reference better.
-            # So: use daily_prev_close for commodity change%, WS for everything else.
+            # Commodity futures: WS change_percent is unreliable due to contract
+            # rollovers (e.g. -22% on CL=F). Use daily_prev_close instead.
+            # All other instruments: WS change values are correct (indices, FX, crypto).
+            # Stale/closed instruments are handled by StaleInstrumentRefreshWorker.
             _COMMODITY_FUTURES = {'GC=F', 'SI=F', 'CL=F', 'BZ=F', 'NG=F', 'HG=F'}
             daily_prev = self._daily_prev_close.get(symbol)
             if symbol in _COMMODITY_FUTURES and daily_prev and daily_prev > 0:
                 cached['change'] = round(update['price'] - daily_prev, 4)
                 cached['change_pct'] = round((update['price'] - daily_prev) / daily_prev * 100, 2)
-                # Log first commodity override to verify
-                if not cached.get('_commodity_override_logged'):
-                    cached['_commodity_override_logged'] = True
-                    print(f"[MarketWatch] {symbol}: WS price={update['price']:.2f}, "
-                          f"daily_prev={daily_prev:.2f}, "
-                          f"calc_chg%={cached['change_pct']:.2f}%, "
-                          f"ws_chg%={update['change_pct']:.2f}%")
             else:
                 cached['change'] = update['change']
                 cached['change_pct'] = update['change_pct']
-                # Debug: why commodity NOT overridden?
-                if symbol in _COMMODITY_FUTURES and not cached.get('_commodity_miss_logged'):
-                    cached['_commodity_miss_logged'] = True
-                    print(f"[MarketWatch] WARNING: {symbol} NOT overridden! "
-                          f"daily_prev={daily_prev}, "
-                          f"len(_daily_prev_close)={len(self._daily_prev_close)}, "
-                          f"keys={[k for k in self._daily_prev_close if '=F' in k]}")
 
             self._ws_cache_dirty = True
             self._ws_changed_symbols.add(symbol)
