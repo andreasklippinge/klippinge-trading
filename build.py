@@ -26,7 +26,7 @@ from pathlib import Path
 # ── Configuration ────────────────────────────────────────────────────────────
 
 APP_NAME = "KlippingeTrading"
-VERSION = "1.0.0"
+VERSION = "1.6.2"
 SPEC_FILE = "build/klippinge.spec"
 INNO_SCRIPT = "build/installer.iss"
 
@@ -34,13 +34,15 @@ INNO_SCRIPT = "build/installer.iss"
 REQUIRED_FILES = [
     "dashboard_PyQt5.py",
     "pairs_engine.py",
-    "regime_hmm.py",
     "portfolio_history.py",
     "scrape_prices_MS.py",
     "app_config.py",
     "auto_updater.py",
+    "eps_mean_reversion.py",
+    "squeeze.py",
+    "vol_analytics.py",
     "logo.ico",
-    "index_tickers.csv",
+    "Trading/index_tickers.csv",
 ]
 
 
@@ -139,18 +141,19 @@ def build_exe(one_file: bool = False):
             '--icon', 'logo.ico',
             
             # Data files
-            '--add-data', 'index_tickers.csv;.',
-            '--add-data', 'underliggande_matchade_tickers.csv;.',
             '--add-data', 'notification_config.json;.',
             '--add-data', 'logo.ico;.',
             '--add-data', 'assets/styles.css;assets',
             '--add-data', 'Trading/index_tickers.csv;Trading',
             '--add-data', 'Trading/portfolio_positions.json;Trading',
             '--add-data', 'Trading/benchmark_cache.json;Trading',
+            '--add-data', 'Trading/underliggande_matchade_tickers.csv;Trading',
             
             # Hidden imports
             '--hidden-import', 'pairs_engine',
-            '--hidden-import', 'regime_hmm',
+            '--hidden-import', 'eps_mean_reversion',
+            '--hidden-import', 'squeeze',
+            '--hidden-import', 'vol_analytics',
             '--hidden-import', 'portfolio_history',
             '--hidden-import', 'scrape_prices_MS',
             '--hidden-import', 'app_config',
